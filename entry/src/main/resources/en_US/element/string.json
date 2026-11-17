@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "AI Object Detection"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "AI Object Detection"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "AI Detect"
+    },
+    {
+      "name": "camera_reason",
+      "value": "Used for real-time AI object detection"
+    },
+    {
+      "name": "mic_reason",
+      "value": "Used to record ambient sound during video recording"
+    }
+  ]
+}

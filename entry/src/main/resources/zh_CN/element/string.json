@@ -1,0 +1,24 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "我爱钓鱼目标检测应用"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "我爱钓鱼目标检测"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "我爱钓鱼"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于实时拍摄画面并进行 AI 目标检测"
+    },
+    {
+      "name": "mic_reason",
+      "value": "用于录像时同步录制环境声音"
+    }
+  ]
+}

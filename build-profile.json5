@@ -1,0 +1,57 @@
+{
+  "app": {
+    "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\18882\\.ohos\\config\\default_HmFish_wp6k1VNPNyGK6UwTcYNk99WMkIWK5Bpb1dqdy6swtbE=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001BFB58D24197EB192AB06E1CC51D5619DF4BA55A65FCEE75E6D532893EC0AACF718627C23BF21CFC",
+          "profile": "C:\\Users\\18882\\.ohos\\config\\default_HmFish_wp6k1VNPNyGK6UwTcYNk99WMkIWK5Bpb1dqdy6swtbE=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\18882\\.ohos\\config\\default_HmFish_wp6k1VNPNyGK6UwTcYNk99WMkIWK5Bpb1dqdy6swtbE=.p12",
+          "storePassword": "0000001BBF075248CF824A84D786D9B774625EDFFF32FD6E8AB67CACF6C714612FCEB263D987956698A318"
+        }
+      }
+    ],
+    "products": [
+      {
+        "name": "default",
+        "signingConfig": "default",
+        "targetSdkVersion": "26.0.0",
+        "compatibleSdkVersion": "6.1.1(24)",
+        "runtimeOS": "HarmonyOS",
+        "buildOption": {
+          "strictMode": {
+            "caseSensitiveCheck": true,
+            "useNormalizedOHMUrl": true
+          },
+          "nativeCompiler": "BiSheng"
+        }
+      }
+    ],
+    "buildModeSet": [
+      {
+        "name": "debug",
+      },
+      {
+        "name": "release"
+      }
+    ]
+  },
+  "modules": [
+    {
+      "name": "entry",
+      "srcPath": "./entry",
+      "targets": [
+        {
+          "name": "default",
+          "applyToProducts": [
+            "default"
+          ]
+        }
+      ]
+    }
+  ]
+}

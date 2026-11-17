@@ -1,0 +1,24 @@
+# ─────────────── HarmonyOS / DevEco 忽略规则 ───────────────
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# IDE / 工具缓存
+/.cache
+/.ui
+/.preview
+/.hvigor-wrapper
+
+# 构建产物
+*.hap
+*.hsp
+*.so.debug

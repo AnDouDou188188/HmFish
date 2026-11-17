@@ -1,0 +1,23 @@
+{
+  "defaultModelId": "yolo26m_640",
+  "models": [
+    {
+      "id": "yolo26m_640",
+      "name": "YOLO 26M",
+      "paramFile": "models/yolo26m_640.param",
+      "binFile": "models/yolo26m_640.bin",
+      "labelsFile": "models/yolo26m_640.txt",
+      "inputSize": 640,
+      "type": "yolo"
+    },
+    {
+      "id": "fishm_640",
+      "name": "Fish M",
+      "paramFile": "models/fishm_640.param",
+      "binFile": "models/fishm_640.bin",
+      "labelsFile": "models/fishm_640.txt",
+      "inputSize": 640,
+      "type": "yolo"
+    }
+  ]
+}
