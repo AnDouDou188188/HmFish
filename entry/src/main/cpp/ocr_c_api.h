@@ -75,6 +75,26 @@ int sr_upscale_rgba(const uint8_t *in, int inW, int inH, uint8_t *out, int outW,
 /* 当前模型放大倍数（2/3/4）；未就绪返回 0 */
 int sr_scale(void);
 
+/* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage 性别年龄 + 几何颜值分） */
+
+/* 加载三个人脸模型（det/lm 必需，ga 可为 NULL）；numThreads<=0 用 3；成功返回 1 */
+int face_init(const char *detPath, const char *lmPath, const char *gaPath, int numThreads);
+
+int face_is_ready(void);
+
+void face_release(void);
+
+/* 同步检测一帧 RGBA。facesOut 每脸 223 个 float：
+ *   [0..3] box x1,y1,x2,y2（图像坐标）
+ *   [4]    检测分
+ *   [5]    性别（0=女 1=男，-1=未知）
+ *   [6]    年龄（-1=未知）
+ *   [7]    颜值 0~100（-1=未知）
+ *   [8..215] 106 关键点 x,y（图像坐标）
+ *   [216..222] 颜值分项 0~100（-1=未知）：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+ * 返回脸数（<=min(maxFaces,4)），未就绪返回 0 */
+int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces);
+
 #ifdef __cplusplus
 }
 #endif

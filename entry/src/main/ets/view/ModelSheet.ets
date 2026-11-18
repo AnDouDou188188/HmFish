@@ -1,5 +1,5 @@
-// ★ 模型/USB 画面增强设置弹窗：YOLO 模型选择、USB 增强三模式切换、
-//   AI 细节强度/亮度/锐度/画质滑条、语音播报开关
+// ★ 识别设置弹窗：YOLO 模型选择、自动录像类别、置信度阈值、
+//   语音播报/识别朗读/触发音效（画面增强/识别框/人脸已迁至画面设置弹窗）
 import { ModelInfo } from '../common/ModelManager';
 
 /**
@@ -21,15 +21,6 @@ export struct ModelSheet {
   // ★ 触发音效：自动录像触发时的提示音（默认内置报警音，可选自定义 MP3，可试听）
   @Prop recordSoundOn: boolean = true;
   @Prop recordSoundName: string = '';
-  // ★ 识别框/标签画面显示开关：关闭后画面干净不画框/文字（识别与自动录像不受影响）
-  @Prop drawBoxesOn: boolean = true;
-  // ★ USB 画面增强（仅 USB 摄像头画面生效）：
-  //   模式 0关/1非AI(亮度+锐度+对比度饱和度)/2 AI超分(QuickSRNetMedium x4 + 精修锐化)
-  @Prop usbBrightness: number = 0;
-  @Prop usbEnhance: boolean = false;
-  @Prop usbEnhanceMode: number = 0;
-  @Prop usbSharpness: number = 0;
-  @Prop usbSrStrength: number = 100;
 
   onClose?: () => void;
   onSelectModel?: (id: string) => void;
@@ -39,12 +30,6 @@ export struct ModelSheet {
   onSpeechToggle?: () => void;
   onSpeechVolumeChange?: (v: number) => void;
   onDetectSpeakToggle?: () => void;
-  onDrawBoxesToggle?: () => void;
-  onUsbModeChange?: (m: number) => void;
-  onUsbBrightnessChange?: (v: number) => void;
-  onUsbSharpnessChange?: (v: number) => void;
-  onUsbSrStrengthChange?: (v: number) => void;
-  onUsbEnhanceToggle?: () => void;
   onSoundToggle?: () => void;
   onPickSound?: () => void;
   onPreviewSound?: () => void;
@@ -54,26 +39,15 @@ export struct ModelSheet {
   // ★ 滑条本地缓冲：拖动期间只更新本地值，松手才提交父组件
   @State localConfPct: number = 25;
   @State localVolume: number = 30;
-  @State localUsbBright: number = 0;
-  @State localUsbSharp: number = 0;
-  @State localSrStrength: number = 100;
 
   aboutToAppear(): void {
     this.localConfPct = this.confThresh * 100;
     this.localVolume = this.speechVolume;
-    this.localUsbBright = this.usbBrightness;
-    this.localUsbSharp = this.usbSharpness;
-    this.localSrStrength = this.usbSrStrength;
     setTimeout(() => { this.appear = true; }, 30);
   }
 
   private isChecked(idx: number): boolean {
     return this.checkedLabels.indexOf(idx) >= 0;
-  }
-
-  // ★ 当前 AI 超分模式说明文案（mode 2）
-  private usbModeDesc(): string {
-    return 'AI超分（细节注入版）：原图细节零损失 + AI 生成细节按强度叠加 + 双重锐化，清晰度显著提升';
   }
 
   @Builder
@@ -88,26 +62,6 @@ export struct ModelSheet {
     }
     .width('100%')
     .margin({ top: 20, bottom: 10 })
-  }
-
-  // ★ USB 增强模式 pill：选中高亮，点击切换（0关/1非AI/2 AI超分）
-  @Builder
-  UsbModePill(label: string, mode: number) {
-    Text(label)
-      .fontSize(12)
-      .fontColor(this.usbEnhanceMode === mode ? '#FFFFFF' : '#B7BDC7')
-      .fontWeight(this.usbEnhanceMode === mode ? FontWeight.Bold : FontWeight.Normal)
-      .padding({ left: 12, right: 12, top: 7, bottom: 7 })
-      .backgroundColor(this.usbEnhanceMode === mode ? 'rgba(0,229,255,0.22)' : 'rgba(255,255,255,0.07)')
-      .borderRadius(14)
-      .border({
-        width: this.usbEnhanceMode === mode ? 1 : 0.5,
-        color: this.usbEnhanceMode === mode ? '#00E5FF' : 'rgba(255,255,255,0.15)'
-      })
-      .margin({ right: 8, bottom: 8 })
-      .onClick(() => {
-        if (mode !== this.usbEnhanceMode) this.onUsbModeChange?.(mode);
-      })
   }
 
   @Builder
@@ -234,158 +188,6 @@ export struct ModelSheet {
               Text('95%').fontSize(10).fontColor('#6E7681')
             }
             .width('100%')
-
-            // ★ 画面显示：识别框和文字开关（关闭后画面干净不画框/文字）
-            Row({ space: 8 }) {
-              Text('🎛').fontSize(14).fontColor('#00E5FF')
-              Text('显示识别框和文字').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
-              Text(this.drawBoxesOn ? '已开启' : '已关闭').fontSize(11)
-                .fontColor(this.drawBoxesOn ? '#00E5FF' : '#6E7681')
-              Blank()
-              Toggle({ type: ToggleType.Switch, isOn: this.drawBoxesOn })
-                .selectedColor('#00E5FF')
-                .onChange((isOn: boolean) => {
-                  if (isOn !== this.drawBoxesOn) this.onDrawBoxesToggle?.();
-                })
-            }
-            .width('100%')
-            .margin({ top: 20 })
-
-            Text('关闭后画面不绘制识别框和标签文字，画面更干净；识别、朗读、自动录像不受影响')
-              .fontSize(10).fontColor('#8E97A3')
-              .width('100%').margin({ top: 6 })
-
-            // ★ USB 画面增强：仅 USB 摄像头画面生效（3 模式：关/非AI/AI超分）
-            this.SectionTitle('▣', 'USB 画面增强', '仅 USB 摄像头')
-
-            Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
-              this.UsbModePill('关闭', 0)
-              this.UsbModePill('非AI增强', 1)
-              this.UsbModePill('AI超分', 2)
-            }
-            .width('100%')
-            .margin({ top: 12, bottom: 2 })
-
-            if (this.usbEnhanceMode === 0) {
-              Text('关闭所有 USB 画面增强处理，保持原始画面')
-                .fontSize(10).fontColor('#8E97A3')
-                .width('100%').margin({ top: 6 })
-            } else if (this.usbEnhanceMode === 1) {
-              Text('亮度/锐度/对比度/饱和度调节，不占用 AI 算力')
-                .fontSize(10).fontColor('#8E97A3')
-                .width('100%').margin({ top: 6 })
-
-              Row({ space: 6 }) {
-                Text('☀').fontSize(13).fontColor('#00E5FF')
-                Text('画面亮度').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
-                Blank()
-                Text(this.localUsbBright > 0 ? `+${this.localUsbBright.toFixed(0)}` :
-                  `${this.localUsbBright.toFixed(0)}`)
-                  .fontSize(13).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
-              }
-              .width('100%')
-              .margin({ top: 14, bottom: 8 })
-
-              Row({ space: 10 }) {
-                Text('调暗').fontSize(10).fontColor('#6E7681')
-                Slider({ value: this.localUsbBright, min: -50, max: 50, step: 5 })
-                  .layoutWeight(1)
-                  .selectedColor('#00E5FF')
-                  .trackColor('rgba(255,255,255,0.15)')
-                  .blockColor('#FFFFFF')
-                  .onChange((v: number, mode: SliderChangeMode) => {
-                    this.localUsbBright = v;
-                    // ★ 松手提交：立即生效并保存
-                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
-                      this.onUsbBrightnessChange?.(v);
-                    }
-                  })
-                Text('调亮').fontSize(10).fontColor('#6E7681')
-              }
-              .width('100%')
-
-              Row({ space: 6 }) {
-                Text('🔺').fontSize(13).fontColor('#00E5FF')
-                Text('画面锐度').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
-                Blank()
-                Text(this.localUsbSharp > 0 ? `+${this.localUsbSharp.toFixed(0)}` : '关闭')
-                  .fontSize(13).fontColor(this.localUsbSharp > 0 ? '#00E5FF' : '#6E7681')
-                  .fontWeight(FontWeight.Bold)
-              }
-              .width('100%')
-              .margin({ top: 16, bottom: 8 })
-
-              Row({ space: 10 }) {
-                Text('柔和').fontSize(10).fontColor('#6E7681')
-                Slider({ value: this.localUsbSharp, min: 0, max: 100, step: 5 })
-                  .layoutWeight(1)
-                  .selectedColor('#00E5FF')
-                  .trackColor('rgba(255,255,255,0.15)')
-                  .blockColor('#FFFFFF')
-                  .onChange((v: number, mode: SliderChangeMode) => {
-                    this.localUsbSharp = v;
-                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
-                      this.onUsbSharpnessChange?.(v);
-                    }
-                  })
-                Text('锐利').fontSize(10).fontColor('#6E7681')
-              }
-              .width('100%')
-
-              Row({ space: 8 }) {
-                Text('✨').fontSize(14).fontColor('#00E5FF')
-                Text('对比度饱和度增强').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
-                Text(this.usbEnhance ? '已开启' : '已关闭').fontSize(11)
-                  .fontColor(this.usbEnhance ? '#00E5FF' : '#6E7681')
-                Blank()
-                Toggle({ type: ToggleType.Switch, isOn: this.usbEnhance })
-                  .selectedColor('#00E5FF')
-                  .onChange((isOn: boolean) => {
-                    if (isOn !== this.usbEnhance) this.onUsbEnhanceToggle?.();
-                  })
-              }
-              .width('100%')
-              .margin({ top: 16 })
-
-              Text('增强 USB 画面对比度与饱和度，画面更通透')
-                .fontSize(10).fontColor('#8E97A3')
-                .width('100%').margin({ top: 6 })
-            } else {
-              Text(this.usbModeDesc())
-                .fontSize(10).fontColor('#8E97A3')
-                .width('100%').margin({ top: 6 })
-
-              Row({ space: 6 }) {
-                Text('🎛').fontSize(13).fontColor('#00E5FF')
-                Text('AI 细节增强强度').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
-                Blank()
-                Text(`${this.localSrStrength.toFixed(0)}%`)
-                  .fontSize(13).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
-              }
-              .width('100%')
-              .margin({ top: 14, bottom: 8 })
-
-              Row({ space: 10 }) {
-                Text('关闭').fontSize(10).fontColor('#6E7681')
-                Slider({ value: this.localSrStrength, min: 0, max: 100, step: 5 })
-                  .layoutWeight(1)
-                  .selectedColor('#00E5FF')
-                  .trackColor('rgba(255,255,255,0.15)')
-                  .blockColor('#FFFFFF')
-                  .onChange((v: number, mode: SliderChangeMode) => {
-                    this.localSrStrength = v;
-                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
-                      this.onUsbSrStrengthChange?.(v);
-                    }
-                  })
-                Text('最强').fontSize(10).fontColor('#6E7681')
-              }
-              .width('100%')
-
-              Text('原始画面细节零损失，AI 提取的细节按强度叠加其上，并叠加双重锐化；过慢时自动降档保持流畅')
-                .fontSize(10).fontColor('#8E97A3')
-                .width('100%').margin({ top: 6 })
-            }
 
             // ★ 语音播报：点击按钮/设置切换/识别结果语音反馈；静音模式自动禁声
             Row({ space: 8 }) {

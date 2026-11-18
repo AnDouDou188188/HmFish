@@ -14,9 +14,14 @@ export const setYoloEnabled: (b: boolean) => void;
 // ★ 识别框/标签画面显示开关（false 时检测照常，仅不绘制）
 export const setDrawBoxesEnabled: (b: boolean) => void;
 // ★ USB 画质增强（仅 USB 摄像头画面生效）：
-//   mode 0 关 / 1 非AI(亮度+锐度+对比度饱和度) / 2 QuickSRNetSmall 超分 / 3 Real-ESRGAN 超分
+//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 QuickSRNet 超分
 export const setUsbEnhance: (mode: number, brightness: number, sharpness: number,
-  enhance: boolean, srStrength: number) => void;
+  contrast: number, saturation: number, srStrength: number) => void;
+// ★ 人脸识别（SCRFD det_500m + 106 关键点连线框 + 性别年龄颜值）
+export const initFace: (detPath: string, lmPath: string, gaPath: string, threads: number) => Promise<boolean>;
+export const releaseFace: () => void;
+export const setFaceEnabled: (b: boolean) => void;
+export const getFaceInfo: () => string;
 // ★ AI 超分模型加载（rawfile 提取到沙箱后的 onnx 路径 + 推理线程数）
 export const initSr: (onnxPath: string, threads: number) => boolean;
 export const releaseSr: () => void;

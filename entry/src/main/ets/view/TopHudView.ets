@@ -7,6 +7,21 @@ export interface DepthRecord {
   time: string;
 }
 
+// ★ 人脸 HUD 行：每张人脸一行（彩色圆点 + 摘要 + "详细"胶囊，点详细弹详情面板）
+export interface FaceHudRow {
+  idx: number;
+  text: string;
+  color: string;
+}
+
+// ★ 人脸主色 hex → 半透明底色（"详细"胶囊底，与彩色描边同色系）
+function faceRowBg(hex: string): string {
+  const r = parseInt(hex.substring(1, 3), 16);
+  const g = parseInt(hex.substring(3, 5), 16);
+  const b = parseInt(hex.substring(5, 7), 16);
+  return `rgba(${r},${g},${b},0.18)`;
+}
+
 @Component
 export struct TopHudView {
   @Prop cameraPosition: number;
@@ -44,8 +59,13 @@ export struct TopHudView {
   @Prop geoName: string = '';
   // ★ OCR 模型集短名（如"票据"/"普通"）：徽标与文字识别行区分当前是哪个模型
   @Prop ocrModelName: string = '';
+  // ★ 人脸识别开关 + 每人脸一行摘要（父组件轮询刷新；点"详细"弹详情面板）
+  @Prop faceEnabled: boolean = false;
+  @Prop faceHudRows: FaceHudRow[] = [];
 
   onCameraSelect?: (pos: number) => void;
+  // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口
+  onShowPictureSheet?: () => void;
   onYoloToggle?: () => void;
   // ★ YOLO 长按：弹出与底部"识别"长按相同的识别设置菜单
   onYoloLongPress?: () => void;
@@ -55,6 +75,8 @@ export struct TopHudView {
   onShowOcrPopup?: () => void;
   onShowPowerSheet?: () => void;
   onShowGeoPopup?: () => void;
+  // ★ 人脸详情：点某张人脸行的"详细"链接，弹出该脸详情面板（箭头指向人脸框）
+  onFaceDetail?: (idx: number) => void;
   // ★ 表格识别：点击"▦ 表格"徽标触发单次表格结构识别
   onRecognizeTable?: () => void;
   // ★ 表格识别中：徽标显示转圈，防重复触发
@@ -175,6 +197,43 @@ export struct TopHudView {
           this.camPill('手机前置', 1, '#AF52DE', 'rgba(175,82,222,0.28)')
         }.justifyContent(FlexAlign.SpaceEvenly).width('100%')
 
+        // ★ 画面设置胶囊：USB 增强/识别框显示/人脸识别统一入口
+        Row({ space: 6 }) {
+          Text('▦').fontSize(12).fontColor('#00E5FF')
+          Text('画面设置').fontSize(11).fontColor('#FFFFFF').fontWeight(FontWeight.Bold)
+          Blank()
+          Text('增强 · 识别框 · 人脸').fontSize(9).fontColor('rgba(255,255,255,0.55)')
+        }
+        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+        .borderRadius(13)
+        .backgroundColor('rgba(0,0,0,0.55)')
+        .border({ width: 1, color: 'rgba(0,229,255,0.4)' })
+        .width('100%')
+        .onClick(() => this.onShowPictureSheet?.())
+
+        // ★ 人脸识别 HUD 行：每张人脸一行（彩色圆点 + 摘要 + "详细"链接，父组件轮询刷新）
+        if (this.faceEnabled && this.faceHudRows.length > 0) {
+          Column({ space: 2 }) {
+            ForEach(this.faceHudRows, (r: FaceHudRow) => {
+              Row({ space: 5 }) {
+                Row().width(7).height(7).borderRadius(3.5).backgroundColor(r.color)
+                Text(r.text)
+                  .fontSize(11).fontColor('#B8FFE3').fontWeight(FontWeight.Bold)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+                Text('详细')
+                  .fontSize(11).fontColor(r.color).fontWeight(FontWeight.Bold)
+                  .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+                  .borderRadius(12)
+                  .backgroundColor(faceRowBg(r.color))
+                  .border({ width: 1, color: r.color })
+                  .onClick(() => this.onFaceDetail?.(r.idx))
+              }.width('100%').alignItems(VerticalAlign.Center)
+            }, (r: FaceHudRow) => `${r.idx}_${r.text}_${r.color}`)
+          }.width('100%')
+        }
+
         // ★ 位置行：地名展示，点击弹复制地址/坐标（字体略大便于阅读）
         if (this.geoName.length > 0) {
           Row({ space: 5 }) {
@@ -184,7 +243,12 @@ export struct TopHudView {
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
               .layoutWeight(1)
-            Text('复制').fontSize(10).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+            Text('复制')
+              .fontSize(11).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+              .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+              .borderRadius(12)
+              .backgroundColor('rgba(0,229,255,0.18)')
+              .border({ width: 1, color: '#00E5FF' })
           }
           .width('100%')
           .padding({ top: 3, bottom: 3 })

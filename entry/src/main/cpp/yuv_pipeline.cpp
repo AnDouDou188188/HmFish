@@ -37,13 +37,17 @@ static std::atomic<bool> g_yolo_enabled(true);
 static std::atomic<bool> g_draw_boxes(true);
 // ★ USB 画面增强（仅外部供帧路径生效）：
 //   mode 0=关闭 1=非AI增强 2=AI细节注入超分(QuickSRNetMedium)
-//   非AI：亮度 -50~+50 / 锐度 0~100（unsharp mask）/ 对比度+饱和度 + 固定基线锐化
+//   非AI：亮度 -50~+50 / 锐度 0~100（unsharp mask）/ 对比度 -50~+50 /
+//         饱和度 -50~+50 / 固定基线锐化
 //   AI：out = 原图 + β×(SR(小图)−双线性(小图))，β=细节强度滑条 0~100%
 static std::atomic<int>  g_usb_mode(0);
 static std::atomic<int>  g_usb_brightness(0);
-static std::atomic<bool> g_usb_enhance(false);
+static std::atomic<int>  g_usb_contrast(0);
+static std::atomic<int>  g_usb_saturation(0);
 static std::atomic<int>  g_usb_sharpness(0);
 static std::atomic<int>  g_usb_sr_strength(100);
+// ★ 人脸识别画面总开关（SCRFD 检测 + 106 点连线框 + 性别年龄颜值标注 + HUD）
+static std::atomic<bool> g_face_enabled(false);
 // ★ SR 细节网格降采样因子（原图宽/factor = SR 输入宽；factor 越大推理越快、
 //   细节增量越粗）。按实测推理耗时自适应：慢了 +1 档（上限 8），快了回 4。
 //   factor 与 SR 倍率(4) 对齐时 SR 输出与原图 1:1 像素对齐，零重采样
@@ -301,30 +305,42 @@ extern "C" {
         g_draw_boxes.store(enabled);
         OH_LOG_INFO(LOG_APP, "[yolo] drawBoxes=%{public}d", (int)enabled);
     }
-    // ★ USB 画质增强模式 0~2：0 关 / 1 非AI(亮度+锐度+对比度饱和度) /
+    // ★ USB 画质增强模式 0~2：0 关 / 1 非AI(亮度+锐度+对比度+饱和度) /
     //   2 AI超分(QuickSRNetMedium x4 + 精修锐化)；切换 AI 模式时重置自适应输入宽度
-    void SetUsbEnhance(int mode, int brightness, int sharpness, int enhance, int strength) {
+    void SetUsbEnhance(int mode, int brightness, int sharpness,
+                       int contrast, int saturation, int strength) {
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
         if (brightness < -50) brightness = -50;
         if (brightness > 50) brightness = 50;
         if (sharpness < 0) sharpness = 0;
         if (sharpness > 100) sharpness = 100;
+        if (contrast < -50) contrast = -50;
+        if (contrast > 50) contrast = 50;
+        if (saturation < -50) saturation = -50;
+        if (saturation > 50) saturation = 50;
         if (strength < 0) strength = 0;
         if (strength > 100) strength = 100;
         const int prevMode = g_usb_mode.load();
         g_usb_mode.store(mode);
         g_usb_brightness.store(brightness);
         g_usb_sharpness.store(sharpness);
-        g_usb_enhance.store(enhance != 0);
+        g_usb_contrast.store(contrast);
+        g_usb_saturation.store(saturation);
         g_usb_sr_strength.store(strength);
         // 切换/进入 AI 模式 → 重置降采样因子（随后按推理耗时自适应）
         if (mode != prevMode && mode == 2) {
             g_sr_factor.store(4);
         }
         OH_LOG_INFO(LOG_APP, "[usb] enhance mode=%{public}d bright=%{public}d sharp=%{public}d "
-                    "quality=%{public}d srStrength=%{public}d",
-                    mode, brightness, sharpness, (int)(enhance != 0), strength);
+                    "contrast=%{public}d saturation=%{public}d srStrength=%{public}d",
+                    mode, brightness, sharpness, contrast, saturation, strength);
+    }
+
+    // ★ 人脸识别开关：关闭时工作线程不再入队，已画结果 1.5s 过期自动消失
+    void SetFaceEnabled(bool enabled) {
+        g_face_enabled.store(enabled);
+        OH_LOG_INFO(LOG_APP, "[face] enabled=%{public}d", (int)enabled);
     }
 
     void SetMotionEnabled(bool enabled) {
@@ -458,6 +474,11 @@ void YuvPipeline::Start() {
     inferRunning_.store(true);
     inferThread_ = std::thread(&YuvPipeline::InferenceLoop, this);
 
+    // ★ 人脸识别工作线程（启用时才真正入队推理，平时在条件变量上休眠）
+    faceBusy_.store(false);
+    faceRunning_.store(true);
+    faceThread_ = std::thread(&YuvPipeline::FaceWorkerLoop, this);
+
     OH_LOG_INFO(LOG_APP, "Pipeline started (async inference)");
 }
 
@@ -471,6 +492,18 @@ void YuvPipeline::Stop() {
         srThread_.join();
     }
     srBusy_.store(false);
+
+    // ★ 停人脸工作线程
+    faceRunning_.store(false);
+    faceCv_.notify_all();
+    if (faceThread_.joinable()) {
+        faceThread_.join();
+    }
+    faceBusy_.store(false);
+    {
+        std::lock_guard<std::mutex> lock(faceInfoMutex_);
+        faceResults_.clear();
+    }
 
     inferRunning_.store(false);
     inferCV_.notify_all();
@@ -796,6 +829,17 @@ void YuvPipeline::ProcessCommonTail() {
         cleanSnapCv_.notify_all();
     }
 
+    // ★ 人脸识别触发：干净帧入队，worker 忙时跳过本帧不积压（对齐 SR 模式）
+    if (g_face_enabled.load() && !faceBusy_.load() && ocr_bridge::faceIsReady()) {
+        std::lock_guard<std::mutex> lock(faceMutex_);
+        faceInPending_ = rgbaBuf_;
+        faceInW_ = displayWidth_;
+        faceInH_ = displayHeight_;
+        facePending_ = true;
+        faceBusy_.store(true);
+        faceCv_.notify_all();
+    }
+
     static int s_motion_tick = 0;
     if ((++s_motion_tick & 1) == 0) {
         update_motion_level(rgbaBuf_.data(), displayWidth_, displayHeight_);
@@ -834,6 +878,8 @@ void YuvPipeline::ProcessCommonTail() {
 
     DrawOverlayOnRgba();
     DrawOcrOverlay();
+    // ★ 人脸 106 关键点连线框 + 性别年龄颜值标注（画在 OCR 叠加之后）
+    DrawFaceOverlay();
 
     // ★ 用户要求：录像画面必须包含时间水印、识别框等叠加内容——
     //   推流挪到叠加绘制之后（此前推的是干净帧）。BGRAToARGB 通道修正
@@ -859,6 +905,12 @@ bool YuvPipeline::UpdateFrameSize(int width, int height) {
         std::lock_guard<std::mutex> lock(resultsMutex_);
         latestResults_.clear();
     }
+    // ★ 分辨率变化 → 旧人脸坐标失效，清空结果快照
+    {
+        std::lock_guard<std::mutex> lock(faceInfoMutex_);
+        faceResults_.clear();
+    }
+
     // ★ 尺寸变化后同步预览 surface 的 buffer geometry（同 ConfigureExternal）
     {
         std::lock_guard<std::mutex> lock(previewWindowMutex_);
@@ -881,6 +933,11 @@ bool YuvPipeline::ConfigureExternal(int width, int height) {
     {
         std::lock_guard<std::mutex> lock(resultsMutex_);
         latestResults_.clear();
+    }
+    // ★ 分辨率变化 → 旧人脸坐标失效，清空结果快照
+    {
+        std::lock_guard<std::mutex> lock(faceInfoMutex_);
+        faceResults_.clear();
     }
     // ★ 尺寸变化后同步预览 surface 的 buffer geometry，
     //   否则 PushPixelsToSurface 按旧 buffer 尺寸 CenterCrop（16:9 被裁掉 2/3 宽度）
@@ -906,6 +963,11 @@ void YuvPipeline::StartExternal() {
     srBusy_.store(false);
     srRunning_.store(true);
     srThread_ = std::thread(&YuvPipeline::SrWorkerLoop, this);
+
+    // ★ 人脸识别工作线程（启用时才真正入队推理，平时在条件变量上休眠）
+    faceBusy_.store(false);
+    faceRunning_.store(true);
+    faceThread_ = std::thread(&YuvPipeline::FaceWorkerLoop, this);
 
     OH_LOG_INFO(LOG_APP, "Pipeline started (external/UVC mode, async inference)");
 }
@@ -1034,30 +1096,36 @@ static void clarityRgba(uint8_t* rgba, int w, int h, float amount) {
 }
 
 // ★ USB 非AI画面增强（mode 1，仅外部供帧路径调用）：
-//   亮度偏移 ±50 直接加；画质增强 = 对比度围绕中值拉伸 1.12 倍 + 饱和度围绕灰度基准推远 1.15 倍；
-//   锐度 0~100 → unsharp mask 强度 0~1.6；
-//   在缩放入 rgbaBuf_ 之后、叠加绘制之前执行 → 时间/位置水印与识别框不被增强污染
+//   亮度 ±50 直接加；对比度 ±50 → 围绕中值 0.5~1.5 倍拉伸；
+//   饱和度 ±50 → 围绕灰度基准 0.5~1.5 倍推远；锐度 0~100 → unsharp mask 0~1.6；
+//   定点整数实现（1/256 定标），全部 0/关闭时零逐像素开销；
+//   在缩放入 rgbaBuf_ 之后、叠加绘制之前执行 → 水印/识别框/人脸框不被增强污染
 static void applyUsbEnhance(uint8_t* rgba, int w, int h) {
-    // ★ mode 0 = 完全关闭（亮度/锐度/对比度饱和度全部不生效）
+    // ★ mode 0 = 完全关闭（亮度/锐度/对比度/饱和度全部不生效）
     if (g_usb_mode.load() == 0) return;
     const int bright = g_usb_brightness.load();
-    const bool enhance = g_usb_enhance.load();
+    const int contrast = g_usb_contrast.load();
+    const int saturation = g_usb_saturation.load();
     const int sharp = g_usb_sharpness.load();
-    if (bright == 0 && !enhance && sharp == 0) return;
-    // ★ 分支外提：仅锐度开启时跳过逐像素循环（旧版白跑一遍空循环）
-    if (bright != 0 || enhance) {
+    if (bright == 0 && contrast == 0 && saturation == 0 && sharp == 0) return;
+    if (bright != 0 || contrast != 0 || saturation != 0) {
+        // 定标 256：contrast 因子 = (100+c)/100 ∈ [128,384]，saturation 同
+        const int cf = 256 * (100 + contrast) / 100;
+        const int sf = 256 * (100 + saturation) / 100;
         const size_t n = (size_t)w * h;
         uint8_t* p = rgba;
         for (size_t i = 0; i < n; ++i, p += 4) {
             int r = p[0], g = p[1], b = p[2];
-            if (enhance) {
-                r = (r - 128) * 112 / 100 + 128;
-                g = (g - 128) * 112 / 100 + 128;
-                b = (b - 128) * 112 / 100 + 128;
+            if (contrast != 0) {
+                r = ((r - 128) * cf >> 8) + 128;
+                g = ((g - 128) * cf >> 8) + 128;
+                b = ((b - 128) * cf >> 8) + 128;
+            }
+            if (saturation != 0) {
                 const int gray = (r * 299 + g * 587 + b * 114) / 1000;
-                r = gray + (r - gray) * 115 / 100;
-                g = gray + (g - gray) * 115 / 100;
-                b = gray + (b - gray) * 115 / 100;
+                r = gray + ((r - gray) * sf >> 8);
+                g = gray + ((g - gray) * sf >> 8);
+                b = gray + ((b - gray) * sf >> 8);
             }
             if (bright != 0) { r += bright; g += bright; b += bright; }
             p[0] = r < 0 ? 0 : (r > 255 ? 255 : (uint8_t)r);
@@ -1891,4 +1959,395 @@ void YuvPipeline::ClearSurface() {
         for (size_t i = 3; i < sz; i += 4) blackBuf_[i] = 255;
     }
     PushPixelsToSurface(blackBuf_.data(), displayWidth_, displayHeight_);
+}
+
+// ═══════════ 人脸识别：SCRFD 检测 + 106 关键点连线框 ═══════════
+
+// face_detect_rgba 每脸输出 float 数：
+//   [0..3]box + [4]score + [5]gender + [6]age + [7]beauty + [8..215]106点xy
+//   + [216..222]颜值分项（对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
+static constexpr int kFaceFloats = 223;
+static constexpr int kMaxFaceDraw = 4;      // 最多绘制/上报的人脸数
+static constexpr int kFaceStaleMs = 600;    // 结果过期阈值（超时不画不报，自动消失；
+                                            // 过长会滞留旧坐标，与移动中的人脸错位）
+
+// 像素 alpha 混合写入（越界由调用方裁剪）
+static inline void blendPxRgba(uint8_t *p, uint8_t r, uint8_t g, uint8_t b, int a) {
+    if (a <= 0) return;
+    if (a > 255) a = 255;
+    const int ia = 255 - a;
+    p[0] = (uint8_t)((r * a + p[0] * ia + 127) / 255);
+    p[1] = (uint8_t)((g * a + p[1] * ia + 127) / 255);
+    p[2] = (uint8_t)((b * a + p[2] * ia + 127) / 255);
+}
+
+// Bresenham 直线（th×th 方块笔刷 + alpha 混合）—— 连线框辉光底衬
+static void drawLineRgba(uint8_t *rgba, int W, int H,
+                         float x0f, float y0f, float x1f, float y1f,
+                         int th, uint8_t r, uint8_t g, uint8_t b, int a) {
+    int x0 = (int)(x0f + 0.5f), y0 = (int)(y0f + 0.5f);
+    int x1 = (int)(x1f + 0.5f), y1 = (int)(y1f + 0.5f);
+    const int dx = std::abs(x1 - x0), dy = -std::abs(y1 - y0);
+    const int sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    const int half = th / 2;
+    while (true) {
+        for (int oy = -half; oy <= half; ++oy) {
+            const int py = y0 + oy;
+            if (py < 0 || py >= H) continue;
+            for (int ox = -half; ox <= half; ++ox) {
+                const int px = x0 + ox;
+                if (px < 0 || px >= W) continue;
+                blendPxRgba(rgba + ((size_t)py * W + px) * 4, r, g, b, a);
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        const int e2 = err * 2;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+// ★ Xiaolin Wu 抗锯齿直线（alpha 混合）—— 106 点连线框的精细笔画，
+//   消除 Bresenham 方块笔画的锯齿感
+static void drawLineAA(uint8_t *rgba, int W, int H,
+                       float x0, float y0, float x1, float y1,
+                       uint8_t r, uint8_t g, uint8_t b, int a) {
+    auto plot = [&](int x, int y, int alpha) {
+        if (x < 0 || x >= W || y < 0 || y >= H) return;
+        blendPxRgba(rgba + ((size_t)y * W + x) * 4, r, g, b, alpha);
+    };
+    if (std::fabs(x1 - x0) < 0.01f && std::fabs(y1 - y0) < 0.01f) {
+        plot((int)(x0 + 0.5f), (int)(y0 + 0.5f), a);
+        return;
+    }
+    auto fpart = [](float v) { return v - std::floor(v); };
+    auto rfpart = [&fpart](float v) { return 1.0f - fpart(v); };
+    const bool steep = std::fabs(y1 - y0) > std::fabs(x1 - x0);
+    if (steep) {
+        std::swap(x0, y0);
+        std::swap(x1, y1);
+    }
+    if (x0 > x1) {
+        std::swap(x0, x1);
+        std::swap(y0, y1);
+    }
+    const float dx = x1 - x0, dy = y1 - y0;
+    const float grad = std::fabs(dx) < 1e-6f ? 1.0f : dy / dx;
+    // 端点
+    float xend = std::floor(x0), yend = y0 + grad * (xend - x0);
+    float xgap = rfpart(x0 + 0.5f);
+    const int xpxl1 = (int)xend;
+    const float intery0 = yend + grad;
+    if (steep) {
+        plot((int)std::floor(yend), xpxl1, (int)(rfpart(yend) * xgap * a));
+        plot((int)std::floor(yend) + 1, xpxl1, (int)(fpart(yend) * xgap * a));
+    } else {
+        plot(xpxl1, (int)std::floor(yend), (int)(rfpart(yend) * xgap * a));
+        plot(xpxl1, (int)std::floor(yend) + 1, (int)(fpart(yend) * xgap * a));
+    }
+    xend = std::floor(x1);
+    yend = y1 + grad * (xend - x1);
+    xgap = fpart(x1 + 0.5f);
+    const int xpxl2 = (int)xend;
+    if (steep) {
+        plot((int)std::floor(yend), xpxl2, (int)(rfpart(yend) * xgap * a));
+        plot((int)std::floor(yend) + 1, xpxl2, (int)(fpart(yend) * xgap * a));
+    } else {
+        plot(xpxl2, (int)std::floor(yend), (int)(rfpart(yend) * xgap * a));
+        plot(xpxl2, (int)std::floor(yend) + 1, (int)(fpart(yend) * xgap * a));
+    }
+    // 主体
+    float intery = intery0;
+    if (steep) {
+        for (int x = xpxl1 + 1; x < xpxl2; ++x) {
+            plot((int)std::floor(intery), x, (int)(rfpart(intery) * a));
+            plot((int)std::floor(intery) + 1, x, (int)(fpart(intery) * a));
+            intery += grad;
+        }
+    } else {
+        for (int x = xpxl1 + 1; x < xpxl2; ++x) {
+            plot(x, (int)std::floor(intery), (int)(rfpart(intery) * a));
+            plot(x, (int)std::floor(intery) + 1, (int)(fpart(intery) * a));
+            intery += grad;
+        }
+    }
+}
+
+// 106 点连线表（离线实证，索引 → pts[i*2] / pts[i*2+1]）
+static const int kFaceOval[] = {           // 脸轮廓闭环
+    1, 9, 10, 11, 12, 13, 14, 15, 16, 2, 3, 4, 5, 6, 7, 8,
+    0, 24, 23, 22, 21, 20, 19, 18, 32, 31, 30, 29, 28, 27, 26, 25, 17
+};
+static const int kFaceEyeR[] = {35, 41, 40, 42, 39, 37, 33, 36};   // 右眼环
+static const int kFaceEyeL[] = {93, 96, 94, 95, 89, 90, 87, 91};   // 左眼环
+static const int kFaceBrowRLo[] = {43, 44, 45, 47, 46};            // 右眉下沿
+static const int kFaceBrowRUp[] = {48, 49, 51, 50};                // 右眉上沿
+static const int kFaceBrowLLo[] = {101, 100, 99, 98, 97};          // 左眉下沿
+static const int kFaceBrowLUp[] = {105, 104, 103, 102};            // 左眉上沿
+static const int kFaceNoseRing[] = {75, 76, 77, 78, 79, 80, 85, 84, 83, 82, 81};  // 鼻翼环
+static const int kFaceNoseBridge[] = {72, 73, 74, 86};             // 鼻梁
+static const int kFaceMouthOut[] = {52, 65, 64, 63, 71, 67, 68, 61, 58, 59, 53, 56, 55};  // 嘴外圈
+static const int kFaceMouthIn[] = {66, 62, 70, 69, 57, 60, 54};    // 嘴内圈
+
+// 折线绘制：closed=true 首尾相连；辉光底衬（方块笔刷低透明度）+ 抗锯齿精细线双层笔画
+static void drawFacePoly(uint8_t *rgba, int W, int H, const FaceDrawInfo &f,
+                         const int *idx, int n, bool closed, int th,
+                         uint8_t r, uint8_t g, uint8_t b, int a) {
+    const int segs = closed ? n : n - 1;
+    for (int i = 0; i < segs; ++i) {
+        const int ai = idx[i];
+        const int ci = closed ? idx[(i + 1) % n] : idx[i + 1];
+        const float ax = f.pts[ai * 2], ay = f.pts[ai * 2 + 1];
+        const float cx = f.pts[ci * 2], cy = f.pts[ci * 2 + 1];
+        if (th > 1) {
+            drawLineRgba(rgba, W, H, ax, ay, cx, cy, th, r, g, b, 48);
+        }
+        drawLineAA(rgba, W, H, ax, ay, cx, cy, r, g, b, a);
+    }
+}
+
+// ★ 人脸工作线程：等待新帧 → SCRFD 检测 + 106 点 + 性别年龄推理 → 结果快照
+//   相机线程忙时跳过（faceBusy_），永远处理最新画面；结果带时间戳供过期剔除
+void YuvPipeline::FaceWorkerLoop() {
+    OH_LOG_INFO(LOG_APP, "[face] worker loop started");
+    faceOutBuf_.resize((size_t)kMaxFaceDraw * kFaceFloats);
+    while (faceRunning_.load()) {
+        std::unique_lock<std::mutex> lk(faceMutex_);
+        faceCv_.wait(lk, [this] { return facePending_ || !faceRunning_.load(); });
+        if (!faceRunning_.load()) break;
+        faceWork_.swap(faceInPending_);
+        facePending_ = false;
+        const int w = faceInW_, h = faceInH_;
+        lk.unlock();
+
+        if (w > 0 && h > 0 && (size_t)w * h * 4 <= faceWork_.size()) {
+            const int n = ocr_bridge::faceDetect(faceWork_.data(), w, h,
+                                                 faceOutBuf_.data(), kMaxFaceDraw);
+            std::vector<FaceDrawInfo> snap;
+            snap.reserve((size_t)(n > 0 ? n : 0));
+            const auto now = std::chrono::steady_clock::now();
+            for (int i = 0; i < n; ++i) {
+                const float *fl = faceOutBuf_.data() + (size_t)i * kFaceFloats;
+                FaceDrawInfo d = {};
+                d.box[0] = fl[0]; d.box[1] = fl[1]; d.box[2] = fl[2]; d.box[3] = fl[3];
+                d.score = fl[4];
+                d.gender = (int)fl[5];
+                d.age = fl[6];
+                d.beauty = fl[7];
+                for (int k = 0; k < 212; ++k) d.pts[k] = fl[8 + k];
+                for (int k = 0; k < 7; ++k) d.comp[k] = fl[216 + k];
+                d.ts = now;
+                snap.push_back(d);
+            }
+            {
+                std::lock_guard<std::mutex> il(faceInfoMutex_);
+                faceResults_ = std::move(snap);
+                faceResW_ = w;
+                faceResH_ = h;
+            }
+        }
+        faceBusy_.store(false);
+    }
+    OH_LOG_INFO(LOG_APP, "[face] worker loop exited");
+}
+
+// ★ 人脸连线框绘制（DrawOcrOverlay 之后调用，画在已增强的最终画面上）：
+//   轮廓/眉/鼻梁绿、眼/鼻环/嘴青、瞳孔红十字、框上方"性别 年龄 颜值"标注
+void YuvPipeline::DrawFaceOverlay() {
+    if (!g_face_enabled.load()) return;
+    if (displayWidth_ <= 0 || displayHeight_ <= 0 || rgbaBuf_.empty()) return;
+
+    std::vector<FaceDrawInfo> snap;
+    int fw = 0, fh = 0;
+    {
+        std::lock_guard<std::mutex> lock(faceInfoMutex_);
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<FaceDrawInfo> keep;
+        keep.reserve(faceResults_.size());
+        for (const auto &f : faceResults_) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - f.ts).count() <= kFaceStaleMs) {
+                keep.push_back(f);
+            }
+        }
+        faceResults_ = std::move(keep);
+        snap = faceResults_;
+        fw = faceResW_;
+        fh = faceResH_;
+    }
+    if (snap.empty() || fw <= 0 || fh <= 0) return;
+
+    uint8_t *buf = rgbaBuf_.data();
+    const int W = displayWidth_, H = displayHeight_;
+    const float sx = (float)W / (float)fw, sy = (float)H / (float)fh;
+    const int th = std::max(2, W / 720);    // 辉光底衬粗细
+    const int fs = std::max(14, W / 45);
+    // ★ 每人脸独立配色（按人脸序号取 6 色循环，与 ETS 端 FACE_PALETTE 完全一致）：
+    //   连线框/外框/标注/详情箭头同色，多脸时一眼区分谁是谁；
+    //   特征色 = 主色各通道 +55 提亮（保留色相）
+    static const uint8_t kFacePalette[][3] = {
+        {0, 235, 178}, {255, 159, 64}, {80, 170, 255},
+        {255, 100, 170}, {188, 140, 255}, {255, 215, 80}
+    };
+
+    for (size_t fi = 0; fi < snap.size(); ++fi) {
+        const uint8_t R1 = kFacePalette[fi % 6][0];
+        const uint8_t G1 = kFacePalette[fi % 6][1];
+        const uint8_t B1 = kFacePalette[fi % 6][2];
+        const uint8_t R2 = (uint8_t)std::min(255, (int)R1 + 55);
+        const uint8_t G2 = (uint8_t)std::min(255, (int)G1 + 55);
+        const uint8_t B2 = (uint8_t)std::min(255, (int)B1 + 55);
+        // 坐标缩放到当前显示尺寸
+        FaceDrawInfo f = snap[fi];
+        f.box[0] *= sx; f.box[1] *= sy; f.box[2] *= sx; f.box[3] *= sy;
+        for (int k = 0; k < 212; ++k) f.pts[k] *= (k & 1) ? sy : sx;
+
+        drawFacePoly(buf, W, H, f, kFaceOval, (int)(sizeof(kFaceOval) / sizeof(int)),
+                     true, th, R1, G1, B1, 235);
+        drawFacePoly(buf, W, H, f, kFaceEyeR, 8, true, th, R2, G2, B2, 225);
+        drawFacePoly(buf, W, H, f, kFaceEyeL, 8, true, th, R2, G2, B2, 225);
+        drawFacePoly(buf, W, H, f, kFaceBrowRLo, 5, false, th, R1, G1, B1, 225);
+        drawFacePoly(buf, W, H, f, kFaceBrowRUp, 4, false, th, R1, G1, B1, 200);
+        drawFacePoly(buf, W, H, f, kFaceBrowLLo, 5, false, th, R1, G1, B1, 225);
+        drawFacePoly(buf, W, H, f, kFaceBrowLUp, 4, false, th, R1, G1, B1, 200);
+        drawFacePoly(buf, W, H, f, kFaceNoseRing, 11, true, th, R2, G2, B2, 215);
+        drawFacePoly(buf, W, H, f, kFaceNoseBridge, 4, false, th, R1, G1, B1, 225);
+        drawFacePoly(buf, W, H, f, kFaceMouthOut, 13, true, th, R2, G2, B2, 225);
+        drawFacePoly(buf, W, H, f, kFaceMouthIn, 6, true, th, R2, G2, B2, 195);
+
+        // ★ 每人脸彩色外框（连线框同色）：详情箭头指向框顶中心，颜色一一对应
+        {
+            const int bth = std::max(2, th / 2);
+            const int bx0 = (int)f.box[0] - bth;
+            const int by0 = (int)f.box[1] - bth;
+            const int bw = (int)(f.box[2] - f.box[0]) + bth * 2;
+            const int bh = (int)(f.box[3] - f.box[1]) + bth * 2;
+            fillRectAlpha(buf, W, H, bx0, by0, bw, bth, R1, G1, B1, 130);
+            fillRectAlpha(buf, W, H, bx0, by0 + bh - bth, bw, bth, R1, G1, B1, 130);
+            fillRectAlpha(buf, W, H, bx0, by0, bth, bh, R1, G1, B1, 130);
+            fillRectAlpha(buf, W, H, bx0 + bw - bth, by0, bth, bh, R1, G1, B1, 130);
+        }
+
+        // 框上方信息标注（两行）：第一行"女 27岁 颜值93"，
+        // 第二行"失分:眉38 眼型41 三庭45"（7 分项中得分最低的 3 项）
+        std::string info;
+        if (f.gender == 0) {
+            info += "女";
+        } else if (f.gender == 1) {
+            info += "男";
+        }
+        if (f.age >= 0) {
+            if (!info.empty()) info += " ";
+            info += std::to_string((int)(f.age + 0.5f)) + "岁";
+        }
+        if (f.beauty >= 0) {
+            if (!info.empty()) info += " ";
+            info += "颜值" + std::to_string((int)(f.beauty + 0.5f));
+        }
+        std::string detail;
+        if (f.beauty >= 0) {
+            static const char *kCompNames[7] =
+                {"对称", "眼形", "眉形", "鼻形", "嘴形", "三庭", "眼型"};
+            int order[7] = {0, 1, 2, 3, 4, 5, 6};
+            std::sort(order, order + 7, [&f](int a, int b) {
+                return f.comp[a] < f.comp[b];
+            });
+            int shown = 0;
+            for (int ci = 0; ci < 7 && shown < 3; ++ci) {
+                if (f.comp[order[ci]] < 0.0f) continue;
+                detail += (shown == 0) ? "失分:" : " ";
+                detail += std::string(kCompNames[order[ci]]) +
+                          std::to_string((int)(f.comp[order[ci]] + 0.5f));
+                ++shown;
+            }
+            if (shown == 0) detail.clear();
+        }
+        if (!info.empty()) {
+            const int fs2 = std::max(11, fs - 3);
+            int tw = measureTextCN(info, fs);
+            if (tw <= 0) tw = (int)info.size() * fs;
+            int tw2 = detail.empty() ? 0 : measureTextCN(detail, fs2);
+            if (tw2 <= 0 && !detail.empty()) tw2 = (int)detail.size() * fs2;
+            const int twAll = std::max(tw, tw2);
+            int x0 = (int)f.box[0];
+            int labelTop = (int)f.box[1] - (detail.empty() ? fs : fs + fs2 + 4) - 8;
+            if (labelTop < 0) labelTop = 0;
+            if (x0 < 0) x0 = 0;
+            if (x0 + twAll + 10 > W) x0 = W - twAll - 10;
+            if (detail.empty()) {
+                fillRectAlpha(buf, W, H, x0, labelTop, twAll + 10, fs + 6, 0, 0, 0, 140);
+                drawTextCN(buf, W, H, info, x0 + 5, labelTop + fs, fs, R1, G1, B1);
+            } else {
+                fillRectAlpha(buf, W, H, x0, labelTop, twAll + 10, fs + fs2 + 10,
+                              0, 0, 0, 140);
+                drawTextCN(buf, W, H, info, x0 + 5, labelTop + fs, fs, R1, G1, B1);
+                drawTextCN(buf, W, H, detail, x0 + 5, labelTop + fs + fs2 + 4, fs2,
+                           R2, G2, B2);
+            }
+        }
+    }
+}
+
+// ★ HUD 人脸信息 JSON：{count, faces:[{gender,age,beauty,x,y,w,h}]}
+//   过期结果自动剔除；坐标缩放到当前显示尺寸
+std::string YuvPipeline::GetFaceInfoJson() {
+    std::vector<FaceDrawInfo> snap;
+    int fw = 0, fh = 0;
+    { 
+        std::lock_guard<std::mutex> lock(faceInfoMutex_);
+        const auto now = std::chrono::steady_clock::now();
+        std::vector<FaceDrawInfo> keep;
+        keep.reserve(faceResults_.size());
+        for (const auto &f : faceResults_) {
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - f.ts).count() <= kFaceStaleMs) {
+                keep.push_back(f);
+            }
+        }
+        faceResults_ = std::move(keep);
+        snap = faceResults_;
+        fw = faceResW_;
+        fh = faceResH_;
+    }
+    std::string json = "{\"count\":" + std::to_string(snap.size()) +
+                       // ★ dw/dh：display 像素尺寸，ETS 端把 box 归一化后映射到屏幕坐标画箭头
+                       ",\"dw\":" + std::to_string(displayWidth_) +
+                       ",\"dh\":" + std::to_string(displayHeight_);
+    if (!snap.empty() && fw > 0 && fh > 0) {
+        const float sx = (float)displayWidth_ / (float)fw;
+        const float sy = (float)displayHeight_ / (float)fh;
+        json += ",\"faces\":[";
+        bool first = true;
+        for (size_t fi = 0; fi < snap.size(); ++fi) {
+            const FaceDrawInfo &f = snap[fi];
+            const float x = f.box[0] * sx;
+            const float y = f.box[1] * sy;
+            const float w = (f.box[2] - f.box[0]) * sx;
+            const float h = (f.box[3] - f.box[1]) * sy;
+            if (!first) json += ",";
+            first = false;
+            // ★ i：人脸序号（=数组位置=连线框配色索引），ETS 按它取同色调箭头/面板
+            json += "{\"i\":" + std::to_string(fi) +
+                    ",\"gender\":" + std::to_string(f.gender) +
+                    ",\"age\":" + std::to_string(f.age >= 0 ? (int)(f.age + 0.5f) : -1) +
+                    ",\"beauty\":" + std::to_string(f.beauty >= 0 ? (int)(f.beauty + 0.5f) : -1) +
+                    ",\"comps\":[" +
+                    std::to_string((int)(f.comp[0] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[1] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[2] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[3] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[4] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[5] + 0.5f)) + "," +
+                    std::to_string((int)(f.comp[6] + 0.5f)) + "]" +
+                    ",\"x\":" + std::to_string((int)x) +
+                    ",\"y\":" + std::to_string((int)y) +
+                    ",\"w\":" + std::to_string((int)w) +
+                    ",\"h\":" + std::to_string((int)h) + "}";
+        }
+        json += "]";
+    } else {
+        json += ",\"faces\":[]";
+    }
+    return json + "}";
 }

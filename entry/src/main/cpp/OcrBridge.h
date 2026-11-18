@@ -55,6 +55,14 @@ namespace ocr_bridge {
     // 当前模型放大倍数（2/3/4），未就绪 0
     int srScale();
 
+    /* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage 性别年龄 + 几何颜值） */
+    bool faceInit(const std::string &detPath, const std::string &lmPath,
+                  const std::string &gaPath, int numThreads);
+    bool faceIsReady();
+    void faceRelease();
+    // 同步检测一帧：facesOut 每脸 223 float（布局见 ocr_c_api.h），返回脸数
+    int faceDetect(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces);
+
 }  // namespace ocr_bridge
 
 #endif

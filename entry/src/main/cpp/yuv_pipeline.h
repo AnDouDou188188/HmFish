@@ -24,6 +24,18 @@
 
 struct DetectItem { float x, y, w, h, score; int label; };
 
+// ★ 人脸识别结果快照（face 工作线程写入，绘制线程/napi 读取）
+struct FaceDrawInfo {
+    float box[4];       // x1,y1,x2,y2（图像坐标）
+    float score;        // 检测分
+    int gender;         // 0=女 1=男 -1=未知
+    float age;          // -1=未知
+    float beauty;       // 0~100，-1=未知
+    float comp[7];      // 颜值分项（各 0~100，-1=未知）：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+    float pts[212];     // 106 关键点 x,y（图像坐标）
+    std::chrono::steady_clock::time_point ts;   // 结果时间戳（>1.5s 视为过期丢弃）
+};
+
 class YuvPipeline {
 public:
     YuvPipeline() = default;
@@ -74,6 +86,9 @@ public:
     void SetLocationText(const std::string &text);
     // ★ 位置水印纵向位置：ratio∈[0.4,1.0]，水印条画在 H*ratio 处（1.0=帧底）
     void SetLocationBottomRatio(float ratio);
+
+    // ★ 人脸识别 HUD 信息（JSON：count/faces[gender,age,beauty,x,y,w,h]），过期结果自动剔除
+    std::string GetFaceInfoJson();
 
     // ★ 录像不中断：AVRecorder 输入 surface 交给 native 直接喂 NV12 帧，
     //   相机/预览/识别全程不重配不中断（对齐 Android 录像架构）
@@ -194,6 +209,25 @@ private:
     std::vector<uint8_t> srBlendBuf_;      // 基底帧（原始裁切缩放到显示尺寸）
     int srInW_ = 0, srInH_ = 0;            // pending 输入尺寸
     int srRawW_ = 0, srRawH_ = 0;          // pending 原始裁切尺寸
+
+    // ★ 人脸识别异步工作线程（对齐 SrWorker 模式：相机线程只拷贝入队，
+    //   SCRFD + 106 点 + 性别年龄推理在工作线程执行，结果快照供绘制与 napi HUD）
+    void FaceWorkerLoop();
+    void DrawFaceOverlay();
+    std::thread faceThread_;
+    std::mutex faceMutex_;
+    std::condition_variable faceCv_;
+    std::atomic<bool> faceRunning_{false};
+    std::atomic<bool> faceBusy_{false};    // 入队后置 true，工作线程处理完置 false
+    bool facePending_ = false;             // faceMutex_ 保护
+    std::vector<uint8_t> faceInPending_;   // 相机线程 → 工作线程
+    int faceInW_ = 0, faceInH_ = 0;
+    std::vector<uint8_t> faceWork_;        // 工作线程私有
+    std::vector<float> faceOutBuf_;        // 工作线程私有（face_detect_rgba 输出，每脸 223 float）
+    // 结果快照（faceInfoMutex_ 保护）
+    std::mutex faceInfoMutex_;
+    std::vector<FaceDrawInfo> faceResults_;
+    int faceResW_ = 0, faceResH_ = 0;
 };
 
 #endif

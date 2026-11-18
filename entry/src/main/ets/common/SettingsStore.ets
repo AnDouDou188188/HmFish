@@ -51,12 +51,16 @@ export interface AppSettings {
   // ★ 识别框/标签画面显示开关（默认开：关闭后不画框/文字，识别与自动录像不受影响）
   drawBoxesOn: boolean;
   // ★ USB 画质增强（仅 USB 摄像头画面生效）：
-  //   mode 0 关 / 1 非AI(亮度+锐度+对比度饱和度) / 2 AI超分(QuickSRNetMedium x4 + 精修锐化)
+  //   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI超分(QuickSRNetMedium x4 + 精修锐化)
   usbBrightness: number;
-  usbEnhance: boolean;
   usbSharpness: number;
   usbEnhanceMode: number;
   usbSrStrength: number;
+  // ★ 对比度/饱和度滑条（-50~+50，替代旧版"画质增强"布尔开关）
+  usbContrast: number;
+  usbSaturation: number;
+  // ★ 人脸识别开关（SCRFD 检测 + 106 关键点连线框 + 性别年龄颜值标注 + HUD）
+  faceEnabled: boolean;
   // ★ mode 枚举 v3 迁移标记：v1/v2 的 2/3/4/5（旧多模型）→ v3 的 2（AI超分）
   usbEnhanceV2: boolean;
   usbEnhanceV3: boolean;
@@ -113,10 +117,12 @@ export class SettingsStore {
       recordSoundPath: '',
       drawBoxesOn: true,
       usbBrightness: 0,
-      usbEnhance: false,
       usbSharpness: 0,
       usbEnhanceMode: 0,
       usbSrStrength: 100,
+      usbContrast: 0,
+      usbSaturation: 0,
+      faceEnabled: false,
       usbEnhanceV2: false,
       usbEnhanceV3: false
     };
@@ -163,10 +169,27 @@ export class SettingsStore {
     r.recordSoundPath = await p.get('recordSoundPath', '') as string;
     r.drawBoxesOn = await p.get('drawBoxesOn', true) as boolean;
     r.usbBrightness = await p.get('usbBrightness', 0) as number;
-    r.usbEnhance = await p.get('usbEnhance', false) as boolean;
     r.usbSharpness = await p.get('usbSharpness', 0) as number;
     r.usbEnhanceMode = await p.get('usbEnhanceMode', 0) as number;
     r.usbSrStrength = await p.get('usbSrStrength', 100) as number;
+    // ★ v4 一次性迁移：旧版"画质增强"布尔开关 → 对比度/饱和度滑条（15/15）
+    const oldContrast = await p.get('usbContrast', -999) as number;
+    if (oldContrast === -999) {
+      const oldEnhance = await p.get('usbEnhance', false) as boolean;
+      r.usbContrast = oldEnhance ? 15 : 0;
+      await p.put('usbContrast', r.usbContrast);
+    } else {
+      r.usbContrast = oldContrast;
+    }
+    const oldSaturation = await p.get('usbSaturation', -999) as number;
+    if (oldSaturation === -999) {
+      const oldEnhance = await p.get('usbEnhance', false) as boolean;
+      r.usbSaturation = oldEnhance ? 15 : 0;
+      await p.put('usbSaturation', r.usbSaturation);
+    } else {
+      r.usbSaturation = oldSaturation;
+    }
+    r.faceEnabled = await p.get('faceEnabled', false) as boolean;
     // ★ mode 枚举 v3 一次性迁移：v1/v2 的 2/3/4/5（旧多模型枚举）→ v3 的 2（AI超分）
     r.usbEnhanceV2 = await p.get('usbEnhanceV2', false) as boolean;
     r.usbEnhanceV3 = await p.get('usbEnhanceV3', false) as boolean;
@@ -224,10 +247,12 @@ export class SettingsStore {
     if (s.recordSoundPath !== undefined) await p.put('recordSoundPath', s.recordSoundPath);
     if (s.drawBoxesOn !== undefined) await p.put('drawBoxesOn', s.drawBoxesOn);
     if (s.usbBrightness !== undefined) await p.put('usbBrightness', s.usbBrightness);
-    if (s.usbEnhance !== undefined) await p.put('usbEnhance', s.usbEnhance);
     if (s.usbSharpness !== undefined) await p.put('usbSharpness', s.usbSharpness);
     if (s.usbEnhanceMode !== undefined) await p.put('usbEnhanceMode', s.usbEnhanceMode);
     if (s.usbSrStrength !== undefined) await p.put('usbSrStrength', s.usbSrStrength);
+    if (s.usbContrast !== undefined) await p.put('usbContrast', s.usbContrast);
+    if (s.usbSaturation !== undefined) await p.put('usbSaturation', s.usbSaturation);
+    if (s.faceEnabled !== undefined) await p.put('faceEnabled', s.faceEnabled);
     if (s.usbEnhanceV2 !== undefined) await p.put('usbEnhanceV2', s.usbEnhanceV2);
     if (s.usbEnhanceV3 !== undefined) await p.put('usbEnhanceV3', s.usbEnhanceV3);
     if (s.enabledLabels !== undefined) await p.put('enabledLabels', s.enabledLabels.join(','));

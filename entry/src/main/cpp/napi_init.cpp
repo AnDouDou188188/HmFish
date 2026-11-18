@@ -45,8 +45,11 @@ extern "C" {
     void SetYoloEnabled(bool enabled);
     // ★ 识别框/标签画面显示开关（yuv_pipeline.cpp 定义）
     void SetDrawBoxesEnabled(bool enabled);
-    // ★ USB 画质增强（yuv_pipeline.cpp 定义）：mode 0关/1非AI/2 QuickSRNet超分/3 RealESRGAN超分
-    void SetUsbEnhance(int mode, int brightness, int sharpness, int enhance, int strength);
+    // ★ USB 画质增强（yuv_pipeline.cpp 定义）：mode 0关/1非AI/2 QuickSRNet超分
+    void SetUsbEnhance(int mode, int brightness, int sharpness,
+                       int contrast, int saturation, int strength);
+    // ★ 人脸识别画面开关（yuv_pipeline.cpp 定义）
+    void SetFaceEnabled(bool enabled);
     void SetMotionEnabled(bool enabled);
     float GetMotionLevel();
     void SetDepthEnabled(bool enabled);
@@ -389,19 +392,110 @@ static napi_value SetDrawBoxesNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ USB 画质增强（仅 USB 外部供帧路径生效）：
-//   mode 0 关 / 1 非AI(亮度+锐度+对比度饱和度) / 2 QuickSRNetSmall 超分 / 3 Real-ESRGAN 超分
+//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 QuickSRNetSmall 超分
 static napi_value SetUsbEnhanceNapi(napi_env env, napi_callback_info info) {
-    size_t argc = 5; napi_value args[5];
+    size_t argc = 6; napi_value args[6];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
-    int32_t mode = 0, brightness = 0, sharpness = 0, strength = 100;
-    bool enhance = false;
+    int32_t mode = 0, brightness = 0, sharpness = 0, contrast = 0, saturation = 0, strength = 100;
     if (argc > 0) napi_get_value_int32(env, args[0], &mode);
     if (argc > 1) napi_get_value_int32(env, args[1], &brightness);
     if (argc > 2) napi_get_value_int32(env, args[2], &sharpness);
-    if (argc > 3) napi_get_value_bool(env, args[3], &enhance);
-    if (argc > 4) napi_get_value_int32(env, args[4], &strength);
-    SetUsbEnhance((int)mode, (int)brightness, (int)sharpness, (int)(enhance ? 1 : 0), (int)strength);
+    if (argc > 3) napi_get_value_int32(env, args[3], &contrast);
+    if (argc > 4) napi_get_value_int32(env, args[4], &saturation);
+    if (argc > 5) napi_get_value_int32(env, args[5], &strength);
+    SetUsbEnhance((int)mode, (int)brightness, (int)sharpness,
+                  (int)contrast, (int)saturation, (int)strength);
     return nullptr;
+}
+
+// ═══════════ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage）═══════════
+
+// 异步加载三个人脸模型（对齐 initTable 模式，避免阻塞 UI 线程）
+struct FaceInitCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string detPath;
+    std::string lmPath;
+    std::string gaPath;
+    int threads = 3;
+    bool ok = false;
+};
+
+static void FaceInitExecute(napi_env env, void *data) {
+    auto *ctx = static_cast<FaceInitCtx *>(data);
+    if (!ocr_bridge::load()) {
+        OH_LOG_ERROR(LOG_APP, "face init: ocr bridge load failed");
+        ctx->ok = false;
+        return;
+    }
+    ctx->ok = ocr_bridge::faceInit(ctx->detPath, ctx->lmPath, ctx->gaPath, ctx->threads);
+}
+
+static void FaceInitComplete(napi_env env, napi_status status, void *data) {
+    auto *ctx = static_cast<FaceInitCtx *>(data);
+    napi_value result = nullptr;
+    napi_get_boolean(env, ctx->ok, &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+static napi_value InitFace(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    char detPath[1024] = {0};
+    char lmPath[1024] = {0};
+    char gaPath[1024] = {0};
+    size_t len = 0;
+    int32_t threads = 3;
+    if (argc > 0) napi_get_value_string_utf8(env, args[0], detPath, sizeof(detPath), &len);
+    if (argc > 1) napi_get_value_string_utf8(env, args[1], lmPath, sizeof(lmPath), &len);
+    if (argc > 2) napi_get_value_string_utf8(env, args[2], gaPath, sizeof(gaPath), &len);
+    if (argc > 3) napi_get_value_int32(env, args[3], &threads);
+
+    auto *ctx = new FaceInitCtx();
+    ctx->detPath = std::string(detPath);
+    ctx->lmPath = std::string(lmPath);
+    ctx->gaPath = std::string(gaPath);
+    ctx->threads = (int)threads;
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "initFace", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName,
+                           FaceInitExecute, FaceInitComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
+static napi_value ReleaseFace(napi_env env, napi_callback_info) {
+    ocr_bridge::faceRelease();
+    return nullptr;
+}
+
+// ★ 人脸识别画面开关：false 时工作线程不再入队，已画连线框 1.5s 过期自动消失
+static napi_value SetFaceEnabledNapi(napi_env env, napi_callback_info info) {
+    size_t argc = 1; napi_value args[1];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    bool enabled = false;
+    if (argc > 0) napi_get_value_bool(env, args[0], &enabled);
+    SetFaceEnabled(enabled);
+    return nullptr;
+}
+
+// ★ HUD 人脸信息（JSON：count/faces[gender,age,beauty,x,y,w,h]，500ms 轮询）
+static napi_value GetFaceInfoNapi(napi_env env, napi_callback_info) {
+    std::string json = "{\"count\":0,\"faces\":[]}";
+    {
+        std::lock_guard<std::mutex> lock(gPipelineMutex);
+        if (gPipeline) json = gPipeline->GetFaceInfoJson();
+    }
+    napi_value result = nullptr;
+    napi_create_string_utf8(env, json.c_str(), json.size(), &result);
+    return result;
 }
 
 // ★ AI 超分模型加载（libocr.so 经 OcrBridge dlsym）：onnxPath + 推理线程数
@@ -966,6 +1060,10 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"initTable",            nullptr, InitTable,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initSr",               nullptr, InitSrNapi,           nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseSr",            nullptr, ReleaseSrNapi,        nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"initFace",             nullptr, InitFace,             nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"releaseFace",          nullptr, ReleaseFace,          nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"setFaceEnabled",       nullptr, SetFaceEnabledNapi,   nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"getFaceInfo",          nullptr, GetFaceInfoNapi,      nullptr, nullptr, nullptr, napi_default, nullptr},
         {"recognizeTable",       nullptr, RecognizeTable,       nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);

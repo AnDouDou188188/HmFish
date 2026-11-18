@@ -42,6 +42,10 @@ namespace ocr_bridge {
         void (*sr_release)(void);
         int (*sr_upscale_rgba)(const uint8_t *, int, int, uint8_t *, int, int);
         int (*sr_scale)(void);
+        int (*face_init)(const char *, const char *, const char *, int);
+        int (*face_is_ready)(void);
+        void (*face_release)(void);
+        int (*face_detect_rgba)(const uint8_t *, int, int, float *, int);
     };
 
     static std::mutex g_mutex;
@@ -99,6 +103,12 @@ namespace ocr_bridge {
             api.sr_upscale_rgba = (int (*)(const uint8_t *, int, int, uint8_t *, int, int))
                     dlsym(h, "sr_upscale_rgba");
             api.sr_scale = (int (*)(void)) dlsym(h, "sr_scale");
+            api.face_init = (int (*)(const char *, const char *, const char *, int))
+                    dlsym(h, "face_init");
+            api.face_is_ready = (int (*)(void)) dlsym(h, "face_is_ready");
+            api.face_release = (void (*)(void)) dlsym(h, "face_release");
+            api.face_detect_rgba = (int (*)(const uint8_t *, int, int, float *, int))
+                    dlsym(h, "face_detect_rgba");
 
             if (!api.init || !api.init_paths || !api.release || !api.is_ready || !api.is_enabled ||
                 !api.set_enabled || !api.maybe_trigger || !api.draw_last_boxes ||
@@ -107,7 +117,9 @@ namespace ocr_bridge {
                 !api.set_det_params || !api.set_num_threads ||
                 !api.table_init || !api.table_is_ready || !api.recognize_table ||
                 !api.sr_init || !api.sr_is_ready || !api.sr_release ||
-                !api.sr_upscale_rgba || !api.sr_scale) {
+                !api.sr_upscale_rgba || !api.sr_scale ||
+                !api.face_init || !api.face_is_ready || !api.face_release ||
+                !api.face_detect_rgba) {
                 LOGE("dlsym incomplete for %{public}s", name);
                 log_dlerror(name);
                 dlclose(h);
@@ -270,6 +282,29 @@ namespace ocr_bridge {
     int srScale() {
         if (!isLoaded()) return 0;
         return g_api.sr_scale();
+    }
+
+    /* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage） */
+
+    bool faceInit(const std::string &detPath, const std::string &lmPath,
+                  const std::string &gaPath, int numThreads) {
+        if (!load()) return false;
+        return g_api.face_init(detPath.c_str(), lmPath.c_str(), gaPath.c_str(), numThreads) != 0;
+    }
+
+    bool faceIsReady() {
+        if (!isLoaded()) return false;
+        return g_api.face_is_ready() != 0;
+    }
+
+    void faceRelease() {
+        if (!isLoaded()) return;
+        g_api.face_release();
+    }
+
+    int faceDetect(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces) {
+        if (!isLoaded()) return 0;
+        return g_api.face_detect_rgba(rgba, w, h, facesOut, maxFaces);
     }
 
 }  // namespace ocr_bridge

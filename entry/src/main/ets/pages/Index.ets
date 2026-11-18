@@ -8,10 +8,11 @@ import { OcrManager, OcrModelSet } from '../common/OcrManager';
 import { AlertService } from '../common/AlertService';
 import { UsbDeviceScanner, UsbCamInfo, UsbPipeHandle } from '../common/UsbDeviceScanner';
 import { LoadingOverlay } from '../components/LoadingOverlay';
-import { TopHudView, DepthRecord } from '../view/TopHudView';
+import { TopHudView, DepthRecord, FaceHudRow } from '../view/TopHudView';
 import { GeoService } from '../core/GeoService';
 import { BottomPanel, PANEL_OCCUPIED_VP } from '../view/BottomPanel';
 import { ModelSheet } from '../view/ModelSheet';
+import { PictureSheet } from '../view/PictureSheet';
 import { MotionSheet } from '../view/MotionSheet';
 import { DepthSheet } from '../view/DepthSheet';
 import { RecordSheet } from '../view/RecordSheet';
@@ -58,6 +59,52 @@ interface CellParsed {
   cs?: number;
   h?: number;
   t?: string;
+}
+
+// ★ 人脸识别 HUD 信息（native getFaceInfo 返回 JSON 的结构）
+interface FaceHudItem {
+  // 人脸序号（=数组位置=连线框配色索引），详情面板/箭头按它取色
+  i?: number;
+  gender: number;
+  age: number;
+  beauty: number;
+  // 颜值分项（各 0~100，-1=未知）：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+  comps?: number[];
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+interface FaceHudInfo {
+  count: number;
+  // display 像素尺寸：box 归一化后映射到屏幕坐标画详情箭头
+  dw?: number;
+  dh?: number;
+  faces: FaceHudItem[];
+}
+
+// ★ 人脸详情面板分项条数据
+interface FaceCompBar {
+  name: string;
+  v: number;
+}
+
+// ★ 人脸框映射到屏幕坐标后的矩形（vp）：箭头终点 / 点框命中判定共用
+interface FaceScreenRect {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+// ★ 每人脸配色（6 色循环，与 C++ 端 kFacePalette 完全一致）：
+//   连线框/外框/标注/HUD 圆点/详情箭头/详情面板描边同色
+const FACE_PALETTE: string[] = ['#00EBB2', '#FF9F40', '#50AAFF', '#FF64AA', '#BC8CFF', '#FFD750'];
+
+function faceColorOf(idx: number): string {
+  const i = idx % 6;
+  return FACE_PALETTE[i < 0 ? i + 6 : i];
 }
 
 // ★ 能耗三档预设固定值已抽到 common/PowerPresets.ets（Index 应用 + PowerSheet 展示共享）
@@ -333,13 +380,35 @@ struct Index {
   // ★ 识别框/标签画面显示开关（默认开）：关闭后画面干净不画框/文字，
   //   检测/朗读/自动录像照常；立即保存，重启恢复
   @State drawBoxesOn: boolean = true;
-  // ★ USB 画面增强：亮度偏移(-50~+50) + 画质增强（对比度/饱和度），仅 USB 画面生效
+  // ★ USB 画面增强：亮度/锐度/对比度/饱和度滑条，仅 USB 画面生效
   @State usbBrightness: number = 0;
-  @State usbEnhance: boolean = false;
-  // ★ USB 画质增强模式：0关/1非AI(亮度锐度对比度)/2 AI超分(QuickSRNetMedium x4+精修锐化)
+  // ★ USB 画质增强模式：0关/1非AI(亮度锐度对比度饱和度)/2 AI超分(QuickSRNetMedium x4+精修锐化)
   @State usbEnhanceMode: number = 0;
   @State usbSharpness: number = 0;
   @State usbSrStrength: number = 100;
+  @State usbContrast: number = 0;
+  @State usbSaturation: number = 0;
+  // ★ 人脸识别（SCRFD + 106 关键点连线框 + 性别年龄颜值标注 + HUD 同步）
+  @State faceEnabled: boolean = false;
+  // ★ 每人脸一行摘要（彩色圆点+文本+"详细"链接），250ms 轮询刷新
+  @State faceHudRows: FaceHudRow[] = [];
+  // 最新一帧人脸数据（详情面板/箭头实时取数，随 faceHudRows 同步刷新触发重绘）
+  private faceHudFaces: FaceHudItem[] = [];
+  // display 像素尺寸（box → 屏幕坐标映射用）
+  private faceHudDw: number = 0;
+  private faceHudDh: number = 0;
+  // ★ 人脸详情面板：点某脸"详细"弹出，箭头从面板指向该脸连线框顶中心
+  @State faceDetailVisible: boolean = false;
+  @State faceDetailIdx: number = -1;
+  // 面板实测高度（onAreaChange 回填，箭头起点=面板底部中心才准）
+  @State faceDetailPanelH: number = 0;
+  // ★ 人脸头像：从最新显示帧（含连线框的 rgbaBuf_）按人脸框裁出小图，面板头部展示
+  @State faceDetailAvatar: image.PixelMap | null = null;
+  private lastAvatarMs: number = 0;
+  private faceArrowCtx: CanvasRenderingContext2D =
+    new CanvasRenderingContext2D(new RenderingContextSettings(true));
+  @State pictureSheetVisible: boolean = false;
+  private faceInfoTimer: number = -1;
 
   // ★ 电池电量（置信度旁显示）：batterySOC 0~100，-1 表示尚未取到；60s 轮询刷新
   @State batterySoc: number = -1;
@@ -441,10 +510,12 @@ struct Index {
         recordSoundPath: this.recordSoundPath,
         drawBoxesOn: this.drawBoxesOn,
         usbBrightness: this.usbBrightness,
-        usbEnhance: this.usbEnhance,
         usbSharpness: this.usbSharpness,
         usbEnhanceMode: this.usbEnhanceMode,
-        usbSrStrength: this.usbSrStrength
+        usbSrStrength: this.usbSrStrength,
+        usbContrast: this.usbContrast,
+        usbSaturation: this.usbSaturation,
+        faceEnabled: this.faceEnabled
       });
     }, 150);
   }
@@ -457,13 +528,21 @@ struct Index {
       //   （display 尺寸更新略滞后于事件，补一次 500ms 延迟重算确保用上新尺寸）
       this.displayChangeListener = (displayId: number): void => {
         this.fitPreviewToAspect(this.previewAspect);
-        setTimeout(() => { this.fitPreviewToAspect(this.previewAspect); }, 500);
+        setTimeout(() => {
+          this.fitPreviewToAspect(this.previewAspect);
+          this.recoverPreviewOnSurfaceChanged();
+        }, 500);
       };
       try { display.on('change', this.displayChangeListener); } catch (_) {}
-      // ★ 折叠开合时内外屏切换，'change' 事件可能不触发，必须监听 foldStatusChange
+      // ★ 折叠开合时内外屏切换，'change' 事件可能不触发，必须监听 foldStatusChange；
+      //   折叠后 XComponent surface 可能重建，相机输出与管线推流仍绑旧 surface
+      //   → 画面卡死在最后一帧，必须重建预览链路
       this.foldStatusListener = (fs: display.FoldStatus): void => {
         this.fitPreviewToAspect(this.previewAspect);
-        setTimeout(() => { this.fitPreviewToAspect(this.previewAspect); }, 500);
+        setTimeout(() => {
+          this.fitPreviewToAspect(this.previewAspect);
+          this.recoverPreviewAfterFold();
+        }, 500);
       };
       try { display.on('foldStatusChange', this.foldStatusListener); } catch (_) {}
       // ★ 核心：在这里加上动态权限申请，解决 camera permission denied
@@ -545,15 +624,18 @@ struct Index {
       this.recordSoundOn = s.recordSoundOn;
       this.recordSoundName = s.recordSoundName;
       this.recordSoundPath = s.recordSoundPath;
-      // ★ 识别框显示 + USB 画质增强恢复
+      // ★ 识别框显示 + USB 画质增强 + 人脸识别恢复
       this.drawBoxesOn = s.drawBoxesOn;
       this.usbBrightness = s.usbBrightness;
-      this.usbEnhance = s.usbEnhance;
       this.usbSharpness = s.usbSharpness;
       this.usbEnhanceMode = s.usbEnhanceMode;
       this.usbSrStrength = s.usbSrStrength;
-      // ★ 旧版迁移：仅存"画质增强"开关或亮度值的老配置 → 升级为非AI增强模式
-      if ((this.usbEnhance || this.usbBrightness !== 0 || this.usbSharpness !== 0) && this.usbEnhanceMode === 0) {
+      this.usbContrast = s.usbContrast;
+      this.usbSaturation = s.usbSaturation;
+      this.faceEnabled = s.faceEnabled;
+      // ★ 旧版迁移：仅存增强参数但模式为关 → 升级为非AI增强模式
+      if ((this.usbBrightness !== 0 || this.usbSharpness !== 0 ||
+        this.usbContrast !== 0 || this.usbSaturation !== 0) && this.usbEnhanceMode === 0) {
         this.usbEnhanceMode = 1;
       }
       this.speech.enabled = this.speechOn;
@@ -614,6 +696,10 @@ struct Index {
       // ★ AI 超分模式恢复：rawfile 提取模型 + initSr（就绪前自动走普通路径兜底）
       if (this.usbEnhanceMode >= 2) {
         this.initSrModel(this.usbEnhanceMode);
+      }
+      // ★ 人脸识别恢复：rawfile 提取三模型 + initFace + native 开关 + HUD 轮询
+      if (this.faceEnabled) {
+        this.startFace();
       }
       // ★ 电池电量：置信度旁显示，60s 轮询刷新
       this.startBatteryPoll();
@@ -723,7 +809,9 @@ struct Index {
     this.releasingCamera = true;
     const self = this;
     (async (): Promise<void> => {
-      try { await self.cameraService.release(); } catch (_) {}
+      // ★ 带 3s 超时释放：onPageHide 时相机服务卡死会锁死 releasingCamera，
+      //   onPageShow 恢复重试全部耗尽 → 永远黑屏
+      await self.releaseCameraSafe();
       self.releasingCamera = false;
     })();
   }
@@ -736,6 +824,14 @@ struct Index {
       if ((self.switching || self.releasingCamera) && retries > 0) {
         setTimeout(() => tryStart(retries - 1), 100);
         return;
+      }
+      if (self.switching || self.releasingCamera) {
+        // ★ 重试耗尽仍卡在切换/释放锁（相机服务挂起、释放永不返回）：
+        //   强制清锁继续恢复，否则永远黑屏。此时相机多半已死，重建是唯一出路
+        self.appendUvcLog('resume: force clear stuck camera flags');
+        self.switching = false;
+        self.releasingCamera = false;
+        self.loading = false;
       }
       const rawId = self.rawCtrl.getXComponentSurfaceId();
       const previewId = self.xcController.getXComponentSurfaceId();
@@ -1008,11 +1104,11 @@ struct Index {
     this.persistSettings();
   }
 
-  // ★ USB 画质增强统一应用入口：模式/亮度/锐度/对比度饱和度/超分融合强度 → native
+  // ★ USB 画质增强统一应用入口：模式/亮度/锐度/对比度/饱和度/超分融合强度 → native
   private applyUsbEnhanceSettings(): void {
     try {
       entry.setUsbEnhance(this.usbEnhanceMode, this.usbBrightness, this.usbSharpness,
-        this.usbEnhance, this.usbSrStrength);
+        this.usbContrast, this.usbSaturation, this.usbSrStrength);
     } catch (_) {}
   }
 
@@ -1074,13 +1170,440 @@ struct Index {
     this.persistSettings();
   }
 
-  // ★ USB 画质增强开关（对比度/饱和度提升）：native 立即生效 + 保存
-  private toggleUsbEnhance(): void {
-    this.usbEnhance = !this.usbEnhance;
+  // ★ USB 对比度（-50~+50）：native 立即生效 + 保存
+  private onUsbContrastChange(v: number): void {
+    this.usbContrast = Math.round(v);
     this.applyUsbEnhanceSettings();
-    this.showToast(this.usbEnhance ? '已开启USB画质增强' : '已关闭USB画质增强');
-    this.speak(this.usbEnhance ? '已开启USB画质增强' : '已关闭USB画质增强');
     this.persistSettings();
+  }
+
+  // ★ USB 饱和度（-50~+50）：native 立即生效 + 保存
+  private onUsbSaturationChange(v: number): void {
+    this.usbSaturation = Math.round(v);
+    this.applyUsbEnhanceSettings();
+    this.persistSettings();
+  }
+
+  // ★ 人脸识别：rawfile 提取三模型（SCRFD det_500m / 2d106det / genderage）+ initFace
+  private async initFaceModels(): Promise<boolean> {
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const names: string[] = ['det_500m.onnx', '2d106det.onnx', 'genderage.onnx'];
+      const paths: string[] = [];
+      for (const name of names) {
+        const dest = `${ctx.filesDir}/${name}`;
+        if (!fs.accessSync(dest)) {
+          const data = await ctx.resourceManager.getRawFileContent(`models/${name}`);
+          const file = fs.openSync(dest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, data.buffer);
+          fs.closeSync(file);
+        }
+        paths.push(dest);
+      }
+      return await entry.initFace(paths[0], paths[1], paths[2], this.powerThreads);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ★ 人脸识别开关：开启时加载模型，失败回退；关闭停 HUD 轮询
+  private async toggleFace(): Promise<void> {
+    this.faceEnabled = !this.faceEnabled;
+    if (this.faceEnabled) {
+      const ok = await this.initFaceModels();
+      if (!ok) {
+        this.showToast('人脸模型加载失败');
+        this.speak('人脸模型加载失败');
+        this.faceEnabled = false;
+      }
+    }
+    try { entry.setFaceEnabled(this.faceEnabled); } catch (_) {}
+    if (this.faceEnabled) {
+      this.startFaceInfoPoll();
+    } else {
+      this.stopFaceInfoPoll();
+      this.faceHudRows = [];
+      this.faceHudFaces = [];
+      this.closeFaceDetail();
+    }
+    this.showToast(this.faceEnabled ? '已开启人脸识别' : '已关闭人脸识别');
+    this.speak(this.faceEnabled ? '已开启人脸识别' : '已关闭人脸识别');
+    this.persistSettings();
+  }
+
+  // ★ 人脸识别启动（重启恢复路径）：确保模型加载 + native 开关 + HUD 轮询
+  private async startFace(): Promise<void> {
+    const ok = await this.initFaceModels();
+    if (!ok) {
+      this.faceEnabled = false;
+      this.persistSettings();
+      return;
+    }
+    try { entry.setFaceEnabled(true); } catch (_) {}
+    this.startFaceInfoPoll();
+  }
+
+  // ★ HUD 人脸信息轮询：250ms 拉一次 getFaceInfo JSON → 每人脸一行摘要 + 详情箭头实时刷新
+  private startFaceInfoPoll(): void {
+    this.stopFaceInfoPoll();
+    this.faceInfoTimer = setInterval((): void => {
+      this.refreshFaceHud();
+    }, 250);
+  }
+
+  private stopFaceInfoPoll(): void {
+    if (this.faceInfoTimer !== -1) {
+      clearInterval(this.faceInfoTimer);
+      this.faceInfoTimer = -1;
+    }
+  }
+
+  private refreshFaceHud(): void {
+    if (!this.faceEnabled) return;
+    try {
+      const json = entry.getFaceInfo();
+      const info = JSON.parse(json) as FaceHudInfo;
+      const faces: FaceHudItem[] =
+        info.faces !== undefined && info.faces !== null ? info.faces : [];
+      this.faceHudFaces = faces;
+      this.faceHudDw = info.dw !== undefined && info.dw !== null ? info.dw : 0;
+      this.faceHudDh = info.dh !== undefined && info.dh !== null ? info.dh : 0;
+      const rows: FaceHudRow[] = [];
+      const max = Math.min(faces.length, 4);
+      for (let i = 0; i < max; ++i) {
+        rows.push(this.buildFaceRow(i, faces[i], info.count));
+      }
+      // ★ 新数组实例驱动重绘：详情面板/箭头随每次轮询取最新数据
+      this.faceHudRows = rows;
+    } catch (_) {}
+    this.drawFaceArrow();
+    this.refreshFaceDetailAvatar();
+  }
+
+  // ★ 每人脸一行摘要：性别/年龄/颜值 + 失分项 top3；超过 4 人最后一行带"等N人"
+  private buildFaceRow(idx: number, f: FaceHudItem, totalCount: number): FaceHudRow {
+    let text = '';
+    if (f.gender === 0) {
+      text = '女';
+    } else if (f.gender === 1) {
+      text = '男';
+    }
+    if (f.age >= 0) {
+      text += ` ${f.age}岁`;
+    }
+    if (f.beauty >= 0) {
+      text += ` 颜值${f.beauty}`;
+    }
+    // 失分项：7 分项中得分最低的 3 项（对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
+    const comps = f.comps;
+    if (comps !== undefined && comps !== null && comps.length === 7) {
+      const names: string[] = ['对称', '眼形', '眉形', '鼻形', '嘴形', '三庭', '眼型'];
+      const order: number[] = [0, 1, 2, 3, 4, 5, 6];
+      order.sort((a: number, b: number): number => comps[a] - comps[b]);
+      let worst = '';
+      let shown = 0;
+      for (let i = 0; i < 3; ++i) {
+        const v = comps[order[i]];
+        if (v < 0) continue;
+        worst += shown === 0 ? ' 失分:' : ' ';
+        worst += `${names[order[i]]}${v}`;
+        ++shown;
+      }
+      if (shown > 0) {
+        text += worst;
+      }
+    }
+    if (idx === 3 && totalCount > 4) {
+      text += ` 等${totalCount}人`;
+    }
+    if (text.length === 0) {
+      text = '检测到人脸';
+    }
+    return { idx: idx, text: text, color: faceColorOf(idx) };
+  }
+
+  // ★ 打开某张人脸的详情面板（HUD 行"详细"胶囊 / 点击预览识别框）
+  private openFaceDetail(idx: number): void {
+    this.faceDetailIdx = idx;
+    this.faceDetailVisible = true;
+    this.lastAvatarMs = 0;
+    this.refreshFaceDetailAvatar();
+    this.drawFaceArrow();
+  }
+
+  // ★ 关闭详情面板并释放头像 PixelMap（防泄漏；延迟释放避免 Image 还引用着已释放图）
+  private closeFaceDetail(): void {
+    this.faceDetailVisible = false;
+    const old = this.faceDetailAvatar;
+    this.faceDetailAvatar = null;
+    if (old !== null) {
+      setTimeout((): void => { try { old.release(); } catch (_) {} }, 200);
+    }
+  }
+
+  // ★ 详情面板锚点：HUD 顶部偏移 + 固定间距（面板水平居中，箭头从其底部中心出发）
+  private faceDetailPanelY(): number {
+    return this.hudTopOffset + 186;
+  }
+
+  // ★ 人脸框 → 屏幕坐标矩形（vp）：box 归一化（dw/dh）→ 预览区居中映射；
+  //   箭头终点与"点识别框弹详情"的命中判定共用
+  private faceScreenRect(f: FaceHudItem): FaceScreenRect | null {
+    if (this.faceHudDw <= 0 || this.faceHudDh <= 0) {
+      return null;
+    }
+    try {
+      const d = display.getDefaultDisplaySync();
+      const vpw = d.width / d.densityPixels;
+      const vph = d.height / d.densityPixels;
+      const pw = this.previewW > 0 ? this.previewW : vpw;
+      const ph = this.previewH > 0 ? this.previewH : vph;
+      const offX = (vpw - pw) / 2;
+      const offY = (vph - ph) / 2;
+      const x1 = offX + (f.x / this.faceHudDw) * pw;
+      const y1 = offY + (f.y / this.faceHudDh) * ph;
+      const x2 = offX + ((f.x + f.w) / this.faceHudDw) * pw;
+      const y2 = offY + ((f.y + f.h) / this.faceHudDh) * ph;
+      return { x1: x1, y1: y1, x2: x2, y2: y2 };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ★ 轻点判定状态：onTouch 自行判定轻点（onClick 会让 SURFACE XComponent 触摸分发失效）
+  private faceTapDownX: number = 0;
+  private faceTapDownY: number = 0;
+  private faceTapDownMs: number = 0;
+  private faceTapArmed: boolean = false;
+
+  // ★ 点击预览画面：命中某张人脸的识别框（含 12vp 容差）→ 弹出该脸详情
+  //   入参是 XComponent 本地坐标（预览矩形内），先加居中偏移换算到
+  //   预览 Stack 旋转前坐标——faceScreenRect 同在该坐标系，旋转角度下也成立
+  private handleFaceFrameTap(localX: number, localY: number): void {
+    if (!this.faceEnabled || this.faceHudFaces.length === 0) {
+      return;
+    }
+    try {
+      const d = display.getDefaultDisplaySync();
+      const vpw = d.width / d.densityPixels;
+      const vph = d.height / d.densityPixels;
+      const pw = this.previewW > 0 ? this.previewW : vpw;
+      const ph = this.previewH > 0 ? this.previewH : vph;
+      const x = localX + (vpw - pw) / 2;
+      const y = localY + (vph - ph) / 2;
+      const tol = 12;
+      for (let i = 0; i < this.faceHudFaces.length; ++i) {
+        const f = this.faceHudFaces[i];
+        const rect = this.faceScreenRect(f);
+        if (rect === null) {
+          continue;
+        }
+        if (x >= rect.x1 - tol && x <= rect.x2 + tol && y >= rect.y1 - tol && y <= rect.y2 + tol) {
+          const fi = f.i !== undefined && f.i !== null ? f.i : i;
+          this.openFaceDetail(fi);
+          return;
+        }
+      }
+    } catch (_) {}
+  }
+
+  // ★ 刷新详情面板头像：captureLatestFrame 拿最新显示帧（含连线框的 RGBA），
+  //   按人脸框裁正方形小图（周边留 12% 余量带上发型/下巴），≥800ms 节流
+  private refreshFaceDetailAvatar(): void {
+    if (!this.faceDetailVisible) {
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastAvatarMs < 800) {
+      return;
+    }
+    this.lastAvatarMs = now;
+    try {
+      const f = this.detailFace();
+      if (f === null || this.faceHudDw <= 0 || this.faceHudDh <= 0) {
+        return;
+      }
+      const buf = entry.captureLatestFrame() as ArrayBuffer;
+      const s = entry.getFrameSize() as number[];
+      if (!buf || buf.byteLength <= 0 || !s || s.length < 2 || s[0] <= 0 || s[1] <= 0) {
+        return;
+      }
+      const imgW = s[0];
+      const imgH = s[1];
+      if (imgW < 8 || imgH < 8) {
+        return;
+      }
+      // 人脸框（display px）→ 帧像素坐标
+      const kx = imgW / this.faceHudDw;
+      const ky = imgH / this.faceHudDh;
+      let cx = Math.round(f.x * kx);
+      let cy = Math.round(f.y * ky);
+      let cw = Math.round(f.w * kx);
+      let ch = Math.round(f.h * ky);
+      // 周边留 12% 余量，并裁成近似正方形（Image objectFit=Cover 下不变形）
+      const padX = Math.round(cw * 0.12);
+      const padY = Math.round(ch * 0.12);
+      cx = Math.max(0, cx - padX);
+      cy = Math.max(0, cy - padY);
+      cw = Math.min(imgW - cx, cw + padX * 2);
+      ch = Math.min(imgH - cy, ch + padY * 2);
+      const side = Math.min(cw, ch);
+      cx += Math.floor((cw - side) / 2);
+      cy += Math.floor((ch - side) / 2);
+      if (side < 8) {
+        return;
+      }
+      // 手工裁剪 RGBA（不依赖 PixelMap.crop）：逐行拷贝 side×side
+      const src = new Uint8Array(buf);
+      const dst = new ArrayBuffer(side * side * 4);
+      const dst8 = new Uint8Array(dst);
+      for (let row = 0; row < side; ++row) {
+        const srcOff = ((cy + row) * imgW + cx) * 4;
+        dst8.set(src.subarray(srcOff, srcOff + side * 4), row * side * 4);
+      }
+      const pm = image.createPixelMapSync(dst, {
+        size: { width: side, height: side },
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
+      });
+      const old = this.faceDetailAvatar;
+      this.faceDetailAvatar = pm;
+      if (old !== null) {
+        setTimeout((): void => { try { old.release(); } catch (_) {} }, 200);
+      }
+    } catch (_) {}
+  }
+
+  // ★ 当前详情面板对应的人脸（按 i 序号匹配；人脸离开画面返回 null）
+  private detailFace(): FaceHudItem | null {
+    for (let i = 0; i < this.faceHudFaces.length; ++i) {
+      const f = this.faceHudFaces[i];
+      const fi = f.i !== undefined && f.i !== null ? f.i : i;
+      if (fi === this.faceDetailIdx) {
+        return f;
+      }
+    }
+    return null;
+  }
+
+  private detailSummary(): string {
+    const f = this.detailFace();
+    if (f === null) {
+      return '';
+    }
+    let s = '未知';
+    if (f.gender === 0) {
+      s = '女';
+    } else if (f.gender === 1) {
+      s = '男';
+    }
+    if (f.age >= 0) {
+      s += ` · ${f.age}岁`;
+    }
+    return s;
+  }
+
+  private detailBeautyText(): string {
+    const f = this.detailFace();
+    if (f === null || f.beauty < 0) {
+      return '';
+    }
+    return `颜值 ${f.beauty}`;
+  }
+
+  private detailCompList(): FaceCompBar[] {
+    const names: string[] = ['对称', '眼形', '眉形', '鼻形', '嘴形', '三庭', '眼型'];
+    const list: FaceCompBar[] = [];
+    const f = this.detailFace();
+    if (f !== null && f.comps !== undefined && f.comps !== null && f.comps.length === 7) {
+      for (let i = 0; i < 7; ++i) {
+        const v = f.comps[i];
+        list.push({ name: names[i], v: v >= 0 ? Math.round(v) : 0 });
+      }
+    }
+    return list;
+  }
+
+  // ★ 分项条配色：≥70 绿 / ≥40 黄 / 其余红
+  private compBarColor(v: number): string {
+    if (v >= 70) return '#34C759';
+    if (v >= 40) return '#FFD60A';
+    return '#FF6B5E';
+  }
+
+  // ★ 复制当前详情人脸信息（性别/年龄/颜值/7 分项）到剪贴板
+  private copyFaceInfo(): void {
+    const f = this.detailFace();
+    if (f === null) {
+      this.showToast('人脸已离开画面');
+      return;
+    }
+    const names: string[] = ['对称', '眼形', '眉形', '鼻形', '嘴形', '三庭', '眼型'];
+    let text = this.detailSummary();
+    if (f.beauty >= 0) {
+      text += ` 颜值${f.beauty}`;
+    }
+    if (f.comps !== undefined && f.comps !== null && f.comps.length === 7) {
+      const parts: string[] = [];
+      for (let i = 0; i < 7; ++i) {
+        if (f.comps[i] >= 0) {
+          parts.push(`${names[i]}${f.comps[i]}`);
+        }
+      }
+      if (parts.length > 0) {
+        text += ` 分项: ${parts.join(' ')}`;
+      }
+    }
+    this.copyGeoText(text, '人脸信息');
+  }
+
+  // ★ 详情箭头：面板底部中心 → 人脸连线框顶中心，颜色与人脸框一致；
+  //   每次 250ms 轮询重画，人脸移动箭头实时跟随
+  private drawFaceArrow(): void {
+    if (!this.faceDetailVisible || this.faceDetailIdx < 0) {
+      return;
+    }
+    try {
+      const d = display.getDefaultDisplaySync();
+      const vpw = d.width / d.densityPixels;
+      const vph = d.height / d.densityPixels;
+      const ctx = this.faceArrowCtx;
+      ctx.clearRect(0, 0, vpw, vph);
+      const f = this.detailFace();
+      if (f === null) {
+        return;
+      }
+      // 人脸框顶中心（共享映射：faceScreenRect）
+      const rect = this.faceScreenRect(f);
+      if (rect === null) {
+        return;
+      }
+      const ex = (rect.x1 + rect.x2) / 2;
+      const ey = rect.y1;
+      // 箭头起点：详情面板底部中心（面板 y 固定锚在 HUD 下方，高度实测回填）
+      const sx = vpw / 2;
+      const sy = this.faceDetailPanelY() +
+        (this.faceDetailPanelH > 0 ? this.faceDetailPanelH : 220);
+      const color = faceColorOf(this.faceDetailIdx);
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(ex, ey);
+      ctx.stroke();
+      // 箭头头部（两撇）+ 框顶圆点
+      const ang = Math.atan2(ey - sy, ex - sx);
+      const head = 12;
+      ctx.beginPath();
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - head * Math.cos(ang - 0.42), ey - head * Math.sin(ang - 0.42));
+      ctx.moveTo(ex, ey);
+      ctx.lineTo(ex - head * Math.cos(ang + 0.42), ey - head * Math.sin(ang + 0.42));
+      ctx.stroke();
+      ctx.fillStyle = color;
+      ctx.beginPath();
+      ctx.arc(ex, ey, 4, 0, Math.PI * 2);
+      ctx.fill();
+    } catch (_) {}
   }
 
   // ★ 电池电量刷新（置信度旁显示）：batterySOC 静态快照需轮询读新值
@@ -1597,6 +2120,10 @@ struct Index {
   private displayChangeListener: ((displayId: number) => void) | null = null;
   // ★ 折叠开合监听（内外屏切换时 display 'change' 不可靠）
   private foldStatusListener: ((fs: display.FoldStatus) => void) | null = null;
+  // ★ 当前已绑定的预览 surfaceId（折叠/展开后变化即需重建链路）
+  private lastAttachedPreviewId: string = '';
+  // ★ 折叠恢复去重时间戳（半折叠态连续触发防抖）
+  private lastFoldRecoverMs: number = 0;
 
   // ★ 变焦上限：手机按 getZoomRatioRange 支持范围，USB 摄像头无参数默认最大 4 倍；
   //   超限时收敛当前倍率，避免滑条与实际能力不符
@@ -1662,6 +2189,39 @@ struct Index {
     }
   }
 
+  // ★ 重建预览链路统一入口：USB 走 UVC 重连，手机摄像头走 restoreCamera
+  private restartPreviewChain(): void {
+    if (this.cameraPosition === 2) {
+      this.resumeUsbCamera();
+      return;
+    }
+    this.restoreCamera(this.cameraPosition);
+  }
+
+  // ★ 折叠开合后预览恢复：XComponent surface 可能随内外屏切换重建（surfaceId 变化），
+  //   相机输出与 native 管线仍绑旧 surface → 画面卡死在最后一帧；
+  //   3 秒去重防止半折叠态连续触发多次重建
+  private recoverPreviewAfterFold(): void {
+    if (!this.started || this.switching || this.loading) return;
+    const now = Date.now();
+    if (now - this.lastFoldRecoverMs < 3000) return;
+    this.lastFoldRecoverMs = now;
+    this.restartPreviewChain();
+  }
+
+  // ★ display 变化（旋转等）：仅 surfaceId 真的变化才重建，避免多余相机重启
+  private recoverPreviewOnSurfaceChanged(): void {
+    if (!this.started || this.switching || this.loading) return;
+    try {
+      const previewId = this.xcController.getXComponentSurfaceId();
+      if (this.lastAttachedPreviewId !== '' && previewId !== ''
+        && previewId !== this.lastAttachedPreviewId) {
+        this.lastFoldRecoverMs = Date.now();
+        this.restartPreviewChain();
+      }
+    } catch (_) {}
+  }
+
   // ★ 根据实际选中的相机设备设置渲染旋转与镜像：
   //   旋转 = CameraDevice.cameraOrientation（后摄通常 90、前摄通常 270，
   //          此前写死 90 导致前置摄像头画面 180° 反转）
@@ -1720,6 +2280,18 @@ struct Index {
     }
   }
 
+  // ★ 释放相机带 3s 超时兜底：相机服务偶发卡死时 release 永不返回，
+  //   会把 switching/releasingCamera 锁死 → 镜头切换/恢复永远黑屏；
+  //   超时后放弃等待继续走后续重建流程（相机管理器重初始化是唯一出路）
+  private async releaseCameraSafe(): Promise<void> {
+    try {
+      await Promise.race([
+        this.cameraService.release(),
+        new Promise<void>((_, reject) => setTimeout(() => reject(new Error('release timeout')), 3000))
+      ]);
+    } catch (_) {}
+  }
+
   private async startCamera(rawDisplayId: string, previewDisplayId: string): Promise<void> {
     if (this.switching) return;
     this.switching = true;
@@ -1731,6 +2303,7 @@ struct Index {
       if (!aiId) { this.showToast('创建 YUV 接收器失败'); return; }
       try { entry.setRotation(SENSOR_ROTATION); } catch (_) {}
       entry.attachPreviewSurface(previewDisplayId);
+      this.lastAttachedPreviewId = previewDisplayId;
       await Promise.race([
         this.cameraService.init(ctx, rawDisplayId, aiId, this.cameraPosition, 'ai'),
         new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), 8000))
@@ -1854,11 +2427,12 @@ struct Index {
     if (!rawId || !previewId) { this.switching = false; this.loading = false; return; }
     try {
       try { entry.stopPipeline(); } catch (_) {}
-      await this.cameraService.release();
+      await this.releaseCameraSafe();
       const aiId = entry.createYuvReceiver(640, 480);
       if (aiId) {
         try { entry.setRotation(SENSOR_ROTATION); } catch (_) {}
         entry.attachPreviewSurface(previewId);
+        this.lastAttachedPreviewId = previewId;
         const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
         await Promise.race([
           this.cameraService.switchTo(ctx, rawId, aiId, pos, 'ai'),
@@ -1907,11 +2481,12 @@ struct Index {
     if (!rawId || !previewId) { this.switching = false; this.loading = false; return; }
     try {
       try { entry.stopPipeline(); } catch (_) {}
-      await this.cameraService.release();
+      await this.releaseCameraSafe();
       const aiId = entry.createYuvReceiver(640, 480);
       if (aiId) {
         try { entry.setRotation(SENSOR_ROTATION); } catch (_) {}
         entry.attachPreviewSurface(previewId);
+        this.lastAttachedPreviewId = previewId;
         const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
         await Promise.race([
           this.cameraService.switchTo(ctx, rawId, aiId, pos, 'ai'),
@@ -2095,7 +2670,8 @@ struct Index {
     this.previewReady = false;
     this.vision.stop();
     try { entry.stopPipeline(); } catch (_) {}
-    await this.cameraService.release();
+    // ★ 带 3s 超时释放：USB 连接路径相机服务卡死时不能无限挂起（连接失败回退也走得到这里）
+    await this.releaseCameraSafe();
 
     // ★ 等价 Android UsbManager.openDevice + getFileDescriptor：
     //   connectDevice 拿 pipe → getFileDescriptor 把 usbfs fd dup 进本进程
@@ -2122,7 +2698,10 @@ struct Index {
     // ★ UVC 相机：外部供帧已正立，关闭前置摄像头遗留的镜像
     try { entry.setMirror(false); } catch (_) {}
     const previewId = this.xcController.getXComponentSurfaceId();
-    if (previewId) entry.attachPreviewSurface(previewId);
+    if (previewId) {
+      entry.attachPreviewSurface(previewId);
+      this.lastAttachedPreviewId = previewId;
+    }
 
     // ★ fd 注入 libuvc：uvc_init2 → uvc_get_device_with_fd(vid,pid,fd,bus,addr) → uvc_open
     if (!entry.uvcConnect(handle.fd, dev.vendorId, dev.productId, dev.busNum, dev.devAddress)) {
@@ -2171,6 +2750,7 @@ struct Index {
     this.persistSettings();
     // ★ 照抄 Android strings.xml openedsuccess
     this.showToast('摄像头连接成功！');
+    this.started = true;
     this.vision.start();
     this.pollPreviewReady();
     this.loading = false;
@@ -2185,6 +2765,7 @@ struct Index {
     this.stopUvcWatchdog();
     if (this.batteryTimer !== -1) { clearInterval(this.batteryTimer); this.batteryTimer = -1; }
     if (this.geoTimer !== -1) { clearTimeout(this.geoTimer); this.geoTimer = -1; }
+    this.stopFaceInfoPoll();
     try {
       if (this.displayChangeListener) display.off('change', this.displayChangeListener);
     } catch (_) {}
@@ -2201,7 +2782,8 @@ struct Index {
     (async (): Promise<void> => {
       try { if (self.isRecording) entry.detachRecordSurface(); } catch (_) {}
       try { if (self.isRecording) await self.media.recorder.stop(); } catch (_) {}
-      try { await self.cameraService.release(); } catch (_) {}
+      // ★ 带 3s 超时释放：页面销毁时相机服务卡死会让相机一直被占用（下次启动黑屏）
+      await self.releaseCameraSafe();
       try { self.cameraService.releaseAll(); } catch (_) {}
       try { await self.alertService.release(); } catch (_) {}
       try { entry.stopPipeline(); } catch (_) {}
@@ -2234,6 +2816,39 @@ struct Index {
             .onActionEnd(() => {
               this.persistSettings();
             }))
+          // ★ 点击预览画面：命中人脸识别框（含容差）→ 弹出该脸详情面板。
+          //   1541 版根因：给 SURFACE 型 XComponent 挂 onClick 会把节点切到
+          //   "可点击"分发模式，捏合手势与点击在该节点上一起失效；
+          //   改用不消费事件的 onTouch 自行判定轻点：
+          //   单指按下 → 快速抬起（<400ms）且位移小（<24vp）且中途无第二指
+          .onTouch((event: TouchEvent) => {
+            if (event.type === TouchType.Down) {
+              if (event.touches.length > 1) {
+                this.faceTapArmed = false;
+                return;
+              }
+              const t = event.changedTouches[0];
+              if (t === undefined) {
+                return;
+              }
+              this.faceTapDownX = t.x;
+              this.faceTapDownY = t.y;
+              this.faceTapDownMs = Date.now();
+              this.faceTapArmed = true;
+            } else if (event.type === TouchType.Up && this.faceTapArmed) {
+              this.faceTapArmed = false;
+              const t = event.changedTouches[0];
+              if (t === undefined) {
+                return;
+              }
+              if (Date.now() - this.faceTapDownMs < 400 &&
+                Math.abs(t.x - this.faceTapDownX) < 24 && Math.abs(t.y - this.faceTapDownY) < 24) {
+                this.handleFaceFrameTap(this.faceTapDownX, this.faceTapDownY);
+              }
+            } else if (event.type === TouchType.Cancel || event.touches.length > 1) {
+              this.faceTapArmed = false;
+            }
+          })
           .onLoad(() => {
             setTimeout(() => {
               const rawId = this.rawCtrl.getXComponentSurfaceId();
@@ -2289,7 +2904,12 @@ struct Index {
         powerMode: this.powerMode,
         geoName: this.geoPlaceName,
         ocrModelName: this.shortOcrSetName(),
+        faceEnabled: this.faceEnabled,
+        faceHudRows: this.faceHudRows,
+        onFaceDetail: (idx: number): void => { this.openFaceDetail(idx); },
         onCameraSelect: (pos: number): void => { this.selectCamera(pos); },
+        // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口
+        onShowPictureSheet: (): void => { this.pictureSheetVisible = true; },
         onYoloToggle: (): void => { this.toggleYolo(); },
         // ★ YOLO 长按：弹出与底部"识别"长按相同的识别设置菜单
         onYoloLongPress: (): void => { this.sheetVisible = true; },
@@ -2303,6 +2923,115 @@ struct Index {
         tableBusy: this.tableBusy,
         onRecognizeTable: (): void => { this.doRecognizeTable(); }
       })
+
+      // ★ 人脸详情弹层（点 HUD 人脸行"详细"胶囊 / 点预览识别框弹出）：
+      //   ① 半透明遮罩点空白关闭（不挡 HUD/底部面板：本层位于两者之间）
+      //   ② 全屏箭头 Canvas（面板 → 人脸框顶中心，颜色与人脸连线框一致，250ms 实时刷新）
+      //   ③ 详情面板（头像 + 性别/年龄/颜值 + 7 分项条 + 复制/关闭胶囊）
+      if (this.faceDetailVisible) {
+        Column()
+          .width('100%').height('100%')
+          .backgroundColor('rgba(0,0,0,0.22)')
+          .onClick((): void => { this.closeFaceDetail(); })
+
+        Canvas(this.faceArrowCtx)
+          .width('100%').height('100%')
+          .hitTestBehavior(HitTestMode.None)
+          .onReady((): void => { this.drawFaceArrow(); })
+
+        Column({ space: 8 }) {
+          // ★ 头部：人脸头像（识别框实裁小图，含连线框）+ 标题/摘要 + 关闭
+          Row({ space: 10 }) {
+            if (this.faceDetailAvatar !== null) {
+              Image(this.faceDetailAvatar)
+                .width(64).height(64)
+                .borderRadius(12)
+                .objectFit(ImageFit.Cover)
+                .border({ width: 1.5, color: faceColorOf(this.faceDetailIdx) })
+                .backgroundColor('#0B0E12')
+            } else {
+              Column() {
+                Text('☺').fontSize(24).fontColor(faceColorOf(this.faceDetailIdx))
+              }
+              .width(64).height(64)
+              .borderRadius(12)
+              .justifyContent(FlexAlign.Center)
+              .backgroundColor('#0B0E12')
+              .border({ width: 1.5, color: faceColorOf(this.faceDetailIdx) })
+            }
+            Column({ space: 4 }) {
+              Text(this.faceDetailIdx > 0 ? `人脸详情 · ${this.faceDetailIdx + 1}` : '人脸详情')
+                .fontSize(12).fontColor('#8E97A3').fontWeight(FontWeight.Bold)
+              if (this.detailFace() === null) {
+                Text('人脸已离开画面')
+                  .fontSize(14).fontColor('#8E97A3').fontWeight(FontWeight.Bold)
+              } else {
+                Text(this.detailSummary())
+                  .fontSize(17).fontColor(faceColorOf(this.faceDetailIdx))
+                  .fontWeight(FontWeight.Bold)
+                Row({ space: 8 }) {
+                  if (this.detailBeautyText().length > 0) {
+                    Text(this.detailBeautyText())
+                      .fontSize(13).fontColor('#FFFFFF').fontWeight(FontWeight.Bold)
+                  }
+                }.width('100%')
+              }
+            }.layoutWeight(1)
+
+            Text('✕').fontSize(13).fontColor('#8E97A3')
+              .padding({ left: 6, right: 6, top: 4, bottom: 4 })
+              .onClick((): void => { this.closeFaceDetail(); })
+          }.width('100%').alignItems(VerticalAlign.Center)
+
+          if (this.detailFace() !== null) {
+            Divider().color('rgba(255,255,255,0.12)')
+
+            Column({ space: 6 }) {
+              ForEach(this.detailCompList(), (c: FaceCompBar) => {
+                Row({ space: 6 }) {
+                  Text(c.name).fontSize(10).fontColor('#C7CDD6').width(28)
+                  Stack({ alignContent: Alignment.Start }) {
+                    Row().width('100%').height(5).borderRadius(2.5)
+                      .backgroundColor('rgba(255,255,255,0.12)')
+                    Row().width(`${Math.max(2, Math.min(100, c.v))}%`).height(5).borderRadius(2.5)
+                      .backgroundColor(this.compBarColor(c.v))
+                  }.layoutWeight(1)
+                  Text(`${c.v}`).fontSize(10).fontColor(this.compBarColor(c.v))
+                    .fontWeight(FontWeight.Bold).width(24).textAlign(TextAlign.End)
+                }.width('100%').alignItems(VerticalAlign.Center)
+              }, (c: FaceCompBar) => `${c.name}_${c.v}`)
+            }.width('100%')
+
+            // ★ 胶囊按钮：加大加高（高 34、全圆角），复制=人脸主色底
+            Row({ space: 10 }) {
+              Button('复制信息')
+                .fontSize(13).fontColor('#003B44')
+                .backgroundColor(faceColorOf(this.faceDetailIdx))
+                .borderRadius(17).height(34).layoutWeight(1)
+                .onClick((): void => { this.copyFaceInfo(); })
+              Button('关闭')
+                .fontSize(13).fontColor('#FFFFFF').backgroundColor('rgba(255,255,255,0.14)')
+                .borderRadius(17).height(34).layoutWeight(1)
+                .onClick((): void => { this.closeFaceDetail(); })
+            }.width('100%')
+          }
+        }
+        .width(262)
+        .padding({ left: 14, right: 14, top: 12, bottom: 12 })
+        .backgroundColor('#16191F')
+        .borderRadius(16)
+        .border({ width: 1, color: faceColorOf(this.faceDetailIdx) })
+        .position({ x: '50%', y: this.faceDetailPanelY() })
+        .translate({ x: '-50%' })
+        .onAreaChange((_old: Area, newArea: Area): void => {
+          // Area.height 类型是 Length（number|string），只接受数值
+          const h = newArea.height;
+          if (typeof h === 'number') {
+            this.faceDetailPanelH = h;
+          }
+          this.drawFaceArrow();
+        })
+      }
 
       BottomPanel({
         isRecording: $isRecording,
@@ -2386,12 +3115,6 @@ struct Index {
           detectSpeakOn: this.detectSpeakOn,
           recordSoundOn: this.recordSoundOn,
           recordSoundName: this.recordSoundName,
-          drawBoxesOn: this.drawBoxesOn,
-          usbBrightness: this.usbBrightness,
-          usbEnhance: this.usbEnhance,
-          usbEnhanceMode: this.usbEnhanceMode,
-          usbSharpness: this.usbSharpness,
-          usbSrStrength: this.usbSrStrength,
           onClose: (): void => { this.sheetVisible = false; },
           onSelectModel: (id: string): void => { this.selectModel(id); },
           onToggleLabel: (idx: number): void => { this.toggleAlertLabel(idx); },
@@ -2400,16 +3123,33 @@ struct Index {
           onSpeechToggle: (): void => { this.toggleSpeech(); },
           onSpeechVolumeChange: (v: number): void => { this.onSpeechVolumeChange(v); },
           onDetectSpeakToggle: (): void => { this.toggleDetectSpeak(); },
-          onDrawBoxesToggle: (): void => { this.toggleDrawBoxes(); },
-          onUsbModeChange: (m: number): void => { this.onUsbModeChange(m); },
-          onUsbBrightnessChange: (v: number): void => { this.onUsbBrightnessChange(v); },
-          onUsbSharpnessChange: (v: number): void => { this.onUsbSharpnessChange(v); },
-          onUsbSrStrengthChange: (v: number): void => { this.onUsbSrStrengthChange(v); },
-          onUsbEnhanceToggle: (): void => { this.toggleUsbEnhance(); },
           onSoundToggle: (): void => { this.toggleRecordSound(); },
           onPickSound: (): void => { this.pickRecordSound(); },
           onPreviewSound: (): void => { this.previewRecordSound(); },
           onResetSound: (): void => { this.resetRecordSound(); }
+        })
+      }
+
+      // ★ 画面设置弹窗：识别框显示 + USB 增强（亮度/锐度/对比度/饱和度/AI强度）+ 人脸识别
+      if (this.pictureSheetVisible) {
+        PictureSheet({
+          drawBoxesOn: this.drawBoxesOn,
+          usbBrightness: this.usbBrightness,
+          usbSharpness: this.usbSharpness,
+          usbContrast: this.usbContrast,
+          usbSaturation: this.usbSaturation,
+          usbEnhanceMode: this.usbEnhanceMode,
+          usbSrStrength: this.usbSrStrength,
+          faceEnabled: this.faceEnabled,
+          onClose: (): void => { this.pictureSheetVisible = false; },
+          onDrawBoxesToggle: (): void => { this.toggleDrawBoxes(); },
+          onUsbModeChange: (m: number): void => { this.onUsbModeChange(m); },
+          onUsbBrightnessChange: (v: number): void => { this.onUsbBrightnessChange(v); },
+          onUsbSharpnessChange: (v: number): void => { this.onUsbSharpnessChange(v); },
+          onUsbContrastChange: (v: number): void => { this.onUsbContrastChange(v); },
+          onUsbSaturationChange: (v: number): void => { this.onUsbSaturationChange(v); },
+          onUsbSrStrengthChange: (v: number): void => { this.onUsbSrStrengthChange(v); },
+          onFaceToggle: (): void => { this.toggleFace(); }
         })
       }
 
