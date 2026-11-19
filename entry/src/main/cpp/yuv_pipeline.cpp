@@ -1965,8 +1965,8 @@ void YuvPipeline::ClearSurface() {
 
 // face_detect_rgba 每脸输出 float 数：
 //   [0..3]box + [4]score + [5]gender + [6]age + [7]beauty + [8..215]106点xy
-//   + [216..222]颜值分项（对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
-static constexpr int kFaceFloats = 223;
+//   + [220..226]颜值分项（对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
+static constexpr int kFaceFloats = 227;
 static constexpr int kMaxFaceDraw = 4;      // 最多绘制/上报的人脸数
 static constexpr int kFaceStaleMs = 600;    // 结果过期阈值（超时不画不报，自动消失；
                                             // 过长会滞留旧坐标，与移动中的人脸错位）
@@ -2100,6 +2100,11 @@ static void drawFacePoly(uint8_t *rgba, int W, int H, const FaceDrawInfo &f,
         const int ci = closed ? idx[(i + 1) % n] : idx[i + 1];
         const float ax = f.pts[ai * 2], ay = f.pts[ai * 2 + 1];
         const float cx = f.pts[ci * 2], cy = f.pts[ci * 2 + 1];
+        // 端点含 NaN（runLandmarks 越界标记的无效点）时跳过该段：
+        // 眉被遮挡时避免画出"拉向窗角"的直线
+        if (std::isnan(ax) || std::isnan(ay) || std::isnan(cx) || std::isnan(cy)) {
+            continue;
+        }
         if (th > 1) {
             drawLineRgba(rgba, W, H, ax, ay, cx, cy, th, r, g, b, 48);
         }
@@ -2136,7 +2141,7 @@ void YuvPipeline::FaceWorkerLoop() {
                 d.age = fl[6];
                 d.beauty = fl[7];
                 for (int k = 0; k < 212; ++k) d.pts[k] = fl[8 + k];
-                for (int k = 0; k < 7; ++k) d.comp[k] = fl[216 + k];
+                for (int k = 0; k < 7; ++k) d.comp[k] = fl[220 + k];
                 d.ts = now;
                 snap.push_back(d);
             }

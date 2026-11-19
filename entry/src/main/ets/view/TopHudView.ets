@@ -455,6 +455,10 @@ export struct TopHudView {
 
     }
     .width('100%').height('100%')
+    // ★ 必须 Transparent：本容器 100%×100% 全屏，Default 会响应全屏命中测试
+    //   并阻塞所有低 z 兄弟节点（预览触摸覆盖层/捏合缩放）——真机注入实证：
+    //   HUD 内元素点击正常、覆盖层 onClick 从不触发，根因即在此
+    .hitTestBehavior(HitTestMode.Transparent)
   }
 
   @Builder

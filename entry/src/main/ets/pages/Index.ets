@@ -392,8 +392,10 @@ struct Index {
   @State faceEnabled: boolean = false;
   // ★ 每人脸一行摘要（彩色圆点+文本+"详细"链接），250ms 轮询刷新
   @State faceHudRows: FaceHudRow[] = [];
-  // 最新一帧人脸数据（详情面板/箭头实时取数，随 faceHudRows 同步刷新触发重绘）
-  private faceHudFaces: FaceHudItem[] = [];
+  // 最新一帧人脸数据（详情面板/箭头实时取数）；必须 @State：detailSummary/
+  // detailBeautyText/detailCompList 经 detailFace() 读它，private 时无响应式
+  // 依赖 → 详情面板分值永不刷新（HUD 行读 @State faceHudRows 所以正常）
+  @State faceHudFaces: FaceHudItem[] = [];
   // display 像素尺寸（box → 屏幕坐标映射用）
   private faceHudDw: number = 0;
   private faceHudDh: number = 0;
@@ -1370,17 +1372,12 @@ struct Index {
     }
   }
 
-  // ★ 轻点判定状态：onTouch 自行判定轻点（onClick 会让 SURFACE XComponent 触摸分发失效）
-  private faceTapDownX: number = 0;
-  private faceTapDownY: number = 0;
-  private faceTapDownMs: number = 0;
-  private faceTapArmed: boolean = false;
-
   // ★ 点击预览画面：命中某张人脸的识别框（含 12vp 容差）→ 弹出该脸详情
   //   入参是 XComponent 本地坐标（预览矩形内），先加居中偏移换算到
   //   预览 Stack 旋转前坐标——faceScreenRect 同在该坐标系，旋转角度下也成立
   private handleFaceFrameTap(localX: number, localY: number): void {
     if (!this.faceEnabled || this.faceHudFaces.length === 0) {
+      this.appendUvcLog(`[tap] skip enabled=${this.faceEnabled} faces=${this.faceHudFaces.length}`);
       return;
     }
     try {
@@ -1392,18 +1389,25 @@ struct Index {
       const x = localX + (vpw - pw) / 2;
       const y = localY + (vph - ph) / 2;
       const tol = 12;
+      let firstRect = 'null';
       for (let i = 0; i < this.faceHudFaces.length; ++i) {
         const f = this.faceHudFaces[i];
         const rect = this.faceScreenRect(f);
         if (rect === null) {
           continue;
         }
+        if (i === 0) {
+          firstRect = `(${rect.x1.toFixed(0)},${rect.y1.toFixed(0)})-(${rect.x2.toFixed(0)},${rect.y2.toFixed(0)})`;
+        }
         if (x >= rect.x1 - tol && x <= rect.x2 + tol && y >= rect.y1 - tol && y <= rect.y2 + tol) {
           const fi = f.i !== undefined && f.i !== null ? f.i : i;
+          this.appendUvcLog(`[tap] HIT face=${fi} tap=(${x.toFixed(0)},${y.toFixed(0)})`);
           this.openFaceDetail(fi);
           return;
         }
       }
+      this.appendUvcLog(`[tap] MISS local=(${localX.toFixed(0)},${localY.toFixed(0)}) tap=(${x.toFixed(0)},${y.toFixed(0)})` +
+        ` faces=${this.faceHudFaces.length} rect0=${firstRect} pw=${pw.toFixed(0)} ph=${ph.toFixed(0)}`);
     } catch (_) {}
   }
 
@@ -2804,51 +2808,6 @@ struct Index {
           //   USB 16:9 → 全宽横条；手机摄像头 3:4 → 竖向适配，均不拉伸变形
           .width(this.previewW > 0 ? this.previewW : '100%')
           .height(this.previewH > 0 ? this.previewH : '100%')
-          // ★ 双指捏合缩放必须直接绑在 XComponent 上：SURFACE 型 XComponent 拦截多点触控，
-          //   绑在父 Stack 的手势不会触发（真机日志验证：gesture start 从未打出）
-          .gesture(PinchGesture({ fingers: 2 })
-            .onActionStart((event: GestureEvent) => {
-              this.pinchStartZoom = this.zoomRatio;
-            })
-            .onActionUpdate((event: GestureEvent) => {
-              this.applyPinchZoom(this.pinchStartZoom * event.scale);
-            })
-            .onActionEnd(() => {
-              this.persistSettings();
-            }))
-          // ★ 点击预览画面：命中人脸识别框（含容差）→ 弹出该脸详情面板。
-          //   1541 版根因：给 SURFACE 型 XComponent 挂 onClick 会把节点切到
-          //   "可点击"分发模式，捏合手势与点击在该节点上一起失效；
-          //   改用不消费事件的 onTouch 自行判定轻点：
-          //   单指按下 → 快速抬起（<400ms）且位移小（<24vp）且中途无第二指
-          .onTouch((event: TouchEvent) => {
-            if (event.type === TouchType.Down) {
-              if (event.touches.length > 1) {
-                this.faceTapArmed = false;
-                return;
-              }
-              const t = event.changedTouches[0];
-              if (t === undefined) {
-                return;
-              }
-              this.faceTapDownX = t.x;
-              this.faceTapDownY = t.y;
-              this.faceTapDownMs = Date.now();
-              this.faceTapArmed = true;
-            } else if (event.type === TouchType.Up && this.faceTapArmed) {
-              this.faceTapArmed = false;
-              const t = event.changedTouches[0];
-              if (t === undefined) {
-                return;
-              }
-              if (Date.now() - this.faceTapDownMs < 400 &&
-                Math.abs(t.x - this.faceTapDownX) < 24 && Math.abs(t.y - this.faceTapDownY) < 24) {
-                this.handleFaceFrameTap(this.faceTapDownX, this.faceTapDownY);
-              }
-            } else if (event.type === TouchType.Cancel || event.touches.length > 1) {
-              this.faceTapArmed = false;
-            }
-          })
           .onLoad(() => {
             setTimeout(() => {
               const rawId = this.rawCtrl.getXComponentSurfaceId();
@@ -2856,23 +2815,34 @@ struct Index {
               if (rawId && previewId) this.startOrRestoreCamera(rawId, previewId);
             }, 200);
           })
+        // ★ 触摸覆盖层：承载点击（命中人脸识别框 → 弹详情面板）与双指捏合
+        //   缩放。真正的触摸失效根因是 TopHudView 全屏容器 Default 命中阻塞
+        //   了低 z 兄弟（已改 Transparent）；覆盖层与 XComponent 同在居中
+        //   Stack 内同尺寸 → ClickEvent.x/y 即预览本地坐标，handleFaceFrameTap
+        //   直接可用；埋点保留供回捞日志验证
+        Column()
+          .width(this.previewW > 0 ? this.previewW : '100%')
+          .height(this.previewH > 0 ? this.previewH : '100%')
+          .onClick((event: ClickEvent): void => {
+            this.appendUvcLog(`[tap] click x=${event.x.toFixed(1)} y=${event.y.toFixed(1)}`);
+            this.handleFaceFrameTap(event.x, event.y);
+          })
+          .gesture(PinchGesture({ fingers: 2 })
+            .onActionStart((event: GestureEvent) => {
+              this.pinchStartZoom = this.zoomRatio;
+              this.appendUvcLog(`[pinch] start zoom=${this.zoomRatio.toFixed(2)} hw=${this.hwZoomSupported}`);
+            })
+            .onActionUpdate((event: GestureEvent) => {
+              this.applyPinchZoom(this.pinchStartZoom * event.scale);
+            })
+            .onActionEnd(() => {
+              this.persistSettings();
+            }))
         if (!this.previewReady) {
           Column().width('100%').height('100%').backgroundColor('#000').justifyContent(FlexAlign.Center).hitTestBehavior(HitTestMode.Transparent)
         }
       }
       .width('100%').height('100%').rotate({ angle: this.rotateAngle })
-      // ★ 双指捏合缩放摄像头：手机（setZoomRatio）与 USB（setUvcZoom）都支持，
-      //   以手势起点倍数 × 捏合比例换算，钳制在 [1, zoomMax]
-      .gesture(PinchGesture({ fingers: 2 })
-        .onActionStart((event: GestureEvent) => {
-          this.pinchStartZoom = this.zoomRatio;
-        })
-        .onActionUpdate((event: GestureEvent) => {
-          this.applyPinchZoom(this.pinchStartZoom * event.scale);
-        })
-        .onActionEnd(() => {
-          this.persistSettings();
-        }))
 
       TopHudView({
         cameraPosition: this.cameraPosition,
@@ -2944,16 +2914,16 @@ struct Index {
           Row({ space: 10 }) {
             if (this.faceDetailAvatar !== null) {
               Image(this.faceDetailAvatar)
-                .width(64).height(64)
+                .width(88).height(88)
                 .borderRadius(12)
                 .objectFit(ImageFit.Cover)
                 .border({ width: 1.5, color: faceColorOf(this.faceDetailIdx) })
                 .backgroundColor('#0B0E12')
             } else {
               Column() {
-                Text('☺').fontSize(24).fontColor(faceColorOf(this.faceDetailIdx))
+                Text('☺').fontSize(30).fontColor(faceColorOf(this.faceDetailIdx))
               }
-              .width(64).height(64)
+              .width(88).height(88)
               .borderRadius(12)
               .justifyContent(FlexAlign.Center)
               .backgroundColor('#0B0E12')

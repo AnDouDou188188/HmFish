@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -56,7 +57,7 @@ namespace {
     constexpr int64_t kGaRefreshMs = 1200;   // 性别年龄复检间隔（track 内节流）
     constexpr size_t kMaxTracks = 8;
     constexpr size_t kMaxFacesOut = 4;    // 最多输出脸数（关键点全部推理）
-    constexpr int kFaceFloats = 223;      // 每脸输出 float 数：[0..7]基本信息 + [8..215]106点 + [216..222]颜值分项
+    constexpr int kFaceFloats = 227;      // 每脸输出 float 数：[0..7]基本信息 + [8..219]106点 + [220..226]颜值分项
     constexpr float kGaVoteMargin = 0.25f;  // 性别投票置信度门槛（|logit 差|）
 
     // 复用缓冲（全部在 g_face_mutex 内访问，仅人脸工作线程实际使用）
@@ -116,14 +117,16 @@ namespace {
         const float rex = X(34), rey = Y(34);   // 右眼中心（瞳孔重复点）
         const float lex = X(88), ley = Y(88);   // 左眼中心
         const float d = std::hypot(lex - rex, ley - rey);
-        if (d < 8.0f) return -1.0f;
+        // NaN 安全守卫：点位含 NaN 时 d/faceW/alen 为 NaN，普通 < 比较为假会
+        // 放行，导致 NaN 扩散到分项/总分 → 改为 !(x>=min) 形式（NaN 必拦截）
+        if (!(d >= 8.0f)) return -1.0f;
         const float faceW = std::hypot(X(17) - X(1), Y(17) - Y(1));
-        if (faceW < 16.0f) return -1.0f;
+        if (!(faceW >= 16.0f)) return -1.0f;
         // 中轴线：双眼中点 → 下巴(0)
         const float mx = (rex + lex) * 0.5f, my = (rey + ley) * 0.5f;
         float ax = X(0) - mx, ay = Y(0) - my;
         const float alen = std::hypot(ax, ay);
-        if (alen < 1.0f) return -1.0f;
+        if (!(alen >= 1.0f)) return -1.0f;
         ax /= alen; ay /= alen;
         auto lineDist = [&](float px, float py) {
             const float dx = px - mx, dy = py - my;
@@ -150,11 +153,29 @@ namespace {
                             std::hypot(X(93) - X(89), Y(93) - Y(89))) * 0.5f;
         const float eyeScore = gauss(eyeW / d, 0.46f, 0.09f);
         // ③ 眉形：眉眼距比（眉下沿中点高于眼中心 / d，理想 0.28 Lena 校准）
-        //    + 左右眉眼距对称
-        const float browGapR =
-            (rey - (Y(43) + Y(44) + Y(45) + Y(46) + Y(47)) * 0.2f) / d;
-        const float browGapL =
-            (ley - (Y(97) + Y(98) + Y(99) + Y(100) + Y(101)) * 0.2f) / d;
+        //    + 左右眉眼距对称；眉点被遮挡时 runLandmarks 标记 NaN →
+        //    取该侧有效点均值，整侧无效回退对侧，双侧无效回退理想值
+        auto browGapOf = [&](const int *bi, float eyeCy) -> float {
+            float sum = 0.0f;
+            int cnt = 0;
+            for (int k = 0; k < 5; ++k) {
+                const float y = Y(bi[k]);
+                if (!std::isnan(y)) {
+                    sum += y;
+                    ++cnt;
+                }
+            }
+            return cnt > 0 ? (eyeCy - sum / (float)cnt) / d
+                           : std::numeric_limits<float>::quiet_NaN();
+        };
+        static const int kBrowRLo[] = {43, 44, 45, 46, 47};
+        static const int kBrowLLo[] = {97, 98, 99, 100, 101};
+        float browGapR = browGapOf(kBrowRLo, rey);
+        float browGapL = browGapOf(kBrowLLo, ley);
+        if (std::isnan(browGapR) && !std::isnan(browGapL)) browGapR = browGapL;
+        if (std::isnan(browGapL) && !std::isnan(browGapR)) browGapL = browGapR;
+        if (std::isnan(browGapR)) browGapR = 0.28f;
+        if (std::isnan(browGapL)) browGapL = 0.28f;
         const float browScore =
             0.5f * gauss((browGapR + browGapL) * 0.5f, 0.28f, 0.12f) +
             0.5f * gauss(std::fabs(browGapR - browGapL), 0.0f, 0.08f);
@@ -194,9 +215,23 @@ namespace {
             dbg[6] = thirds;
             dbg[7] = eyeH / std::max(1.0f, eyeW);
         }
-        float score = 0.22f * symScore + 0.13f * eyeScore + 0.12f * browScore +
-                      0.14f * noseScore + 0.14f * mouthScore + 0.16f * thirdsScore +
-                      0.09f * aspectScore;
+        // ★ NaN 清洗 + 权重归一：个别分项因点位 NaN 时置 -1（无效，标签/详情
+        //   端按 <0 跳过），总分按有效分项权重求和后归一（全部有效时与原
+        //   固定权重完全一致），有效权重不足一半视为不可信返回 -1
+        static const float kScoreW[7] = {0.22f, 0.13f, 0.12f, 0.14f,
+                                         0.14f, 0.16f, 0.09f};
+        for (int k = 0; k < 7; ++k) {
+            if (std::isnan(comp[k])) comp[k] = -1.0f;
+        }
+        float score = 0.0f, wsum = 0.0f;
+        for (int k = 0; k < 7; ++k) {
+            if (comp[k] >= 0.0f) {
+                score += kScoreW[k] * comp[k];
+                wsum += kScoreW[k];
+            }
+        }
+        if (wsum < 0.5f) return -1.0f;
+        score /= wsum;
         if (score < 0.0f) score = 0.0f;
         if (score > 100.0f) score = 100.0f;
         return score;
@@ -258,11 +293,19 @@ namespace {
             const float cx = (b.x1 + b.x2) * 0.5f, cy = (b.y1 + b.y2) * 0.5f;
             const float s = (float)S / (std::max(w, h) * 1.5f);
             for (int j = 0; j < 106; ++j) {
-                // 钳制到模型输入窗 [0,S]：眉被头发/刘海遮挡时模型可能输出
-                // 越界 q（<−1 或 >1），逆映射后为负坐标，画出来是拉向屏幕
-                // 左上角的直线；钳制后最坏贴到裁剪窗边缘，不会飞出屏幕
-                const float qx = std::clamp((pred[j * 2] + 1.0f) * half, 0.0f, (float)S);
-                const float qy = std::clamp((pred[j * 2 + 1] + 1.0f) * half, 0.0f, (float)S);
+                // 越界 pred（<−1 或 >1，回归头输出可略超界）标记 NaN：
+                // 逆映射后为远离脸的坐标，drawFacePoly 跳段、faceBeautyScore
+                // 取有效点均值/回退。注："眉线拉向左上角"的真根因是分项与
+                // 104/105 号点在输出布局重叠（已修，分项移至 [220..226]），
+                // 此检查仅拦真正越界的模型输出
+                const float qx = (pred[j * 2] + 1.0f) * half;
+                const float qy = (pred[j * 2 + 1] + 1.0f) * half;
+                if (!(qx > -24.0f && qx < (float)S + 24.0f &&
+                      qy > -24.0f && qy < (float)S + 24.0f)) {
+                    ptsOut[j * 2] = std::numeric_limits<float>::quiet_NaN();
+                    ptsOut[j * 2 + 1] = std::numeric_limits<float>::quiet_NaN();
+                    continue;
+                }
                 ptsOut[j * 2] = (qx - half) / s + cx;
                 ptsOut[j * 2 + 1] = (qy - half) / s + cy;
             }
@@ -447,11 +490,11 @@ void face_release(void) {
     LOGI("face released");
 }
 
-/* 同步检测一帧 RGBA。facesOut 每脸 kFaceFloats=223 个 float：
+/* 同步检测一帧 RGBA。facesOut 每脸 kFaceFloats=227 个 float：
  * [0..3] box x1,y1,x2,y2（图像坐标） [4] 检测分
  * [5] 性别(0女1男,-1未知) [6] 年龄(-1未知) [7] 颜值 0~100(-1未知)
- * [8..215] 106 关键点 x,y（图像坐标）
- * [216..222] 颜值分项 0~100(-1未知)：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+ * [8..219] 106 关键点 x,y（图像坐标）
+ * [220..226] 颜值分项 0~100(-1未知)：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
  * 返回脸数（<=min(maxFaces,4)），未就绪返回 0 */
 int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces) {
     if (!g_face_ready.load() || !rgba || !facesOut || w <= 0 || h <= 0 || maxFaces <= 0) {
@@ -692,7 +735,10 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
             float dbg[8] = {0};
             const float beauty = faceBeautyScore(pts, comp, dbg);
             o[7] = beauty;
-            for (int ci = 0; ci < 7; ++ci) o[216 + ci] = comp[ci];
+            // ★ 分项写 [220..226]：106 点占 [8..219]，旧版写在 [216..222]
+            //   与末 4 个 float（104/105 号点=左眉上沿）重叠——分项分值
+            //   （0~100 小值）当作帧坐标画出，就是"直线拉向左上角"的根因
+            for (int ci = 0; ci < 7; ++ci) o[220 + ci] = comp[ci];
             // 诊断：分项与原始比值（每 30 脸一条）——定位某分项异常是关键点
             // 错位还是理想值校准问题
             {
@@ -713,7 +759,7 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         } else {
             std::memset(pts, 0, sizeof(float) * 212);
             o[7] = -1.0f;
-            for (int ci = 0; ci < 7; ++ci) o[216 + ci] = -1.0f;
+            for (int ci = 0; ci < 7; ++ci) o[220 + ci] = -1.0f;
         }
         ++n;
     }
