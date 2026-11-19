@@ -373,14 +373,41 @@ namespace rapidocr_wrapper {
         return g_table && g_table->isReady();
     }
 
-    std::string recognizeTable(const cv::Mat &bgr) {
-        if (bgr.empty()) return table_net::errorJson("画面为空");
+    // ★ 表格识别（增强版）：三个目标合一
+    //   1) 提速：工作图降采样到长边 1024（det 上限本就 1024，SLANet 内部自行缩放 488，
+    //      OCR 文本行来自该图 → 行宽缩短，逐行 CRNN 显著加速）
+    //   2) 提速：OCR 只跑表格区域（cells 联合 bbox 外扩裁剪；框外文本行本就会被
+    //      IoU 匹配过滤，全图 OCR 纯属浪费）
+    //   3) 交互：采集帧 JPEG（stage 1）与结构框标注图 JPEG（stage 2）落 outDir 并经
+    //      cb 回调，供弹窗实时显示被识别画面与 SLANet 结构框
+    std::string recognizeTableEx(const cv::Mat &bgrFull, const std::string &outDir,
+                                 ocr_table_event_cb cb, void *userdata,
+                                 int &structureFound, std::string &boxedPathOut) {
+        structureFound = 0;
+        boxedPathOut.clear();
+        if (bgrFull.empty()) return table_net::errorJson("画面为空");
         const long long t0 = now_ms();
+
+        // ★ 提速①：统一降采样到长边 1024（AREA 插值，缩小时质量最优）
+        cv::Mat bgr = bgrFull;
+        constexpr int kWorkSide = 1024;
+        const int maxSide = std::max(bgrFull.cols, bgrFull.rows);
+        if (maxSide > kWorkSide) {
+            const double s = (double) kWorkSide / (double) maxSide;
+            cv::resize(bgrFull, bgr, cv::Size(), s, s, cv::INTER_AREA);
+        }
+
+        // ★ 交互 stage 1：采集帧 JPEG 先回传（弹窗 loading 态立即显示被识别画面）
+        const std::string framePath = outDir + "/table_frame.jpg";
+        const std::vector<int> jpegParams = {cv::IMWRITE_JPEG_QUALITY, 85};
+        cv::imwrite(framePath, bgr, jpegParams);
+        if (cb) cb(1, framePath.c_str(), userdata);
 
         // 1. 表格结构推理（SLANet）
         std::vector<std::string> tokens;
         std::vector<table_net::TableCell> cells;
         std::string errMsg;
+        const long long tStruct0 = now_ms();
         {
             std::lock_guard<std::mutex> lk(g_table_mutex);
             if (!g_table || !g_table->isReady())
@@ -388,47 +415,92 @@ namespace rapidocr_wrapper {
             if (!g_table->detect(bgr, tokens, cells, errMsg))
                 return table_net::errorJson(errMsg.empty() ? "表格识别失败" : errMsg);
         }
+        const long long tStruct = now_ms() - tStruct0;
+        structureFound = 1;
 
-        // 2. 全图 OCR（同步，取文本行用于单元格匹配；OCR 未就绪则输出纯结构）
-        std::vector<table_net::OcrLine> lines;
+        // ★ 交互 stage 2：结构框标注图回传（绿色单元格框画在帧上，弹窗切"正在识别文字"）
+        const std::string boxedPath = outDir + "/table_boxed.jpg";
         {
-            std::lock_guard<std::mutex> lk(g_ocr_mutex);
-            if (g_ocr) {
-                try {
-                    cv::Mat src = bgr.clone();  // detect 接收非 const 引用，安全拷贝
-                    OcrResult result = g_ocr->detect(src, 50, 1024,
-                                                     g_db_score.load(), g_db_box.load(),
-                                                     g_unclip.load(), false, false);
-                    lines.reserve(result.textBlocks.size());
-                    for (const TextBlock &tb : result.textBlocks) {
-                        if (tb.boxPoint.size() < 4 || tb.text.empty()) continue;
-                        table_net::OcrLine line;
-                        float x0 = tb.boxPoint[0].x, y0 = tb.boxPoint[0].y;
-                        float x1 = x0, y1 = y0;
-                        for (const cv::Point &p : tb.boxPoint) {
-                            x0 = std::min(x0, (float) p.x);
-                            y0 = std::min(y0, (float) p.y);
-                            x1 = std::max(x1, (float) p.x);
-                            y1 = std::max(y1, (float) p.y);
+            cv::Mat boxed = bgr.clone();
+            const int th = std::max(2, boxed.cols / 400);
+            for (const auto &c : cells) {
+                if (c.x1 - c.x0 < 0.5f && c.y1 - c.y0 < 0.5f) continue;  // 跳过空框
+                cv::rectangle(boxed,
+                              cv::Point((int) c.x0, (int) c.y0),
+                              cv::Point((int) c.x1, (int) c.y1),
+                              cv::Scalar(0, 220, 0), th, cv::LINE_AA);
+            }
+            cv::imwrite(boxedPath, boxed, jpegParams);
+        }
+        boxedPathOut = boxedPath;
+        if (cb) cb(2, boxedPath.c_str(), userdata);
+
+        // 2. ★ 提速②：表格区域裁剪 OCR——cells 联合 bbox 外扩 2%（容纳贴边文字）后裁剪，
+        //    det/CRNN 输入与文本行数双降；行坐标加回裁剪偏移即工作图坐标
+        float tx0 = 0.f, ty0 = 0.f, tx1 = 0.f, ty1 = 0.f;
+        bool hasBox = false;
+        for (const auto &c : cells) {
+            if (c.x1 - c.x0 < 0.5f && c.y1 - c.y0 < 0.5f) continue;
+            if (!hasBox) {
+                tx0 = c.x0; ty0 = c.y0; tx1 = c.x1; ty1 = c.y1;
+                hasBox = true;
+            } else {
+                tx0 = std::min(tx0, c.x0);
+                ty0 = std::min(ty0, c.y0);
+                tx1 = std::max(tx1, c.x1);
+                ty1 = std::max(ty1, c.y1);
+            }
+        }
+        std::vector<table_net::OcrLine> lines;
+        const long long tOcr0 = now_ms();
+        if (hasBox) {
+            const float padX = std::max(4.f, (tx1 - tx0) * 0.02f);
+            const float padY = std::max(4.f, (ty1 - ty0) * 0.02f);
+            const int ox = std::max(0, (int) (tx0 - padX));
+            const int oy = std::max(0, (int) (ty0 - padY));
+            const int ow = std::min(bgr.cols - ox, (int) (tx1 - tx0 + 2 * padX) + 1);
+            const int oh = std::min(bgr.rows - oy, (int) (ty1 - ty0 + 2 * padY) + 1);
+            if (ow > 8 && oh > 8) {
+                const cv::Mat crop = bgr(cv::Rect(ox, oy, ow, oh)).clone();
+                std::lock_guard<std::mutex> lk(g_ocr_mutex);
+                if (g_ocr) {
+                    try {
+                        // detect 返回的 boxPoint 已扣 padding（crop 内坐标），加回 (ox, oy) 即工作图坐标
+                        OcrResult result = g_ocr->detect(crop, 50, 1024,
+                                                         g_db_score.load(), g_db_box.load(),
+                                                         g_unclip.load(), false, false);
+                        lines.reserve(result.textBlocks.size());
+                        for (const TextBlock &tb : result.textBlocks) {
+                            if (tb.boxPoint.size() < 4 || tb.text.empty()) continue;
+                            table_net::OcrLine line;
+                            float x0 = (float) tb.boxPoint[0].x, y0 = (float) tb.boxPoint[0].y;
+                            float x1 = x0, y1 = y0;
+                            for (const cv::Point &p : tb.boxPoint) {
+                                x0 = std::min(x0, (float) p.x);
+                                y0 = std::min(y0, (float) p.y);
+                                x1 = std::max(x1, (float) p.x);
+                                y1 = std::max(y1, (float) p.y);
+                            }
+                            line.x0 = x0 + (float) ox;
+                            line.y0 = y0 + (float) oy;
+                            line.x1 = x1 + (float) ox;
+                            line.y1 = y1 + (float) oy;
+                            line.text = tb.text;
+                            lines.push_back(std::move(line));
                         }
-                        line.x0 = x0;
-                        line.y0 = y0;
-                        line.x1 = x1;
-                        line.y1 = y1;
-                        line.text = tb.text;
-                        lines.push_back(std::move(line));
+                    } catch (const std::exception &e) {
+                        LOGE("table ocr detect exception: %{public}s", e.what());
+                    } catch (...) {
+                        LOGE("table ocr detect unknown exception");
                     }
-                } catch (const std::exception &e) {
-                    LOGE("table ocr detect exception: %{public}s", e.what());
-                } catch (...) {
-                    LOGE("table ocr detect unknown exception");
                 }
             }
         }
+        const long long tOcr = now_ms() - tOcr0;
 
-        // 3. 匹配 + 组装 JSON
+        // 3. 匹配 + 组装 JSON（含 boxed 预览图路径与阶段计时）
         const long long elapsed = now_ms() - t0;
-        return table_net::buildTableJson(tokens, cells, lines, elapsed);
+        return table_net::buildTableJson(tokens, cells, lines, elapsed, tStruct, tOcr, boxedPath);
     }
 
 
@@ -583,13 +655,20 @@ extern "C" {
         return rapidocr_wrapper::isTableReady() ? 1 : 0;
     }
 
-    // 单帧同步识别：rgba 输入，JSON 输出，返回实际拷贝字节数（含 '\0'），失败返回 0
-    int ocr_recognize_table(const uint8_t *rgba, int w, int h, char *jsonOut, int bufLen) {
-        if (!rgba || w <= 0 || h <= 0 || !jsonOut || bufLen <= 0) return 0;
+    // 单帧同步识别（增强版）：rgba 输入 → JSON 输出；预览图落 outDir 并经 cb 阶段回调，
+    // structureFound 回写是否识别到表格结构（0=无框，供调用方换帧重试）
+    int ocr_recognize_table_ex(const uint8_t *rgba, int w, int h, const char *outDir,
+                               ocr_table_event_cb cb, void *userdata,
+                               int *structureFound, char *jsonOut, int bufLen) {
+        if (!rgba || w <= 0 || h <= 0 || !jsonOut || bufLen <= 0 || !outDir) return 0;
         cv::Mat m(h, w, CV_8UC4, const_cast<uint8_t *>(rgba));
         cv::Mat bgr;
         cv::cvtColor(m, bgr, cv::COLOR_RGBA2BGR);
-        const std::string json = rapidocr_wrapper::recognizeTable(bgr);
+        int found = 0;
+        std::string boxed;
+        const std::string json = rapidocr_wrapper::recognizeTableEx(
+                bgr, std::string(outDir), cb, userdata, found, boxed);
+        if (structureFound) *structureFound = found;
         size_t n = json.size();
         if ((int) n >= bufLen) n = (size_t) bufLen - 1;
         std::memcpy(jsonOut, json.data(), n);

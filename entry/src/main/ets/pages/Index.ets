@@ -48,7 +48,11 @@ interface TableParsed {
   cols?: number;
   cells?: CellParsed[];
   html?: string;
+  // ★ 结构框标注图路径（loading/结果态弹窗顶部预览）
+  boxed?: string;
   ms?: number;
+  t_struct?: number;
+  t_ocr?: number;
   error?: string;
 }
 
@@ -331,6 +335,16 @@ struct Index {
   @State tableCells: TableCellData[] = [];
   @State tableHtml: string = '';
   @State tableElapsedMs: number = 0;
+  // ★ 表格识别"先弹窗后加载"交互：点击立即弹 loading 面板，
+  //   模型加载/推理后台进行，完成后面板原地切换为结果
+  @State tableLoading: boolean = false;
+  @State tableLoadingHint: string = '';
+  // ★ 表格识别预览图路径：loading 态=采集帧/结构框标注图，结果态=结构框标注图
+  @State tablePreviewPath: string = '';
+  private tableSeq: number = 0;          // 放弃识别（识别中关闭弹窗）后使在途回调失效
+  private tableTimerId: number = -1;     // loading 已用时计时器
+  private tableElapsedSec: number = 0;
+  private tableStage: string = '';
   // ★ OCR 识别进度：只在 HUD"识别中"徽标显示，不再画在画面上
   @State ocrDone: number = 0;
   @State ocrTotal: number = 0;
@@ -2037,16 +2051,57 @@ struct Index {
   private doRecognizeTable(): void {
     if (this.tableBusy) return;
     this.tableBusy = true;
+    const seq = ++this.tableSeq;
+    // ★ 识别全链路（模型加载+SLANet 推理+全图 OCR）最长约 20s：
+    //   点击立即弹出 loading 面板给反馈，完成后面板原地切换为结果
+    this.tableLoading = true;
+    this.tablePopupVisible = true;
+    this.tablePreviewPath = '';
+    this.startTableElapsedTimer();
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-    this.doRecognizeTableAsync(ctx);
+    this.doRecognizeTableAsync(ctx, seq);
   }
 
-  private async doRecognizeTableAsync(ctx: common.UIAbilityContext): Promise<void> {
+  // ★ loading 面板已用时计时：每秒刷新提示，让用户知道没有死机
+  private startTableElapsedTimer(): void {
+    this.stopTableElapsedTimer();
+    this.tableElapsedSec = 0;
+    this.tableStage = '正在准备模型 · ';
+    this.tableLoadingHint = `${this.tableStage}已用时 0 秒`;
+    this.tableTimerId = setInterval((): void => {
+      this.tableElapsedSec++;
+      this.tableLoadingHint = `${this.tableStage}已用时 ${this.tableElapsedSec} 秒`;
+    }, 1000);
+  }
+
+  private stopTableElapsedTimer(): void {
+    if (this.tableTimerId !== -1) {
+      clearInterval(this.tableTimerId);
+      this.tableTimerId = -1;
+    }
+  }
+
+  // ★ 放弃识别：识别中关闭弹窗 → 在途回调按 seq 静默失效（native 推理照常跑完，仅丢弃结果）
+  private abandonTableRecognition(): void {
+    this.tableSeq++;
+    this.closeTablePopup();
+  }
+
+  private closeTablePopup(): void {
+    this.tablePopupVisible = false;
+    this.tableLoading = false;
+    this.tablePreviewPath = '';
+    this.stopTableElapsedTimer();
+  }
+
+  private async doRecognizeTableAsync(ctx: common.UIAbilityContext, seq: number): Promise<void> {
     try {
       // 保证 OCR 引擎就绪（单元格文本匹配依赖全图 OCR 文本行）
       const ocrOk = await this.ocr.initSet(ctx, this.ocrModelId);
+      if (seq !== this.tableSeq) return;
       if (!ocrOk) {
         this.showToast('OCR 引擎初始化失败');
+        this.closeTablePopup();
         return;
       }
       // ★ 表格识别依赖 OCR：OCR 未开启时点击"表格"自动开启（短按 OCR 徽标可再关闭）
@@ -2057,18 +2112,53 @@ struct Index {
         this.persistSettings();
         this.showToast('文字识别已自动开启（表格识别需要）');
       }
-      // SLANet 表格模型（幂等，首次从 rawfile 解包）
+      // SLANet 表格模型（幂等，首次从 rawfile 解包；预览就绪后已后台预载）
       const tableOk = await this.ocr.initTable(ctx);
+      if (seq !== this.tableSeq) return;
       if (!tableOk) {
         this.showToast('表格模型加载失败');
+        this.closeTablePopup();
         return;
       }
-      const json: string = await entry.recognizeTable();
+      this.tableStage = '正在识别表格 · ';
+      this.tableLoadingHint = `${this.tableStage}已用时 ${this.tableElapsedSec} 秒`;
+      const json: string = await entry.recognizeTable(ctx.filesDir,
+        (stage: number, path: string): void => { this.onTableEvent(stage, path, seq); });
+      if (seq !== this.tableSeq) return;
       this.parseTableJson(json);
     } catch (_) {
+      if (seq !== this.tableSeq) return;
       this.showToast('表格识别失败');
+      this.closeTablePopup();
     } finally {
+      // ★ 无条件复位：无论正常完成还是被放弃，识别链结束后都允许再次触发
+      //   （放弃场景下 native 推理仍在跑，保持 busy 到回调结束避免并发识别）
       this.tableBusy = false;
+    }
+  }
+
+  // ★ SLANet 表格模型后台预载（懒加载）：预览就绪后延时静默加载，
+  //   点击"▦ 表格"时免付首次模型加载等待（initTable 幂等，预载与点击并发安全）
+  private preloadTableModel(): void {
+    setTimeout((): void => {
+      try {
+        const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+        this.ocr.initTable(ctx);
+      } catch (_) {}
+    }, 3000);
+  }
+
+  // ★ native 阶段事件回调（识别线程 → tsfn → JS 线程）：
+  //   stage 1=采集帧 JPEG（loading 态立即显示被识别画面）
+  //   stage 2=结构框标注图 JPEG（切"正在识别文字"阶段，图上绿框=SLANet 结构）
+  private onTableEvent(stage: number, path: string, seq: number): void {
+    if (seq !== this.tableSeq) return;
+    if (stage === 1) {
+      this.tablePreviewPath = path;
+    } else if (stage === 2) {
+      this.tablePreviewPath = path;
+      this.tableStage = '正在识别文字 · ';
+      this.tableLoadingHint = `${this.tableStage}已用时 ${this.tableElapsedSec} 秒`;
     }
   }
 
@@ -2077,11 +2167,13 @@ struct Index {
       const parsed = JSON.parse(json) as TableParsed;
       if (parsed.error !== undefined && parsed.error.length > 0) {
         this.showToast(parsed.error);
+        this.closeTablePopup();
         return;
       }
       if (parsed.rows === undefined || parsed.cols === undefined ||
         parsed.cells === undefined) {
         this.showToast('表格识别失败');
+        this.closeTablePopup();
         return;
       }
       const cells: TableCellData[] = [];
@@ -2096,9 +2188,17 @@ struct Index {
       this.tableCells = cells;
       this.tableHtml = parsed.html ?? '';
       this.tableElapsedMs = parsed.ms ?? 0;
+      // 结构框标注图（事件回调已设置；此处兜底，确保结果态一定显示带框画面）
+      if (parsed.boxed !== undefined && parsed.boxed.length > 0) {
+        this.tablePreviewPath = parsed.boxed;
+      }
       this.tablePopupVisible = true;
+      // ★ 识别完成：loading 态原地切换为结果（弹窗保持打开，不闪断）
+      this.tableLoading = false;
+      this.stopTableElapsedTimer();
     } catch (_) {
       this.showToast('表格识别失败');
+      this.closeTablePopup();
     }
   }
 
@@ -2110,6 +2210,7 @@ struct Index {
           this.previewReady = true;
           // ★ 按实际帧宽高比适配预览区（USB 16:9 竖屏显示为横条不变形；手机摄像头按旋转后比例）
           this.fitPreviewToAspect(s[0] / s[1]);
+          this.preloadTableModel();
           return;
         }
       } catch (_) {}
@@ -2155,8 +2256,14 @@ struct Index {
   // ★ 变焦路由：硬件变焦走 setZoomRatio；前摄/USB 等无硬件变焦走管线数字变焦（中心裁剪）
   private applyZoomToCamera(): void {
     try {
-      if (this.hwZoomSupported) this.cameraService.setZoomRatio(this.zoomRatio);
-      else entry.setUvcZoom(this.zoomRatio);
+      if (this.hwZoomSupported) {
+        // ★ 硬件变焦生效时必须把管线数字变焦复位 1x：
+        //   前摄残留的 zoomScale_ 会与后摄硬件变焦叠加成双重放大
+        entry.setUvcZoom(1.0);
+        this.cameraService.setZoomRatio(this.zoomRatio);
+      } else {
+        entry.setUvcZoom(this.zoomRatio);
+      }
     } catch (_) {}
   }
 
@@ -2767,6 +2874,7 @@ struct Index {
     this.previewReady = false;
     this.stopRecordTimer();
     this.stopUvcWatchdog();
+    this.stopTableElapsedTimer();
     if (this.batteryTimer !== -1) { clearInterval(this.batteryTimer); this.batteryTimer = -1; }
     if (this.geoTimer !== -1) { clearTimeout(this.geoTimer); this.geoTimer = -1; }
     this.stopFaceInfoPoll();
@@ -3138,7 +3246,8 @@ struct Index {
         .onClick((): void => { this.ocrPopupVisible = false; })
       }
 
-      // ★ 表格识别结果弹窗（Grid 渲染合并单元格，复制文本/HTML）
+      // ★ 表格识别结果弹窗（Grid 渲染合并单元格，复制文本/HTML）；
+      //   识别中为 loading 态（转圈+已用时），关闭=放弃识别
       if (this.tablePopupVisible) {
         Column() {
           TableResultPopup({
@@ -3147,14 +3256,23 @@ struct Index {
             cells: this.tableCells,
             html: this.tableHtml,
             elapsedMs: this.tableElapsedMs,
-            onClose: (): void => { this.tablePopupVisible = false; }
+            loading: this.tableLoading,
+            loadingHint: this.tableLoadingHint,
+            previewPath: this.tablePreviewPath,
+            onClose: (): void => {
+              if (this.tableLoading) this.abandonTableRecognition();
+              else this.tablePopupVisible = false;
+            }
           })
         }
         .width('100%')
         .height('100%')
         .justifyContent(FlexAlign.Center)
         .backgroundColor('rgba(0,0,0,0.55)')
-        .onClick((): void => { this.tablePopupVisible = false; })
+        .onClick((): void => {
+          if (this.tableLoading) this.abandonTableRecognition();
+          else this.tablePopupVisible = false;
+        })
       }
 
       // ★ 相册最新照片预览（点击底部相册按钮弹出，无权限时回退缓存缩略图）

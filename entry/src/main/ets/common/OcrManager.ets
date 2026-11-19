@@ -277,26 +277,28 @@ export class OcrManager {
   }
 
   private tableInited: boolean = false;
-  private tableIniting: boolean = false;
+  private tableInitPromise: Promise<boolean> | null = null;
 
-  // 加载 SLANet 表格模型（幂等；模型常驻，不随 OCR 引擎释放）
+  // 加载 SLANet 表格模型（幂等；模型常驻，不随 OCR 引擎释放）。
+  // ★ promise 缓存：后台预载与用户点击并发时等待同一次初始化，
+  //   而不是返回 false 误报"加载失败"；失败清缓存允许重试
   async initTable(ctx: common.UIAbilityContext): Promise<boolean> {
     if (this.tableInited) return true;
-    if (this.tableIniting) return false;
-    this.tableIniting = true;
-    try {
-      this.ensureTableModel(ctx);
-      const ok = await entry.initTable(this.tableModelPath(ctx));
-      this.tableInited = ok;
-      if (!ok) {
-        console.error('[OcrManager] initTable failed');
-      }
-      return ok;
-    } catch (e) {
-      console.error('[OcrManager] initTable exception', e);
-      return false;
-    } finally {
-      this.tableIniting = false;
+    if (this.tableInitPromise === null) {
+      this.tableInitPromise = new Promise<boolean>((resolve) => {
+        try {
+          this.ensureTableModel(ctx);
+          entry.initTable(this.tableModelPath(ctx))
+            .then((ok: boolean): void => { resolve(ok); })
+            .catch((): void => { resolve(false); });
+        } catch (_) {
+          resolve(false);
+        }
+      });
     }
+    const ok = await this.tableInitPromise;
+    if (ok) this.tableInited = true;
+    else this.tableInitPromise = null;
+    return ok;
   }
 }

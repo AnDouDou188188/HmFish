@@ -277,7 +277,7 @@ export struct PictureSheet {
               }
               .width('100%')
             } else {
-              Text('AI超分（细节注入版）：原图细节零损失 + AI 生成细节按强度叠加 + 双重锐化，清晰度显著提升')
+              Text('AI画质增强（v2 显示分辨率超分）：AI 细节 0~220% 增益注入原图 + 双重锐化加强档，效果直观可辨')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
 
@@ -308,7 +308,7 @@ export struct PictureSheet {
               }
               .width('100%')
 
-              Text('原始画面细节零损失，AI 提取的细节按强度叠加其上，并叠加双重锐化；过慢时自动降档保持流畅')
+              Text('原始画面细节零损失；AI 细节按强度 0~220% 增益叠加（软限幅防爆点），叠加双重锐化加强档；强度 0=关闭 AI；过慢时自动降档保持流畅')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
             }

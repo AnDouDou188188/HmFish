@@ -3,6 +3,8 @@
 #ifndef OCR_BRIDGE_H
 #define OCR_BRIDGE_H
 
+#include "ocr_c_api.h"
+
 #include <string>
 
 /* libentry.so 侧的 OCR 桥接层：
@@ -43,8 +45,11 @@ namespace ocr_bridge {
     /* ★ 表格结构识别（PP-Structure SLANet） */
     bool initTable(const std::string &tableModelPath);
     bool isTableReady();
-    // rgba 输入 → JSON（{"rows","cols","cells","html","ms"} 或 {"error"}）
-    std::string recognizeTable(const uint8_t *rgba, int w, int h);
+    // rgba 输入 → JSON（含 boxed 预览图路径）；outDir 写预览 JPEG（table_frame/table_boxed）；
+    // eventCb 阶段回调（stage 1=采集帧 2=结构框图，可空）；structureFound 回写是否识别到表格结构
+    std::string recognizeTableEx(const uint8_t *rgba, int w, int h, const std::string &outDir,
+                                 ocr_table_event_cb eventCb, void *userdata,
+                                 bool &structureFound);
 
     /* ★ AI 超分（ESPCN/FSRCNN/QuickSRNetMedium/Real-ESRGAN，x2-x4，onnxruntime CPU 推理） */
     bool srInit(const std::string &onnxPath, int numThreads);

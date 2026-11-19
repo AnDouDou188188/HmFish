@@ -55,9 +55,18 @@ int ocr_table_init(const char *tableModelPath);
 
 int ocr_table_is_ready(void);
 
-/* 单帧同步识别：rgba 输入，JSON 输出（{"rows","cols","cells","html","ms"} 或 {"error"}），
- * 返回实际拷贝字节数（含 '\0'），失败返回 0 */
-int ocr_recognize_table(const uint8_t *rgba, int w, int h, char *jsonOut, int bufLen);
+/* 表格识别阶段事件回调：stage 1=采集帧 JPEG 已生成，2=结构框标注图 JPEG 已生成
+ * （jpegPath=文件路径）；userdata 原样透传，回调在识别线程内同步调用，需快速返回 */
+typedef void (*ocr_table_event_cb)(int stage, const char *jpegPath, void *userdata);
+
+/* 单帧同步识别（增强版）：rgba 输入 → JSON 输出（{"rows","cols","cells","html",
+ * "boxed","ms","t_struct","t_ocr"} 或 {"error"}）。
+ * outDir：预览图输出目录（写入 table_frame.jpg / table_boxed.jpg）；
+ * cb/userdata：阶段事件回调（可空）；structureFound 非空时回写是否识别到表格
+ * 结构（0=无框，供调用方换帧重试）；返回实际拷贝字节数（含 '\0'），失败返回 0 */
+int ocr_recognize_table_ex(const uint8_t *rgba, int w, int h, const char *outDir,
+                           ocr_table_event_cb cb, void *userdata,
+                           int *structureFound, char *jsonOut, int bufLen);
 
 /* ★ AI 超分（QuickSRNetSmall / Real-ESRGAN x4，onnxruntime CPU） */
 

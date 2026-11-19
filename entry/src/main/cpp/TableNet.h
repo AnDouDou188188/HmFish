@@ -58,11 +58,14 @@ namespace table_net {
     };
 
     // 单元格-OCR 匹配 + 组装结果 JSON（照抄 RapidTable TableMatch + get_pred_html）
-    // 返回 JSON：{"rows":R,"cols":C,"cells":[{"r","c","rs","cs","h","t"}],"html":"...","ms":N}
+    // 返回 JSON：{"rows":R,"cols":C,"cells":[{"r","c","rs","cs","h","t"}],"html":"...",
+    //            "boxed":"...","ms":N,"t_struct":N,"t_ocr":N}
     std::string buildTableJson(const std::vector<std::string> &tokens,
                                std::vector<TableCell> &cells,
                                const std::vector<OcrLine> &ocrLines,
-                               long long elapsedMs);
+                               long long elapsedMs,
+                               long long structMs, long long ocrMs,
+                               const std::string &boxedPath);
 
     // 错误 JSON：{"error":"..."}
     std::string errorJson(const std::string &msg);

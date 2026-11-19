@@ -54,9 +54,11 @@ export const setYoloThreads: (n: number) => void;
 export const setOcrTriggerInterval: (ms: number) => void;
 export const setOcrDetParams: (dbScore: number, dbBox: number, unclip: number) => void;
 export const setOcrNumThreads: (n: number) => void;
-// ★ 表格结构识别（PP-Structure SLANet）：加载模型 / 单帧识别（返回 JSON）
+// ★ 表格结构识别（PP-Structure SLANet）：加载模型 / 单帧识别（返回 JSON）；
+//   outDir=预览图输出目录；onEvent(stage,path) 阶段回调：1=采集帧 JPEG，2=结构框标注图 JPEG
 export const initTable: (tableModelPath: string) => Promise<boolean>;
-export const recognizeTable: () => Promise<string>;
+export const recognizeTable: (outDir: string,
+  onEvent?: (stage: number, path: string) => void) => Promise<string>;
 export const setupExternalPipeline: (w: number, h: number) => boolean;
 export const uvcConnect: (fd: number, vid: number, pid: number, busnum: number, devaddr: number) => boolean;
 export const uvcStartStreaming: (w: number, h: number, fps: number) => boolean;

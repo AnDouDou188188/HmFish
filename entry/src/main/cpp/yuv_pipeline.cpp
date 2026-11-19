@@ -36,10 +36,13 @@ static std::atomic<bool> g_yolo_enabled(true);
 // ★ 识别框/标签画面显示开关（false 时检测照常，仅不画框和文字）
 static std::atomic<bool> g_draw_boxes(true);
 // ★ USB 画面增强（仅外部供帧路径生效）：
-//   mode 0=关闭 1=非AI增强 2=AI细节注入超分(QuickSRNetMedium)
+//   mode 0=关闭 1=非AI增强 2=AI画质增强(显示分辨率超分 v2)
 //   非AI：亮度 -50~+50 / 锐度 0~100（unsharp mask）/ 对比度 -50~+50 /
-//         饱和度 -50~+50 / 固定基线锐化
-//   AI：out = 原图 + β×(SR(小图)−双线性(小图))，β=细节强度滑条 0~100%
+//         饱和度 -50~+50 / 固定基线锐化 0.45
+//   AI v2：整条链路在显示分辨率进行（SR 网格 = 显示尺寸/factor，推理像素量
+//         仅为旧版 1/4，细节增量零降采样衰减）：
+//         out = 原图 + 增益×(SR(小图)−双线性(小图))，增益 = 强度滑条 0~220%，
+//         软限幅 ±64 防爆点；精修锐化比非AI档明显强一档（0.75+Clarity 0.50）
 static std::atomic<int>  g_usb_mode(0);
 static std::atomic<int>  g_usb_brightness(0);
 static std::atomic<int>  g_usb_contrast(0);
@@ -48,10 +51,11 @@ static std::atomic<int>  g_usb_sharpness(0);
 static std::atomic<int>  g_usb_sr_strength(100);
 // ★ 人脸识别画面总开关（SCRFD 检测 + 106 点连线框 + 性别年龄颜值标注 + HUD）
 static std::atomic<bool> g_face_enabled(false);
-// ★ SR 细节网格降采样因子（原图宽/factor = SR 输入宽；factor 越大推理越快、
-//   细节增量越粗）。按实测推理耗时自适应：慢了 +1 档（上限 8），快了回 4。
-//   factor 与 SR 倍率(4) 对齐时 SR 输出与原图 1:1 像素对齐，零重采样
-static std::atomic<int>  g_sr_factor(4);
+// ★ AI v2：SR 网格 = 显示尺寸/factor（2/4/8 三档，倍增梯子）。
+//   f=2 质量最高（SR 看到真实半分辨率细节）；f=4 与 SR 倍率(4) 对齐时
+//   SR 输出与显示 1:1 像素对齐零重采样；f=8 兜底最快。
+//   按实测推理耗时自适应：>500ms 升档保流畅，<200ms 降档保质量
+static std::atomic<int>  g_sr_factor(2);
 
 // ───────── 运动 & 水深 ─────────
 static pthread_mutex_t g_motion_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -328,9 +332,9 @@ extern "C" {
         g_usb_contrast.store(contrast);
         g_usb_saturation.store(saturation);
         g_usb_sr_strength.store(strength);
-        // 切换/进入 AI 模式 → 重置降采样因子（随后按推理耗时自适应）
+        // 切换/进入 AI 模式 → 重置自适应因子到最高质量档（随后按推理耗时自适应）
         if (mode != prevMode && mode == 2) {
-            g_sr_factor.store(4);
+            g_sr_factor.store(2);
         }
         OH_LOG_INFO(LOG_APP, "[usb] enhance mode=%{public}d bright=%{public}d sharp=%{public}d "
                     "contrast=%{public}d saturation=%{public}d srStrength=%{public}d",
@@ -812,6 +816,26 @@ void YuvPipeline::ProcessFrame(OH_ImageNative *image) {
                (size_t)displayWidth_ * displayHeight_ * 4);
     }
 
+    // ★ 手机相机管线数字变焦（与 ProcessExternalRgba 同款中心裁剪+回放大）：
+    //   前摄 getZoomRatioRange=[1,1] 无硬件变焦，ETS 走 entry.setUvcZoom 设
+    //   zoomScale_，但此前只有 USB 供帧路径读取它，手机路径帧从不过裁剪
+    //   → 滑条动画面不变焦。裁剪放在旋转/镜像之后（裁的是用户所见方向），
+    //   裁完双线性回放大到显示尺寸；人脸/YOLO/OCR 均在变焦后的帧上采样，
+    //   叠加坐标与画面天然对齐
+    const float zoom = zoomScale_.load();
+    if (zoom > 1.001f) {
+        const int W = displayWidth_, H = displayHeight_;
+        const int cropW = std::max(16, std::min(W, (int)(W / zoom)));
+        const int cropH = std::max(16, std::min(H, (int)(H / zoom)));
+        const int sx = (W - cropW) / 2;
+        const int sy = (H - cropH) / 2;
+        libyuv::ARGBScale(rgbaBuf_.data() + ((size_t)sy * W + sx) * 4, W * 4,
+                          cropW, cropH,
+                          tempBuf_.data(), W * 4, W, H,
+                          libyuv::kFilterBilinear);
+        memcpy(rgbaBuf_.data(), tempBuf_.data(), (size_t)W * H * 4);
+    }
+
     ProcessCommonTail();
 }
 
@@ -1138,20 +1162,22 @@ static void applyUsbEnhance(uint8_t* rgba, int w, int h) {
     }
 }
 
-// ★ AI 超分工作线程（细节注入架构）：
-//   等待 pending → SR 推理（重活）→ out = 原图 + β×(SR(小图)−双线性(小图))
-//   → 双重锐化 → 用户滑条链 → 上屏 → 复位 busy。
-//   相机线程只负责缩放入队，推理期间到达的帧直接丢弃，屏幕保持上一帧结果
+// ★ AI 画质增强工作线程（v3，细节层异步产出）：
+//   等待 pending → SR 推理 → delta = SR(小图) − 双线性(小图)（对齐到显示尺寸）
+//   → 与旧层 65/35 时域混合 → 发布细节层快照 → 复位 busy。
+//   ★ v3 关键：工作线程只产出"细节层"，不再接管渲染——相机线程每帧
+//     "基底 + 最新细节层"合成上屏，帧率与推理速度解耦（全帧率流畅不跳帧）；
+//     因子自适应带滞回（3 连慢升档/3 连快降档 + 180~500ms 死区），
+//     防止阈值附近来回震荡导致细节强度周期性跳变（闪烁）
 void YuvPipeline::SrWorkerLoop() {
+    int slowCnt = 0, fastCnt = 0;
     while (true) {
         std::unique_lock<std::mutex> lk(srMutex_);
         srCv_.wait(lk, [this] { return srPending_ || !srRunning_.load(); });
         if (!srRunning_.load()) break;
         if (!srPending_) continue;
         std::swap(srWorkIn_, srInPending_);
-        std::swap(srWorkRaw_, srRawPending_);
         const int inW = srInW_, inH = srInH_;
-        const int rawW = srRawW_, rawH = srRawH_;
         srPending_ = false;
         lk.unlock();
 
@@ -1173,15 +1199,29 @@ void YuvPipeline::SrWorkerLoop() {
         }
         const int64_t inferMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0).count();
-        // ★ 推理太慢 → 降采样因子 +1（SR 网格更小更快，上限 8）；快了逐步回 4
+        // ★ 倍增梯子自适应（2/4/8）+ 滞回：3 连慢(>500ms)升档保流畅、
+        //   3 连快(<180ms)降档保质量，180~500ms 死区内不动 → 无震荡
         {
             int f = g_sr_factor.load();
-            if (inferMs > 1200 && f < 8) {
-                g_sr_factor.store(f + 1);
-                OH_LOG_INFO(LOG_APP, "[sr] slow(%{public}lldms) factor=%{public}d",
-                            (long long)inferMs, f + 1);
-            } else if (inferMs < 400 && f > 4) {
-                g_sr_factor.store(f - 1);
+            if (inferMs > 500) {
+                if (++slowCnt >= 3 && f < 8) {
+                    g_sr_factor.store(f * 2);
+                    slowCnt = 0; fastCnt = 0;
+                    OH_LOG_INFO(LOG_APP, "[sr] slow(%{public}lldms) factor=%{public}d",
+                                (long long)inferMs, f * 2);
+                }
+            } else {
+                slowCnt = 0;
+            }
+            if (inferMs < 180) {
+                if (++fastCnt >= 3 && f > 2) {
+                    g_sr_factor.store(f / 2);
+                    fastCnt = 0; slowCnt = 0;
+                    OH_LOG_INFO(LOG_APP, "[sr] fast(%{public}lldms) factor=%{public}d",
+                                (long long)inferMs, f / 2);
+                }
+            } else {
+                fastCnt = 0;
             }
         }
 
@@ -1193,21 +1233,9 @@ void YuvPipeline::SrWorkerLoop() {
                           srUpBuf_.data(), (size_t)srW * 4, srW, srH,
                           libyuv::kFilterBilinear);
 
-        // 与相机回调互斥，接管渲染
-        std::lock_guard<std::mutex> cbLock(callbackMutex_);
-        if (!running_ || rgbaBuf_.empty()) { srBusy_.store(false); continue; }
         const int W = displayWidth_, H = displayHeight_;
         if (W > 0 && H > 0) {
-            // ① 基底 = 原始裁切帧（真实传感器细节，零损失）缩放到显示尺寸
-            srBlendBuf_.resize((size_t)W * H * 4);
-            if (rawW == W && rawH == H) {
-                memcpy(srBlendBuf_.data(), srWorkRaw_.data(), (size_t)W * H * 4);
-            } else {
-                libyuv::ARGBScale(srWorkRaw_.data(), (size_t)rawW * 4, rawW, rawH,
-                                  srBlendBuf_.data(), (size_t)W * 4, W, H,
-                                  libyuv::kFilterBilinear);
-            }
-            // ② SR 输出与双线性基线对齐到显示尺寸（factor 与倍率对齐时零重采样）
+            // 对齐到显示尺寸（factor 与 SR 倍率对齐时零重采样）
             const uint8_t *srF = nullptr;
             const uint8_t *upF = nullptr;
             if (srW == W && srH == H) {
@@ -1225,28 +1253,70 @@ void YuvPipeline::SrWorkerLoop() {
                 srF = srDetailBuf_.data();
                 upF = srUpScaledBuf_.data();
             }
-            // ③ 细节注入：out = 原图 + β×(SR − 双线性)，β = 细节强度滑条 0~100%
-            const int strength = g_usb_sr_strength.load();
-            memcpy(rgbaBuf_.data(), srBlendBuf_.data(), (size_t)W * H * 4);
-            if (strength > 0) {
-                uint8_t *d = rgbaBuf_.data();
+            // ★ 发布细节层（v3 核心）：delta 每通道 clamp ±96；
+            //   与旧层 65/35 时域混合，抑制 SR 更新间的层间抖动（闪烁）
+            {
+                std::lock_guard<std::mutex> dlk(srDeltaMutex_);
                 const size_t n = (size_t)W * H;
-                for (size_t i = 0; i < n; ++i, d += 4, srF += 4, upF += 4) {
+                const bool blend = srDeltaValid_.load() && srDeltaW_ == W &&
+                                   srDeltaH_ == H && srDeltaBuf_.size() == n * 3;
+                if (!blend) srDeltaBuf_.assign(n * 3, 0);
+                int8_t *dst = srDeltaBuf_.data();
+                for (size_t i = 0; i < n; ++i, srF += 4, upF += 4, dst += 3) {
                     for (int c = 0; c < 3; ++c) {
-                        int v = d[c] + ((int)srF[c] - (int)upF[c]) * strength / 100;
-                        d[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+                        int dv = (int)srF[c] - (int)upF[c];
+                        if (dv > 96) dv = 96;
+                        else if (dv < -96) dv = -96;
+                        if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
+                        dst[c] = (int8_t)dv;
                     }
                 }
+                srDeltaW_ = W;
+                srDeltaH_ = H;
+                srDeltaCycleMs_ = (int)inferMs;
+                srDeltaTime_ = std::chrono::steady_clock::now();
+                srDeltaValid_.store(true);
             }
-            // ④ 双重精修锐化：细锐（3x3 unsharp）+ Clarity（中频局部对比），
-            //    肉眼"清晰感"最敏感的两个频段同时拉满
-            sharpenRgba(rgbaBuf_.data(), W, H, 0.50f);
-            clarityRgba(rgbaBuf_.data(), W, H, 0.35f);
-            // ⑤ 用户滑条链：亮度/锐度/对比度饱和度对 AI 模式同样生效；叠加层在其后绘制不受污染
-            applyUsbEnhance(rgbaBuf_.data(), W, H);
-            ProcessCommonTail();
         }
         srBusy_.store(false);
+    }
+}
+
+// ★ AI 细节层合成（v3，相机线程每帧调用）：基底 + 最新细节层（按龄衰减）叠加。
+//   细节层由 SR 工作线程以推理节奏（约 2~7Hz）刷新，相机帧全帧率渲染——
+//   基底实时、细节层半静态，画面流畅不跳帧；
+//   龄衰减窗口 = max(500, 2×推理周期)（cap 1200ms）内全强度，之后 400ms 线性淡出：
+//   SR 持续刷新时永不衰减（稳定不呼吸），管线停更/场景切走后旧细节自然消失
+void YuvPipeline::CompositeSrDelta(uint8_t *rgba, int W, int H) {
+    const int strength = g_usb_sr_strength.load();
+    if (strength <= 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk(srDeltaMutex_);
+    if (!srDeltaValid_.load() || srDeltaW_ != W || srDeltaH_ != H ||
+        srDeltaBuf_.size() != (size_t)W * H * 3) {
+        return;
+    }
+    const int64_t ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - srDeltaTime_).count();
+    const int fadeStart = std::min(1200, std::max(500, srDeltaCycleMs_ * 2));
+    if (ageMs > fadeStart + 400) return;
+    int fade100 = 100;
+    if (ageMs > fadeStart) fade100 = 100 - (int)((ageMs - fadeStart) * 100 / 400);
+    if (fade100 <= 0) return;
+    // 增益 = 强度滑条 0~100 → 0~220%（v3 网格在显示分辨率，细节零降采样衰减，
+    // 加倍注入后边缘轮廓增量肉眼显著）；±64 软限幅防爆点
+    const int gain100 = strength * 220 / 100 * fade100 / 100;
+    const int8_t *dl = srDeltaBuf_.data();
+    uint8_t *d = rgba;
+    const size_t n = (size_t)W * H;
+    for (size_t i = 0; i < n; ++i, d += 4, dl += 3) {
+        for (int c = 0; c < 3; ++c) {
+            int dv = (int)dl[c] * gain100 / 100;
+            if (dv > 64) dv = 64 + (dv - 64) / 2;
+            else if (dv < -64) dv = -64 + (dv + 64) / 2;
+            int v = d[c] + dv;
+            d[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+        }
     }
 }
 
@@ -1278,36 +1348,36 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
     const uint8_t *src = rgba + ((size_t)sy * w + sx) * 4;
     const int mode = g_usb_mode.load();
 
-    // ★ AI 超分模式（mode 2，细节注入架构）：相机线程只做 Box 降采样入队
-    //   （SR 细节网格 = 原图/factor），原始帧整帧备份作基底；推理在工作线程，
-    //   推理忙时丢帧保持画面稳定（上一帧结果留在屏上）
-    if (mode == 2 && ocr_bridge::srIsReady()) {
-        if (srBusy_.load()) return;
-        int f = g_sr_factor.load();
-        if (f < 4) f = 4;
-        if (f > 8) f = 8;
-        int inW = (sw / f) & ~1;
-        int inH = (sh / f) & ~1;
-        if (inW < 32) inW = 32;
-        if (inH < 32) inH = 32;
-        {
-            std::lock_guard<std::mutex> lk(srMutex_);
-            srInPending_.resize((size_t)inW * inH * 4);
-            libyuv::ARGBScale(src, w * 4, sw, sh,
-                              srInPending_.data(), inW * 4, inW, inH,
-                              libyuv::kFilterBox);
-            // 原始裁切帧整帧备份：细节注入的基底（真实传感器细节零损失）
-            srRawPending_.assign(src, src + (size_t)sw * sh * 4);
-            srInW_ = inW; srInH_ = inH;
-            srRawW_ = sw; srRawH_ = sh;
-            srPending_ = true;
+    // ★ AI 画质增强（mode 2，v3 细节层解耦架构）：忙时只跳过投喂（细节层照常合成，
+    //   推理节奏与渲染节奏彻底解耦——相机帧永远全帧率上屏，无丢帧跳帧）
+    const bool aiOn = mode == 2 && g_usb_sr_strength.load() > 0 && ocr_bridge::srIsReady();
+    if (aiOn) {
+        const int W = displayWidth_, H = displayHeight_;
+        if (W > 0 && H > 0 && !srBusy_.load()) {
+            int f = g_sr_factor.load();
+            if (f < 2) f = 2;
+            if (f > 8) f = 8;
+            // SR 网格 = 显示尺寸/f（f 与 SR 倍率对齐时输出与显示 1:1 零重采样）
+            int inW = (W / f) & ~1;
+            int inH = (H / f) & ~1;
+            if (inW < 32) inW = 32;
+            if (inH < 32) inH = 32;
+            {
+                std::lock_guard<std::mutex> lk(srMutex_);
+                srInPending_.resize((size_t)inW * inH * 4);
+                libyuv::ARGBScale(src, w * 4, sw, sh,
+                                  srInPending_.data(), inW * 4, inW, inH,
+                                  libyuv::kFilterBox);
+                srInW_ = inW; srInH_ = inH;
+                srPending_ = true;
+            }
+            srBusy_.store(true);
+            srCv_.notify_all();
         }
-        srBusy_.store(true);
-        srCv_.notify_all();
-        return;
     }
 
-    // 普通路径（mode 0/1，或 AI 模式未就绪时兜底）
+    // 基底渲染（v3 核心：AI 模式不再由工作线程接管，相机线程每帧照常画基底，
+    //   细节层在其上异步合成 → 全帧率流畅）
     if (zoom <= 1.001f && w == width_ && h == height_) {
         memcpy(rgbaBuf_.data(), rgba, (size_t)w * h * 4);
     } else {
@@ -1316,9 +1386,15 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
                           libyuv::kFilterBilinear);
     }
 
-    // ★ 非AI基线锐化（mode≥1 固定生效，滑条全 0 也能看出增强开启；
-    //   否则"非AI增强"与"关闭"肉眼无差别）。用户锐度滑条在其后叠加
-    if (mode >= 1) {
+    if (aiOn) {
+        // ★ 细节层合成（按龄衰减+增益+软限幅）+ AI 档双重精修锐化
+        //   （细锐 3x3 unsharp + Clarity 中频局部对比，比非AI 0.45 强一档）
+        CompositeSrDelta(rgbaBuf_.data(), width_, height_);
+        sharpenRgba(rgbaBuf_.data(), width_, height_, 0.75f);
+        clarityRgba(rgbaBuf_.data(), width_, height_, 0.50f);
+    } else if (mode >= 1) {
+        // ★ 非AI基线锐化（mode≥1 固定生效，滑条全 0 也能看出增强开启；
+        //   否则"非AI增强"与"关闭"肉眼无差别）。用户锐度滑条在其后叠加
         sharpenRgba(rgbaBuf_.data(), width_, height_, 0.45f);
     }
 

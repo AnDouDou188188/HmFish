@@ -35,6 +35,11 @@ export struct TableResultPopup {
   @Prop cells: TableCellData[] = [];
   @Prop html: string = '';
   @Prop elapsedMs: number = 0;
+  // ★ loading 态：识别中立即弹面板（转圈+阶段/已用时提示），完成后原地切换结果
+  @Prop loading: boolean = false;
+  @Prop loadingHint: string = '';
+  // ★ 预览图：loading 态=被识别帧/结构框标注图，结果态=结构框标注图（SLANet 绿框）
+  @Prop previewPath: string = '';
   onClose?: () => void = () => {};
 
   // 行高自适应：行数多时压缩行高保证弹窗不过分高
@@ -98,107 +103,170 @@ export struct TableResultPopup {
         Row().width(6).height(6).borderRadius(3).backgroundColor('#FF9500')
         Text('表格识别结果')
           .fontSize(16).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).layoutWeight(1)
-        Text(`${this.rows} 行 × ${this.cols} 列 · ${this.elapsedMs} ms`)
-          .fontSize(10).fontColor('#FFD60A')
+        if (this.loading) {
+          Row({ space: 5 }) {
+            LoadingProgress().width(12).height(12).color('#FFD60A')
+            Text('识别中…')
+              .fontSize(10).fontColor('#FFD60A')
+          }
           .padding({ left: 8, right: 8, top: 3, bottom: 3 })
           .borderRadius(9)
           .backgroundColor('rgba(255,214,10,0.12)')
           .border({ width: 1, color: 'rgba(255,214,10,0.35)' })
+        } else {
+          Text(`${this.rows} 行 × ${this.cols} 列 · ${this.elapsedMs} ms`)
+            .fontSize(10).fontColor('#FFD60A')
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .borderRadius(9)
+            .backgroundColor('rgba(255,214,10,0.12)')
+            .border({ width: 1, color: 'rgba(255,214,10,0.35)' })
+        }
         Text('✕').fontSize(16).fontColor('#B0B6C0')
           .padding({ left: 8, right: 4, top: 4, bottom: 4 })
           .onClick(() => this.onClose?.())
       }.width('100%')
 
-      // ★ 小票"纸"：米黄底，网格还原表格结构（含合并单元格）
-      Scroll() {
-        Scroll() {
-          Grid() {
-            ForEach(this.cells, (cell: TableCellData) => {
-              GridItem() {
-                Column() {
-                  if (cell.t.length > 0) {
-                    Text(cell.t)
-                      .fontSize(10)
-                      .lineHeight(13)
-                      .fontColor(cell.h === 1 ? '#3E3A33' : '#2E2B25')
-                      .fontWeight(cell.h === 1 ? FontWeight.Bold : FontWeight.Normal)
-                      .textAlign(cell.h === 1 ? TextAlign.Center : TextAlign.Start)
-                      .maxLines(2)
-                      .textOverflow({ overflow: TextOverflow.Ellipsis })
-                      .textSelectable(TextSelectableMode.SELECTABLE_FOCUSABLE)
-                  }
-                }
-                .width('100%')
-                .height('100%')
-                .justifyContent(FlexAlign.Center)
-                .padding({ left: 3, right: 3, top: 2, bottom: 2 })
-              }
-              // ★ 绝对定位 + 跨行跨列（rowEnd/columnEnd 为包含语义：跨度 = end - start + 1）
-              .rowStart(cell.r)
-              .rowEnd(cell.r + cell.rs - 1)
-              .columnStart(cell.c)
-              .columnEnd(cell.c + cell.cs - 1)
-              .backgroundColor(cell.h === 1 ? '#EAE3D2' : '#FBF8F0')
-              // ★ 折叠边框：每格画上/左边缘，末行补下边缘、末列补右边缘，避免双线
-              .border({
-                width: {
-                  top: 1,
-                  left: 1,
-                  bottom: cell.r + cell.rs >= this.rows ? 1 : 0,
-                  right: cell.c + cell.cs >= this.cols ? 1 : 0
-                },
-                color: '#B9B2A3'
-              })
-            }, (cell: TableCellData) => `${cell.r}_${cell.c}_${cell.rs}_${cell.cs}_${cell.t}`)
+      // ★ 小票"纸"：米黄底，网格还原表格结构（含合并单元格）；
+      //   识别中显示 loading 反馈（转圈 + 阶段/已用时），完成后原地切换
+      if (this.loading) {
+        Column({ space: 10 }) {
+          // ★ 被识别帧/结构框标注图实时预览（stage1=采集帧，stage2=带 SLANet 绿框）：
+          //   识别中预览图占弹窗主体（大图），识别完成后缩小为小条
+          if (this.previewPath !== '') {
+            Image('file://' + this.previewPath)
+              .width('100%')
+              .height(300)
+              .objectFit(ImageFit.Contain)
+              .borderRadius(8)
+              .backgroundColor('#000000')
           }
-          .columnsTemplate(`repeat(${this.cols}, 1fr)`)
-          .rowsTemplate(`repeat(${this.rows}, 1fr)`)
-          .width(this.useHScroll() ? this.gridWidthVp() : '100%')
-          .height(this.rows * this.rowHeightVp())
-          .scrollBar(BarState.Off)
+          LoadingProgress().width(46).height(46).color('#FFD60A')
+          Text('正在识别表格结构')
+            .fontSize(15).fontColor('#3E3A33').fontWeight(FontWeight.Bold)
+          Text(this.loadingHint)
+            .fontSize(11).fontColor('#8A8272')
+            .textAlign(TextAlign.Center)
+            .maxLines(2)
         }
-        .scrollable(ScrollDirection.Horizontal)
+        .layoutWeight(1)
+        .width('100%')
+        .justifyContent(FlexAlign.Center)
+        .margin({ top: 10 })
+        .backgroundColor('#F7F3E9')
+        .borderRadius(10)
+        .border({ width: 1, color: 'rgba(0,0,0,0.08)' })
+        .padding(16)
+      } else {
+        // ★ 结果态顶部：结构框标注图缩小为小条（识别中是大图，完成后让位给表格内容）
+        if (this.previewPath !== '') {
+          Image('file://' + this.previewPath)
+            .width('100%')
+            .height(72)
+            .objectFit(ImageFit.Contain)
+            .borderRadius(8)
+            .margin({ top: 10 })
+        }
+        Scroll() {
+          Scroll() {
+            Grid() {
+              ForEach(this.cells, (cell: TableCellData) => {
+                GridItem() {
+                  Column() {
+                    if (cell.t.length > 0) {
+                      Text(cell.t)
+                        .fontSize(10)
+                        .lineHeight(13)
+                        .fontColor(cell.h === 1 ? '#3E3A33' : '#2E2B25')
+                        .fontWeight(cell.h === 1 ? FontWeight.Bold : FontWeight.Normal)
+                        .textAlign(cell.h === 1 ? TextAlign.Center : TextAlign.Start)
+                        .maxLines(2)
+                        .textOverflow({ overflow: TextOverflow.Ellipsis })
+                        .textSelectable(TextSelectableMode.SELECTABLE_FOCUSABLE)
+                    }
+                  }
+                  .width('100%')
+                  .height('100%')
+                  .justifyContent(FlexAlign.Center)
+                  .padding({ left: 3, right: 3, top: 2, bottom: 2 })
+                }
+                // ★ 绝对定位 + 跨行跨列（rowEnd/columnEnd 为包含语义：跨度 = end - start + 1）
+                .rowStart(cell.r)
+                .rowEnd(cell.r + cell.rs - 1)
+                .columnStart(cell.c)
+                .columnEnd(cell.c + cell.cs - 1)
+                .backgroundColor(cell.h === 1 ? '#EAE3D2' : '#FBF8F0')
+                // ★ 折叠边框：每格画上/左边缘，末行补下边缘、末列补右边缘，避免双线
+                .border({
+                  width: {
+                    top: 1,
+                    left: 1,
+                    bottom: cell.r + cell.rs >= this.rows ? 1 : 0,
+                    right: cell.c + cell.cs >= this.cols ? 1 : 0
+                  },
+                  color: '#B9B2A3'
+                })
+              }, (cell: TableCellData) => `${cell.r}_${cell.c}_${cell.rs}_${cell.cs}_${cell.t}`)
+            }
+            .columnsTemplate(`repeat(${this.cols}, 1fr)`)
+            .rowsTemplate(`repeat(${this.rows}, 1fr)`)
+            .width(this.useHScroll() ? this.gridWidthVp() : '100%')
+            .height(this.rows * this.rowHeightVp())
+            .scrollBar(BarState.Off)
+          }
+          .scrollable(ScrollDirection.Horizontal)
+          .scrollBar(BarState.Auto)
+          .width('100%')
+        }
+        .layoutWeight(1)
         .scrollBar(BarState.Auto)
         .width('100%')
+        .align(Alignment.TopStart)
+        .margin({ top: 10 })
+        .backgroundColor('#F7F3E9')
+        .borderRadius(10)
+        .border({ width: 1, color: 'rgba(0,0,0,0.08)' })
+        .padding(4)
       }
-      .layoutWeight(1)
-      .scrollBar(BarState.Auto)
-      .width('100%')
-      .align(Alignment.TopStart)
-      .margin({ top: 10 })
-      .backgroundColor('#F7F3E9')
-      .borderRadius(10)
-      .border({ width: 1, color: 'rgba(0,0,0,0.08)' })
-      .padding(4)
 
-      Row({ space: 8 }) {
-        Button('复制文本')
-          .fontSize(12).fontColor('#003B44')
-          .padding({ left: 4, right: 4 })
-          .backgroundColor('#FFD60A')
-          .borderRadius(18)
-          .height(34)
-          .layoutWeight(1)
-          .onClick(() => this.copyWithToast(this.buildTsv(), '已复制表格文本（可粘贴 Excel）'))
-        Button('复制HTML')
-          .fontSize(12).fontColor('#003B44')
-          .padding({ left: 4, right: 4 })
-          .backgroundColor('#00E5FF')
-          .borderRadius(18)
-          .height(34)
-          .layoutWeight(1)
-          .onClick(() => this.copyWithToast(this.html, '已复制表格 HTML'))
+      if (this.loading) {
         Button('关闭')
           .fontSize(12).fontColor('#D7DAE1')
           .padding({ left: 4, right: 4 })
           .backgroundColor('rgba(255,255,255,0.08)')
           .borderRadius(18)
           .height(34)
-          .layoutWeight(1)
+          .width('100%')
           .onClick(() => this.onClose?.())
+      } else {
+        Row({ space: 8 }) {
+          Button('复制文本')
+            .fontSize(12).fontColor('#003B44')
+            .padding({ left: 4, right: 4 })
+            .backgroundColor('#FFD60A')
+            .borderRadius(18)
+            .height(34)
+            .layoutWeight(1)
+            .onClick(() => this.copyWithToast(this.buildTsv(), '已复制表格文本（可粘贴 Excel）'))
+          Button('复制HTML')
+            .fontSize(12).fontColor('#003B44')
+            .padding({ left: 4, right: 4 })
+            .backgroundColor('#00E5FF')
+            .borderRadius(18)
+            .height(34)
+            .layoutWeight(1)
+            .onClick(() => this.copyWithToast(this.html, '已复制表格 HTML'))
+          Button('关闭')
+            .fontSize(12).fontColor('#D7DAE1')
+            .padding({ left: 4, right: 4 })
+            .backgroundColor('rgba(255,255,255,0.08)')
+            .borderRadius(18)
+            .height(34)
+            .layoutWeight(1)
+            .onClick(() => this.onClose?.())
+        }
+        .width('100%')
+        .margin({ top: 12 })
       }
-      .width('100%')
-      .margin({ top: 12 })
     }
     .width('88%')
     .constraintSize({ maxHeight: '70%' })

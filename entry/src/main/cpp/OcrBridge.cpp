@@ -36,7 +36,8 @@ namespace ocr_bridge {
         void (*set_num_threads)(int);
         int (*table_init)(const char *);
         int (*table_is_ready)(void);
-        int (*recognize_table)(const uint8_t *, int, int, char *, int);
+        int (*recognize_table_ex)(const uint8_t *, int, int, const char *,
+                                  ocr_table_event_cb, void *, int *, char *, int);
         int (*sr_init)(const char *, int);
         int (*sr_is_ready)(void);
         void (*sr_release)(void);
@@ -95,8 +96,9 @@ namespace ocr_bridge {
             api.set_num_threads = (void (*)(int)) dlsym(h, "ocr_set_num_threads");
             api.table_init = (int (*)(const char *)) dlsym(h, "ocr_table_init");
             api.table_is_ready = (int (*)(void)) dlsym(h, "ocr_table_is_ready");
-            api.recognize_table = (int (*)(const uint8_t *, int, int, char *, int))
-                    dlsym(h, "ocr_recognize_table");
+            api.recognize_table_ex = (int (*)(const uint8_t *, int, int, const char *,
+                                              ocr_table_event_cb, void *, int *, char *, int))
+                    dlsym(h, "ocr_recognize_table_ex");
             api.sr_init = (int (*)(const char *, int)) dlsym(h, "sr_init");
             api.sr_is_ready = (int (*)(void)) dlsym(h, "sr_is_ready");
             api.sr_release = (void (*)(void)) dlsym(h, "sr_release");
@@ -115,7 +117,7 @@ namespace ocr_bridge {
                 !api.get_result || !api.get_boxes || !api.get_box_text ||
                 !api.get_progress || !api.set_trigger_interval ||
                 !api.set_det_params || !api.set_num_threads ||
-                !api.table_init || !api.table_is_ready || !api.recognize_table ||
+                !api.table_init || !api.table_is_ready || !api.recognize_table_ex ||
                 !api.sr_init || !api.sr_is_ready || !api.sr_release ||
                 !api.sr_upscale_rgba || !api.sr_scale ||
                 !api.face_init || !api.face_is_ready || !api.face_release ||
@@ -248,12 +250,19 @@ namespace ocr_bridge {
         return g_api.table_is_ready() != 0;
     }
 
-    std::string recognizeTable(const uint8_t *rgba, int w, int h) {
+    std::string recognizeTableEx(const uint8_t *rgba, int w, int h, const std::string &outDir,
+                                 ocr_table_event_cb eventCb, void *userdata,
+                                 bool &structureFound) {
+        structureFound = false;
         if (!isLoaded()) return "{\"error\":\"OCR 库未加载\"}";
         // 表格 JSON（含 html 全文）可能远超 4KB，用大缓冲
         std::vector<char> buf(256 * 1024);
-        int n = g_api.recognize_table(rgba, w, h, buf.data(), (int) buf.size());
+        int found = 0;
+        int n = g_api.recognize_table_ex(rgba, w, h, outDir.c_str(),
+                                         eventCb, userdata,
+                                         &found, buf.data(), (int) buf.size());
         if (n <= 0) return "{\"error\":\"表格识别失败\"}";
+        structureFound = (found != 0);
         return std::string(buf.data());
     }
 

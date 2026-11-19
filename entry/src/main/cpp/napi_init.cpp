@@ -3,9 +3,11 @@
 #include <napi/native_api.h>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <atomic>
 #include <hilog/log.h>
@@ -952,36 +954,91 @@ static napi_value InitTable(napi_env env, napi_callback_info info) {
 }
 
 // 单帧同步识别：取"叠加绘制前"的干净帧（不含水印/检测框，避免识别出
-// 自绘内容）→ SLANet 结构 + 全图 OCR → 单元格匹配 → JSON
+// 自绘内容）→ SLANet 结构 + 表格区域 OCR → 单元格匹配 → JSON。
+// ★ 无框自动换帧重试：SLANet 未识别到表格结构时换新画面再试（最多 3 次），
+//   免去用户手动反复点击；预览图（采集帧/结构框标注图）经 tsfn 实时回传 JS
 struct TableRecognizeCtx {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
+    napi_threadsafe_function tsfn = nullptr;  // 阶段事件 → JS 回调（未传回调则为空）
+    std::string outDir;
     std::string json;
 };
 
+// tsfn 载荷：识别阶段事件（stage + 预览图路径）
+struct TableEventData {
+    int stage = 0;
+    std::string path;
+};
+
+// JS 线程：调用 ArkTS 回调 onEvent(stage, path)
+static void TableEventJsCall(napi_env env, napi_value jsCallback, void *context, void *data) {
+    auto *ev = static_cast<TableEventData *>(data);
+    napi_value undefined = nullptr;
+    napi_get_undefined(env, &undefined);
+    napi_value stageVal = nullptr;
+    napi_value pathVal = nullptr;
+    napi_create_int32(env, ev->stage, &stageVal);
+    napi_create_string_utf8(env, ev->path.c_str(), ev->path.size(), &pathVal);
+    napi_value args[2] = {stageVal, pathVal};
+    napi_value result = nullptr;
+    napi_call_function(env, undefined, jsCallback, 2, args, &result);
+    delete ev;
+}
+
+// libocr 识别线程内同步回调 → tsfn 投递到 JS 线程（非阻塞，队列打满即丢弃）
+static void tableEventTrampoline(int stage, const char *path, void *userdata) {
+    auto *ctx = static_cast<TableRecognizeCtx *>(userdata);
+    if (!ctx || !ctx->tsfn || !path) return;
+    auto *ev = new TableEventData();
+    ev->stage = stage;
+    ev->path = std::string(path);
+    if (napi_call_threadsafe_function(ctx->tsfn, ev, napi_tsfn_nonblocking) != napi_ok) {
+        delete ev;
+    }
+}
+
 static void TableRecognizeExecute(napi_env env, void *data) {
     auto *ctx = static_cast<TableRecognizeCtx *>(data);
-    std::vector<uint8_t> rgba;
-    int w = 0, h = 0;
-    {
-        // 持 gPipelineMutex 等待干净帧（最长 600ms），防止等待期间管线被销毁；
-        // 推理本身不持锁
-        std::lock_guard<std::mutex> lock(gPipelineMutex);
-        if (!gPipeline) {
-            ctx->json = "{\"error\":\"相机未启动\"}";
-            return;
+    ctx->json.clear();
+    for (int attempt = 0; attempt < 3; attempt++) {
+        std::vector<uint8_t> rgba;
+        int w = 0;
+        int h = 0;
+        {
+            // 持 gPipelineMutex 等待干净帧（最长 600ms），防止等待期间管线被销毁；
+            // 推理本身不持锁
+            std::lock_guard<std::mutex> lock(gPipelineMutex);
+            if (!gPipeline) {
+                ctx->json = "{\"error\":\"相机未启动\"}";
+                return;
+            }
+            gPipeline->RequestCleanSnapshot();
+            if (!gPipeline->WaitCleanSnapshot(600, rgba, w, h)) {
+                if (ctx->json.empty())
+                    ctx->json = "{\"error\":\"未取到相机画面，请开启预览后重试\"}";
+                return;
+            }
         }
-        gPipeline->RequestCleanSnapshot();
-        if (!gPipeline->WaitCleanSnapshot(600, rgba, w, h)) {
-            ctx->json = "{\"error\":\"未取到相机画面，请开启预览后重试\"}";
-            return;
-        }
+        bool structureFound = false;
+        ctx->json = ocr_bridge::recognizeTableEx(rgba.data(), w, h, ctx->outDir,
+                                                 tableEventTrampoline, ctx, structureFound);
+        if (structureFound) return;  // 有框：锁定当前帧，结果即最终 JSON
+        // 无框：稍候换新画面自动重试（间隔等待画面变化）
+        if (attempt < 2) std::this_thread::sleep_for(std::chrono::milliseconds(600));
     }
-    ctx->json = ocr_bridge::recognizeTable(rgba.data(), w, h);
+    // 3 次均无框：json 为最后一次的 {"error":"未识别到表格结构"}，换成可操作提示
+    if (ctx->json.find("未识别到表格结构") != std::string::npos) {
+        ctx->json = "{\"error\":\"未识别到表格，请对准表格画面后重试\"}";
+    }
 }
 
 static void TableRecognizeComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<TableRecognizeCtx *>(data);
+    if (ctx->tsfn) {
+        napi_release_threadsafe_function(ctx->tsfn, napi_tsfn_release);
+        ctx->tsfn = nullptr;
+    }
     napi_value result = nullptr;
     napi_create_string_utf8(env, ctx->json.c_str(), ctx->json.size(), &result);
     napi_resolve_deferred(env, ctx->deferred, result);
@@ -989,11 +1046,29 @@ static void TableRecognizeComplete(napi_env env, napi_status status, void *data)
     delete ctx;
 }
 
-static napi_value RecognizeTable(napi_env env, napi_callback_info) {
+static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2] = {nullptr, nullptr};
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     auto *ctx = new TableRecognizeCtx();
+    // 参数 0：预览图输出目录（filesDir，table_frame.jpg/table_boxed.jpg 落这里）
+    if (argc > 0) {
+        char buf[1024] = {0};
+        size_t len = 0;
+        if (napi_get_value_string_utf8(env, args[0], buf, sizeof(buf), &len) == napi_ok) {
+            ctx->outDir = std::string(buf);
+        }
+    }
     napi_value promise = nullptr;
     napi_create_promise(env, &ctx->deferred, &promise);
-
+    // 参数 1：阶段事件回调 onEvent(stage, path) → tsfn 跨线程投递
+    if (argc > 1) {
+        napi_value eventRes = nullptr;
+        napi_create_string_utf8(env, "tableEvent", NAPI_AUTO_LENGTH, &eventRes);
+        napi_create_threadsafe_function(env, args[1], nullptr, eventRes,
+                                        0, 1, nullptr, nullptr, nullptr,
+                                        TableEventJsCall, &ctx->tsfn);
+    }
     napi_value resourceName = nullptr;
     napi_create_string_utf8(env, "recognizeTable", NAPI_AUTO_LENGTH, &resourceName);
     napi_create_async_work(env, nullptr, resourceName,

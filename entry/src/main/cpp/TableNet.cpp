@@ -397,7 +397,9 @@ namespace table_net {
     std::string buildTableJson(const std::vector<std::string> &tokens,
                                std::vector<TableCell> &cells,
                                const std::vector<OcrLine> &ocrLines,
-                               long long elapsedMs) {
+                               long long elapsedMs,
+                               long long structMs, long long ocrMs,
+                               const std::string &boxedPath) {
         if (cells.empty()) return errorJson("未识别到表格结构");
 
         // 1. 过滤表格上方游离文本（照抄 filter_ocr_result：完全位于最高单元格之上的行丢弃）
@@ -481,7 +483,12 @@ namespace table_net {
         json += "],\"html\":\"";
         jsonEscape(html, esc);
         json += esc;
+        json += "\",\"boxed\":\"";
+        jsonEscape(boxedPath, esc);
+        json += esc;
         json += "\",\"ms\":" + std::to_string(elapsedMs);
+        json += ",\"t_struct\":" + std::to_string(structMs);
+        json += ",\"t_ocr\":" + std::to_string(ocrMs);
         json += "}";
         return json;
     }

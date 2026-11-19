@@ -17,8 +17,8 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 | 多相机接入 / Multi-camera input | USB UVC 摄像头（探鱼器）+ 手机前置/后置，一键切换，断连自动恢复 / USB UVC camera (fish finder) + phone front/rear, one-tap switching, auto-recovery on disconnect |
 | AI 目标检测 / AI object detection | 双模型可切换：YOLO 26M（80 类）与 Fish M（21 种淡水鱼），识别框 + 计数标签 + 按类别自动录像 / Switchable dual models: YOLO 26M (80 classes) and Fish M (21 freshwater species), boxes + count labels + category-based auto recording |
 | 人脸识别分析 / Face analysis | SCRFD 检测 + 106 关键点连线框 + 性别/年龄/颜值（0~100，7 分项），多脸同屏，点击识别框弹出详情面板 / SCRFD detection + 106-point wireframe + gender/age/beauty (0–100, 7 sub-scores), multiple faces, tap a face box to open the detail panel |
-| OCR 文字识别 / OCR | PP-OCRv4/v5 检测+识别+方向分类，PP-Structure 表格识别，结果弹窗一键复制 / PP-OCRv4/v5 detect + recognize + orientation classification, PP-Structure table recognition, one-tap copy from the result popup |
-| AI 超分增强 / AI super-resolution | QuickSRNetMedium ×4 细节注入 + 双重锐化（USB 画面），或非 AI 的亮度/锐度/对比度/饱和度调节 / QuickSRNetMedium ×4 detail injection + double sharpening (USB), or non-AI brightness/sharpness/contrast/saturation |
+| OCR 文字识别 / OCR | PP-OCRv4/v5 检测+识别+方向分类，PP-Structure 表格识别（阶段事件实时预览、逐格联合裁剪 OCR、无框自动重试），结果弹窗一键复制 / PP-OCRv4/v5 detect + recognize + orientation classification, PP-Structure table recognition (staged live preview, per-cell joint-crop OCR, auto-retry when no table frame found), one-tap copy from the result popup |
+| AI 超分增强 / AI super-resolution | QuickSRNetMedium ×4 细节层异步合成（帧率与推理解耦，全帧率流畅无跳闪）+ 双重锐化（USB 画面），或非 AI 的亮度/锐度/对比度/饱和度调节 / QuickSRNetMedium ×4 asynchronous detail-layer compositing (frame rate decoupled from inference, full-rate smooth with no jitter/flicker) + double sharpening (USB), or non-AI brightness/sharpness/contrast/saturation |
 | 录像与拍照 / Recording & capture | 手动录像/拍照、定时录像、运动检测自动录像、识别类别自动录像、自定义触发音效 / Manual record/capture, timed recording, motion-triggered and detection-triggered auto recording, custom trigger sound |
 | 运动检测 / Motion detection | 灵敏度可调；画面运动超阈值时 HUD 标红并自动录像 / Adjustable sensitivity; HUD highlights red and auto-records when motion exceeds the threshold |
 | 水深估算 / Depth estimation | 入水→触底过程估算水深：水体特征确认 + 浑浊度/摄像头重量参数 + 数据线阻力减速模型 / Estimates depth during descent: water-feature confirmation + turbidity/camera-weight parameters + cable-drag deceleration model |
@@ -58,21 +58,21 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 
 ### OCR 与表格识别 / OCR & Table Recognition
 
-**中文** 采用 PaddleOCR 移动端模型（PP-OCRv4 / PP-OCRv5 可切换）：文本检测 → 方向分类 → 识别（中英文 + 数字，内置词典）。表格模式使用 PP-Structure SLANet 还原表格结构，结果以 HTML 表格弹窗展示，支持一键复制。方向分类模型（textline_ori_cls）保证旋转文本也能正确识别。
+**中文** 采用 PaddleOCR 移动端模型（PP-OCRv4 / PP-OCRv5 可切换）：文本检测 → 方向分类 → 识别（中英文 + 数字，内置词典）。方向分类模型（textline_ori_cls）保证旋转文本也能正确识别。表格识别为多阶段流水线并带阶段事件回调：工作图降采样（长边 1024，加速 4 倍以上）→ SLANet 结构还原（首阶段回调即弹出"正在识别表格"实时预览图）→ 逐格联合 bbox 外扩裁剪后批量 OCR（坐标偏移回映射）→ 绿框标注图 + HTML 表格弹窗，支持一键复制；画面中未检出表格边框时自动重试（最多 3 次，间隔 600ms），全程弹窗展示识别进度。
 
-**English** Built on PaddleOCR mobile models (PP-OCRv4 / PP-OCRv5 switchable): text detection → orientation classification → recognition (Chinese, English, digits, with bundled dictionaries). Table mode uses PP-Structure SLANet to rebuild table structure, shown as an HTML-style popup with one-tap copy. The orientation-classification model (textline_ori_cls) ensures rotated text is recognized correctly.
+**English** Built on PaddleOCR mobile models (PP-OCRv4 / PP-OCRv5 switchable): text detection → orientation classification → recognition (Chinese, English, digits, with bundled dictionaries). The orientation-classification model (textline_ori_cls) ensures rotated text is recognized correctly. Table recognition is a multi-stage pipeline with staged event callbacks: the working image is downsampled (long side 1024, 4×+ speedup) → SLANet structure recovery (the first stage callback pops up a live "recognizing table" preview) → per-cell OCR on joint-bbox crops expanded by 2% (coordinates mapped back) → a green-boxed result image plus an HTML-style popup with one-tap copy. If no table frame is detected, it retries automatically (up to 3 times, 600 ms apart), with progress shown in the popup throughout.
 
 ### AI 超分辨率（USB 画面）/ AI Super-Resolution (USB)
 
-**中文** USB 摄像头画面支持三档增强：关闭（原始画面）、非 AI（亮度/锐度/对比度/饱和度实时调节，不占用 AI 算力）、AI 超分（QuickSRNetMedium ×4 细节注入：原图细节零损失 + AI 生成细节按强度叠加 + 双重锐化）。过慢时自动降档保持流畅。
+**中文** USB 摄像头画面支持三档增强：关闭（原始画面）、非 AI（亮度/锐度/对比度/饱和度实时调节，不占用 AI 算力）、AI 超分。AI 档采用"细节层"异步架构：相机线程每帧照常渲染基底（全帧率，永不因推理丢帧），SR 工作线程以自身节奏（约 2~7Hz）异步产出"细节层"快照（delta = SR(小图) − 双线性(小图)，显示分辨率），相机帧取最新细节层按强度滑条（0~220% 增益，±64 软限幅）合成，再叠加双重锐化（细锐 + Clarity）。细节层新旧 65/35 时域混合 + 按龄衰减消除层间闪烁与场景切换跳变；SR 网格分辨率自适应（2/4/8 倍增梯子，带 3 连慢/快滞回与死区防震荡），推理过慢时自动升档保流畅。
 
-**English** The USB camera feed supports three enhancement modes: off (raw), non-AI (real-time brightness/sharpness/contrast/saturation, no AI cost), and AI super-resolution (QuickSRNetMedium ×4 detail injection: zero loss of original detail + AI-generated detail blended by strength + double sharpening). It automatically steps down if processing falls behind.
+**English** The USB camera feed supports three enhancement modes: off (raw), non-AI (real-time brightness/sharpness/contrast/saturation, no AI cost), and AI super-resolution. The AI mode uses an asynchronous "detail-layer" architecture: the camera thread renders the base frame every time (full frame rate, never dropping frames for inference), while the SR worker thread produces "detail layer" snapshots (delta = SR(small grid) − bilinear(small grid), at display resolution) at its own pace (~2–7 Hz). Each camera frame composites the latest detail layer with the strength slider (0–220% gain, ±64 soft clamp) plus double sharpening (unsharp + clarity). New/old detail layers are blended 65/35 in the time domain, and age-based fading removes inter-layer flicker and scene-switch pops. The SR grid resolution adapts on a 2/4/8 ladder with hysteresis (3 consecutive slow/fast readings + dead zone) to avoid oscillation, stepping up automatically when inference falls behind.
 
 ### 性能设计 / Performance Design
 
-**中文** 全部视觉处理在 C++ 层完成（libyuv 色彩转换、NCNN/ONNX Runtime 推理、OpenCV 辅助），ArkTS 层只负责 UI 与状态。检测在独立工作线程运行，采用"永远处理最新帧"的跳帧策略，避免排队积压；多模型推理互不阻塞。相机占用带 3 秒超时保护，防止异常释放卡死。能耗档位通过调节处理间隔平衡续航与流畅度。
+**中文** 全部视觉处理在 C++ 层完成（libyuv 色彩转换、NCNN/ONNX Runtime 推理、OpenCV 辅助），ArkTS 层只负责 UI 与状态。检测在独立工作线程运行，采用"永远处理最新帧"的跳帧策略，避免排队积压；多模型推理互不阻塞。AI 超分采用"基底实时渲染 + 细节层异步合成"的帧率解耦架构：渲染帧率与推理速度彻底解耦，推理慢只影响细节层刷新率，不影响画面流畅度。相机占用带 3 秒超时保护，防止异常释放卡死。能耗档位通过调节处理间隔平衡续航与流畅度。
 
-**English** All vision processing happens in C++ (libyuv color conversion, NCNN/ONNX Runtime inference, OpenCV helpers); the ArkTS layer only handles UI and state. Detection runs on a dedicated worker thread with an always-newest-frame skipping policy to avoid backlog; multiple models run without blocking each other. Camera occupancy has a 3-second timeout guard against release deadlocks. Power presets trade battery for smoothness by adjusting the processing interval.
+**English** All vision processing happens in C++ (libyuv color conversion, NCNN/ONNX Runtime inference, OpenCV helpers); the ArkTS layer only handles UI and state. Detection runs on a dedicated worker thread with an always-newest-frame skipping policy to avoid backlog; multiple models run without blocking each other. AI super-resolution uses a "real-time base + asynchronous detail layer" decoupled architecture: render frame rate is fully decoupled from inference speed — slow inference only lowers the detail-layer refresh rate, never the on-screen smoothness. Camera occupancy has a 3-second timeout guard against release deadlocks. Power presets trade battery for smoothness by adjusting the processing interval.
 
 ---
 

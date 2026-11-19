@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <opencv2/opencv.hpp>
+#include "ocr_c_api.h"
 
 namespace rapidocr_wrapper {
 
@@ -28,11 +29,15 @@ namespace rapidocr_wrapper {
     void getLastBoxes(std::vector<OcrBox>& out);
     void drawLastBoxes(cv::Mat& rgba);
 
-    /* ★ 表格结构识别（PP-Structure SLANet）：单帧同步识别，
-     * 返回 JSON（{"rows","cols","cells":[{r,c,rs,cs,h,t}],"html","ms"} 或 {"error"}） */
+    /* ★ 表格结构识别（PP-Structure SLANet）：单帧同步识别（增强版）——
+     * 工作图降采样 1024 + 表格区域裁剪 OCR 提速；预览图落 outDir 并经 cb 阶段回调；
+     * structureFound 回写是否识别到表格结构（0=无框，供换帧重试）；
+     * 返回 JSON（含 "boxed"/"t_struct"/"t_ocr"，或 {"error"}） */
     bool initTable(const std::string& tableModelPath);
     bool isTableReady();
-    std::string recognizeTable(const cv::Mat& bgr);
+    std::string recognizeTableEx(const cv::Mat& bgrFull, const std::string& outDir,
+                                 ocr_table_event_cb cb, void* userdata,
+                                 int& structureFound, std::string& boxedPathOut);
 
 }  // namespace rapidocr_wrapper
 
