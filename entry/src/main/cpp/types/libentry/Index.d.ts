@@ -13,10 +13,13 @@ export const getFrameSize: () => number[];
 export const setYoloEnabled: (b: boolean) => void;
 // ★ 识别框/标签画面显示开关（false 时检测照常，仅不绘制）
 export const setDrawBoxesEnabled: (b: boolean) => void;
-// ★ USB 画质增强（仅 USB 摄像头画面生效）：
-//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 QuickSRNet 超分
+// ★ 画质增强（USB/手机前后置全部相机生效）：
+//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI增强
+//   （超分细节 srStrength + AI降噪 denoise + 水下去浊 clarity + 色彩还原 color，
+//    修复层异步合成，帧率与推理解耦不卡顿）
 export const setUsbEnhance: (mode: number, brightness: number, sharpness: number,
-  contrast: number, saturation: number, srStrength: number) => void;
+  contrast: number, saturation: number, srStrength: number,
+  denoise: number, clarity: number, color: number) => void;
 // ★ 人脸识别（SCRFD det_500m + 106 关键点连线框 + 性别年龄颜值）
 export const initFace: (detPath: string, lmPath: string, gaPath: string, threads: number) => Promise<boolean>;
 export const releaseFace: () => void;

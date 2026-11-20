@@ -187,19 +187,22 @@ private:
     std::vector<uint8_t> cleanSnapBuf_;
     bool cleanSnapReady_ = false;   // cleanSnapMutex_ 保护
 
-    // ★ AI 画质增强异步工作线程（USB 摄像头 mode 2，v3 细节层架构）：
+    // ★ AI 画质增强异步工作线程（mode 2，v3 细节层解耦架构）：
     //   相机线程每帧照常渲染基底（全帧率流畅），SR 工作线程只异步产出
-    //   "细节层"快照（delta = SR−双线性，显示分辨率），相机帧取最新层合成：
-    //   out = 基底 + 增益×细节层（强度滑条 0~220%、±64 软限幅、按龄衰减）。
+    //   三张"修复层"快照（全部显示分辨率、int8、3 通道、clamp ±96）：
+    //   ① 细节层 delta = SR−双线性（强度滑条 0~220%、±64 软限幅）
+    //   ② 降噪层 = SR 引导联合双边滤波平滑 − 原帧（负向噪声分量）
+    //   ③ 去浊层 = 暗通道先验去雾 + 灰世界白平衡（水下去浊+色彩还原，低频）
+    //   相机帧取最新层按龄衰减合成（max(500,2×推理周期) 内全强度，之后 400ms 淡出）。
     //   帧率与推理速度彻底解耦（v2"推理期间丢帧"的跳帧/闪烁根因），
-    //   细节层新旧 65/35 时域混合，因子自适应带滞回防震荡
+    //   各层新旧 65/35 时域混合，因子自适应带滞回防震荡
     void SrWorkerLoop();
-    void CompositeSrDelta(uint8_t *rgba, int W, int H);
+    void CompositeAiLayers(uint8_t *rgba, int W, int H);
     std::thread srThread_;
     std::mutex srMutex_;
     std::condition_variable srCv_;
     std::atomic<bool> srRunning_{false};
-    std::atomic<bool> srBusy_{false};      // 入队后置 true，工作线程产出细节层后置 false
+    std::atomic<bool> srBusy_{false};      // 入队后置 true，工作线程产出修复层后置 false
     bool srPending_ = false;               // srMutex_ 保护
     std::vector<uint8_t> srInPending_;     // 相机线程 → 工作线程（缩放后小图）
     std::vector<uint8_t> srWorkIn_;        // 工作线程私有
@@ -208,12 +211,18 @@ private:
     std::vector<uint8_t> srUpBuf_;         // 低分辨率网格的双线性放大（与 SR 输出同尺寸，细节增量基线）
     std::vector<uint8_t> srDetailBuf_;     // SR 输出缩放到显示尺寸
     std::vector<uint8_t> srUpScaledBuf_;   // 双线性基线缩放到显示尺寸
-    // ★ 细节层快照（srDeltaMutex_ 保护；SR 工作线程写，相机线程读合成）
+    std::vector<uint8_t> srGuideBuf_;      // SR 输出降回网格尺寸（降噪联合双边滤波的"无噪引导图"）
+    std::vector<uint8_t> srPackBuf_;       // 降噪层打包缓冲（网格尺寸，delta+128 塞进 RGBA 经 libyuv 放大）
+    std::vector<uint8_t> srTinyBuf_;       // 去浊估计微缩图（长边 128）
+    std::vector<uint8_t> srLayerTmp_;      // 修复层放大临时（显示尺寸 RGBA）
+    // ★ 修复层快照（srDeltaMutex_ 保护；SR 工作线程写，相机线程读合成）
     std::mutex srDeltaMutex_;
-    std::vector<int8_t> srDeltaBuf_;       // 细节增量层（显示尺寸，每像素 3 通道，clamp ±96）
+    std::vector<int8_t> srDeltaBuf_;       // ① 细节增量层（显示尺寸，clamp ±96）
+    std::vector<int8_t> srNoiseBuf_;       // ② 降噪层（网格平滑−原帧，显示尺寸，clamp ±96）
+    std::vector<int8_t> srClarityBuf_;     // ③ 去浊+色彩还原层（低频校正，显示尺寸，clamp ±96）
     int srDeltaW_ = 0, srDeltaH_ = 0;
     int srDeltaCycleMs_ = 0;               // 最近一次 SR 推理耗时（龄衰减窗口参考）
-    std::chrono::steady_clock::time_point srDeltaTime_{};   // 细节层产出时刻
+    std::chrono::steady_clock::time_point srDeltaTime_{};   // 修复层产出时刻
     std::atomic<bool> srDeltaValid_{false};
 
     // ★ 人脸识别异步工作线程（对齐 SrWorker 模式：相机线程只拷贝入队，

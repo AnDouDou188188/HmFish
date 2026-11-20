@@ -50,8 +50,9 @@ export interface AppSettings {
   recordSoundPath: string;
   // ★ 识别框/标签画面显示开关（默认开：关闭后不画框/文字，识别与自动录像不受影响）
   drawBoxesOn: boolean;
-  // ★ USB 画质增强（仅 USB 摄像头画面生效）：
-  //   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI超分(QuickSRNetMedium x4 + 精修锐化)
+  // ★ 画质增强（USB/手机前后置全部相机生效）：
+  //   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI增强
+  //   （超分细节 + AI降噪 + 水下去浊 + 色彩还原，修复层异步合成）
   usbBrightness: number;
   usbSharpness: number;
   usbEnhanceMode: number;
@@ -59,6 +60,10 @@ export interface AppSettings {
   // ★ 对比度/饱和度滑条（-50~+50，替代旧版"画质增强"布尔开关）
   usbContrast: number;
   usbSaturation: number;
+  // ★ AI 增强附加模块（mode 2 内独立滑条，0~100）
+  aiDenoise: number;
+  aiClarity: number;
+  aiColorRestore: number;
   // ★ 人脸识别开关（SCRFD 检测 + 106 关键点连线框 + 性别年龄颜值标注 + HUD）
   faceEnabled: boolean;
   // ★ mode 枚举 v3 迁移标记：v1/v2 的 2/3/4/5（旧多模型）→ v3 的 2（AI超分）
@@ -122,6 +127,9 @@ export class SettingsStore {
       usbSrStrength: 100,
       usbContrast: 0,
       usbSaturation: 0,
+      aiDenoise: 50,
+      aiClarity: 50,
+      aiColorRestore: 60,
       faceEnabled: false,
       usbEnhanceV2: false,
       usbEnhanceV3: false
@@ -190,6 +198,10 @@ export class SettingsStore {
       r.usbSaturation = oldSaturation;
     }
     r.faceEnabled = await p.get('faceEnabled', false) as boolean;
+    // ★ AI 增强附加模块（0~100，未存储时用推荐默认）
+    r.aiDenoise = await p.get('aiDenoise', 50) as number;
+    r.aiClarity = await p.get('aiClarity', 50) as number;
+    r.aiColorRestore = await p.get('aiColorRestore', 60) as number;
     // ★ mode 枚举 v3 一次性迁移：v1/v2 的 2/3/4/5（旧多模型枚举）→ v3 的 2（AI超分）
     r.usbEnhanceV2 = await p.get('usbEnhanceV2', false) as boolean;
     r.usbEnhanceV3 = await p.get('usbEnhanceV3', false) as boolean;
@@ -252,6 +264,9 @@ export class SettingsStore {
     if (s.usbSrStrength !== undefined) await p.put('usbSrStrength', s.usbSrStrength);
     if (s.usbContrast !== undefined) await p.put('usbContrast', s.usbContrast);
     if (s.usbSaturation !== undefined) await p.put('usbSaturation', s.usbSaturation);
+    if (s.aiDenoise !== undefined) await p.put('aiDenoise', s.aiDenoise);
+    if (s.aiClarity !== undefined) await p.put('aiClarity', s.aiClarity);
+    if (s.aiColorRestore !== undefined) await p.put('aiColorRestore', s.aiColorRestore);
     if (s.faceEnabled !== undefined) await p.put('faceEnabled', s.faceEnabled);
     if (s.usbEnhanceV2 !== undefined) await p.put('usbEnhanceV2', s.usbEnhanceV2);
     if (s.usbEnhanceV3 !== undefined) await p.put('usbEnhanceV3', s.usbEnhanceV3);

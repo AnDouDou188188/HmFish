@@ -49,6 +49,11 @@ static std::atomic<int>  g_usb_contrast(0);
 static std::atomic<int>  g_usb_saturation(0);
 static std::atomic<int>  g_usb_sharpness(0);
 static std::atomic<int>  g_usb_sr_strength(100);
+// ★ AI 附加修复模块（mode 2 下与超分并行，同一工作线程产出修复层）：
+//   降噪 = SR 引导联合双边滤波；去浊 = 暗通道先验去雾；色彩还原 = 灰世界白平衡
+static std::atomic<int>  g_ai_denoise(50);
+static std::atomic<int>  g_ai_clarity(50);
+static std::atomic<int>  g_ai_color(60);
 // ★ 人脸识别画面总开关（SCRFD 检测 + 106 点连线框 + 性别年龄颜值标注 + HUD）
 static std::atomic<bool> g_face_enabled(false);
 // ★ AI v2：SR 网格 = 显示尺寸/factor（2/4/8 三档，倍增梯子）。
@@ -56,6 +61,10 @@ static std::atomic<bool> g_face_enabled(false);
 //   SR 输出与显示 1:1 像素对齐零重采样；f=8 兜底最快。
 //   按实测推理耗时自适应：>500ms 升档保流畅，<200ms 降档保质量
 static std::atomic<int>  g_sr_factor(2);
+// ★ 前置声明：ProcessFrame（手机相机路径）先于定义处调用增强链
+static void sharpenRgba(uint8_t* rgba, int w, int h, float amount);
+static void clarityRgba(uint8_t* rgba, int w, int h, float amount);
+static void applyUsbEnhance(uint8_t* rgba, int w, int h);
 
 // ───────── 运动 & 水深 ─────────
 static pthread_mutex_t g_motion_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -309,10 +318,12 @@ extern "C" {
         g_draw_boxes.store(enabled);
         OH_LOG_INFO(LOG_APP, "[yolo] drawBoxes=%{public}d", (int)enabled);
     }
-    // ★ USB 画质增强模式 0~2：0 关 / 1 非AI(亮度+锐度+对比度+饱和度) /
-    //   2 AI超分(QuickSRNetMedium x4 + 精修锐化)；切换 AI 模式时重置自适应输入宽度
+    // ★ 画质增强模式 0~2：0 关 / 1 非AI(亮度+锐度+对比度+饱和度) /
+    //   2 AI增强(超分细节 + AI降噪 + 水下去浊 + 色彩还原 + 精修锐化)；
+    //   全部相机（USB/手机前后置）生效；切换 AI 模式时重置自适应输入宽度
     void SetUsbEnhance(int mode, int brightness, int sharpness,
-                       int contrast, int saturation, int strength) {
+                       int contrast, int saturation, int strength,
+                       int denoise, int clarity, int color) {
         if (mode < 0) mode = 0;
         if (mode > 2) mode = 2;
         if (brightness < -50) brightness = -50;
@@ -325,6 +336,12 @@ extern "C" {
         if (saturation > 50) saturation = 50;
         if (strength < 0) strength = 0;
         if (strength > 100) strength = 100;
+        if (denoise < 0) denoise = 0;
+        if (denoise > 100) denoise = 100;
+        if (clarity < 0) clarity = 0;
+        if (clarity > 100) clarity = 100;
+        if (color < 0) color = 0;
+        if (color > 100) color = 100;
         const int prevMode = g_usb_mode.load();
         g_usb_mode.store(mode);
         g_usb_brightness.store(brightness);
@@ -332,13 +349,18 @@ extern "C" {
         g_usb_contrast.store(contrast);
         g_usb_saturation.store(saturation);
         g_usb_sr_strength.store(strength);
+        g_ai_denoise.store(denoise);
+        g_ai_clarity.store(clarity);
+        g_ai_color.store(color);
         // 切换/进入 AI 模式 → 重置自适应因子到最高质量档（随后按推理耗时自适应）
         if (mode != prevMode && mode == 2) {
             g_sr_factor.store(2);
         }
         OH_LOG_INFO(LOG_APP, "[usb] enhance mode=%{public}d bright=%{public}d sharp=%{public}d "
-                    "contrast=%{public}d saturation=%{public}d srStrength=%{public}d",
-                    mode, brightness, sharpness, contrast, saturation, strength);
+                    "contrast=%{public}d saturation=%{public}d srStrength=%{public}d "
+                    "denoise=%{public}d clarity=%{public}d color=%{public}d",
+                    mode, brightness, sharpness, contrast, saturation, strength,
+                    denoise, clarity, color);
     }
 
     // ★ 人脸识别开关：关闭时工作线程不再入队，已画结果 1.5s 过期自动消失
@@ -836,6 +858,46 @@ void YuvPipeline::ProcessFrame(OH_ImageNative *image) {
         memcpy(rgbaBuf_.data(), tempBuf_.data(), (size_t)W * H * 4);
     }
 
+    // ★ 画质增强（手机前后置同款链路，v3 解耦架构，与 USB 路径行为一致）：
+    //   AI 模式投喂网格到 SR 工作线程（忙时跳过，不阻塞），修复层照常合成；
+    //   非AI模式只做基线锐化；用户滑条链（亮度/锐度/对比度/饱和度）最后统一叠加
+    {
+        const int enhMode = g_usb_mode.load();
+        const bool aiOn = enhMode == 2 && ocr_bridge::srIsReady() &&
+            (g_usb_sr_strength.load() > 0 || g_ai_denoise.load() > 0 ||
+             g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
+        if (aiOn) {
+            const int W = displayWidth_, H = displayHeight_;
+            if (W > 0 && H > 0 && !srBusy_.load()) {
+                int f = g_sr_factor.load();
+                if (f < 2) f = 2;
+                if (f > 8) f = 8;
+                int inW = (W / f) & ~1;
+                int inH = (H / f) & ~1;
+                if (inW < 32) inW = 32;
+                if (inH < 32) inH = 32;
+                {
+                    std::lock_guard<std::mutex> lk(srMutex_);
+                    srInPending_.resize((size_t)inW * inH * 4);
+                    libyuv::ARGBScale(rgbaBuf_.data(), (size_t)W * 4, W, H,
+                                      srInPending_.data(), (size_t)inW * 4, inW, inH,
+                                      libyuv::kFilterBox);
+                    srInW_ = inW; srInH_ = inH;
+                    srPending_ = true;
+                }
+                srBusy_.store(true);
+                srCv_.notify_all();
+            }
+            CompositeAiLayers(rgbaBuf_.data(), displayWidth_, displayHeight_);
+            sharpenRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.75f);
+            clarityRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.50f);
+        } else if (enhMode >= 1) {
+            // 非AI基线锐化（mode≥1 固定生效，与 USB 路径一致）
+            sharpenRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.45f);
+        }
+        applyUsbEnhance(rgbaBuf_.data(), displayWidth_, displayHeight_);
+    }
+
     ProcessCommonTail();
 }
 
@@ -1277,19 +1339,194 @@ void YuvPipeline::SrWorkerLoop() {
                 srDeltaTime_ = std::chrono::steady_clock::now();
                 srDeltaValid_.store(true);
             }
+
+            // ── ② AI 降噪层：SR 输出（无噪）降回网格尺寸作"引导图"，原帧在
+            //    其引导下做 5x5 联合双边滤波 → 平均掉传感器噪点、保留真实
+            //    边缘纹理（引导图跨边缘时值域权重归零，边缘不糊）
+            srGuideBuf_.resize((size_t)inW * inH * 4);
+            libyuv::ARGBScale(srOutBuf_.data(), (size_t)srW * 4, srW, srH,
+                              srGuideBuf_.data(), (size_t)inW * 4, inW, inH,
+                              libyuv::kFilterBilinear);
+            srPackBuf_.resize((size_t)inW * inH * 4);
+            {
+                const uint8_t *gd = srGuideBuf_.data();
+                const uint8_t *bs = srWorkIn_.data();
+                uint8_t *pk = srPackBuf_.data();
+                for (int y = 0; y < inH; ++y) {
+                    const int y0 = std::max(0, y - 2), y1 = std::min(inH - 1, y + 2);
+                    for (int x = 0; x < inW; ++x, pk += 4) {
+                        const size_t c0 = (size_t)y * inW + x;
+                        const int g0r = gd[c0 * 4], g0g = gd[c0 * 4 + 1], g0b = gd[c0 * 4 + 2];
+                        const int x0 = std::max(0, x - 2), x1 = std::min(inW - 1, x + 2);
+                        int wsum = 0, sr_ = 0, sg = 0, sb = 0;
+                        for (int yy = y0; yy <= y1; ++yy) {
+                            for (int xx = x0; xx <= x1; ++xx) {
+                                const size_t cc = (size_t)yy * inW + xx;
+                                const int dd = std::abs((int)gd[cc * 4] - g0r) +
+                                               std::abs((int)gd[cc * 4 + 1] - g0g) +
+                                               std::abs((int)gd[cc * 4 + 2] - g0b);
+                                // 值域三角核：引导差异小（同侧平滑区）权重大
+                                const int wgt = dd < 96 ? (96 - dd) : 0;
+                                if (wgt > 0) {
+                                    wsum += wgt;
+                                    sr_ += wgt * bs[cc * 4];
+                                    sg += wgt * bs[cc * 4 + 1];
+                                    sb += wgt * bs[cc * 4 + 2];
+                                }
+                            }
+                        }
+                        for (int c = 0; c < 3; ++c) {
+                            const int b = bs[c0 * 4 + c];
+                            int smooth = b;
+                            if (wsum > 0) {
+                                smooth = (c == 0 ? sr_ : (c == 1 ? sg : sb)) / wsum;
+                            }
+                            // 降噪层 = 平滑 − 原帧（负向噪声分量），+128 打包进 RGBA
+                            const int v = smooth - b + 128;
+                            pk[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+                        }
+                        pk[3] = 255;
+                    }
+                }
+            }
+            srLayerTmp_.resize((size_t)W * H * 4);
+            libyuv::ARGBScale(srPackBuf_.data(), (size_t)inW * 4, inW, inH,
+                              srLayerTmp_.data(), (size_t)W * 4, W, H,
+                              libyuv::kFilterBilinear);
+            {
+                std::lock_guard<std::mutex> dlk(srDeltaMutex_);
+                const size_t n = (size_t)W * H;
+                const bool blend = srDeltaValid_.load() && srNoiseBuf_.size() == n * 3;
+                if (!blend) srNoiseBuf_.assign(n * 3, 0);
+                int8_t *dst = srNoiseBuf_.data();
+                const uint8_t *p = srLayerTmp_.data();
+                for (size_t i = 0; i < n; ++i, p += 4, dst += 3) {
+                    for (int c = 0; c < 3; ++c) {
+                        int dv = (int)p[c] - 128;
+                        if (dv > 96) dv = 96;
+                        else if (dv < -96) dv = -96;
+                        if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
+                        dst[c] = (int8_t)dv;
+                    }
+                }
+            }
+
+            // ── ③ AI 水下去浊+色彩还原层：微缩图（长边 128）上估计环境光与
+            //    暗通道 → 暗通道先验去雾（去浊）+ 灰世界白平衡（拉回水下
+            //    偏绿/偏蓝的色偏）。纯低频校正，时域天然稳定不闪烁
+            {
+                int tW, tH;
+                if (inW >= inH) { tW = 128; tH = std::max(8, 128 * inH / inW); }
+                else            { tH = 128; tW = std::max(8, 128 * inW / inH); }
+                srTinyBuf_.resize((size_t)tW * tH * 4);
+                libyuv::ARGBScale(srWorkIn_.data(), (size_t)inW * 4, inW, inH,
+                                  srTinyBuf_.data(), (size_t)tW * 4, tW, tH,
+                                  libyuv::kFilterBilinear);
+                const int tn = tW * tH;
+                const uint8_t *tp = srTinyBuf_.data();
+                // 环境光 A_c：亮度前 10% 像素的各通道均值（"水色"本底）
+                std::vector<int> luma(tn);
+                for (int i = 0; i < tn; ++i) {
+                    luma[i] = (tp[i * 4] * 299 + tp[i * 4 + 1] * 587 +
+                               tp[i * 4 + 2] * 114) / 1000;
+                }
+                std::vector<int> sorted(luma);
+                std::nth_element(sorted.begin(), sorted.begin() + tn * 9 / 10, sorted.end());
+                const int lumaTh = sorted[tn * 9 / 10];
+                long ar = 0, ag = 0, ab = 0;
+                int cnt = 0;
+                for (int i = 0; i < tn; ++i) {
+                    if (luma[i] >= lumaTh) {
+                        ++cnt;
+                        ar += tp[i * 4];
+                        ag += tp[i * 4 + 1];
+                        ab += tp[i * 4 + 2];
+                    }
+                }
+                if (cnt > 0 && (ar + ag + ab) > 0) {
+                    const int Ac[3] = { std::max(8, (int)(ar / cnt)),
+                                        std::max(8, (int)(ag / cnt)),
+                                        std::max(8, (int)(ab / cnt)) };
+                    const int aLuma = (Ac[0] + Ac[1] + Ac[2]) / 3;
+                    const int clarity = g_ai_clarity.load();
+                    const int colorS = g_ai_color.load();
+                    srPackBuf_.resize((size_t)tn * 4);
+                    uint8_t *pk = srPackBuf_.data();
+                    for (int y = 0; y < tH; ++y) {
+                        const int y0 = std::max(0, y - 1), y1 = std::min(tH - 1, y + 1);
+                        for (int x = 0; x < tW; ++x, pk += 4) {
+                            const int x0 = std::max(0, x - 1), x1 = std::min(tW - 1, x + 1);
+                            for (int c = 0; c < 3; ++c) {
+                                const int I = tp[((size_t)y * tW + x) * 4 + c];
+                                int inc = 0;
+                                if (clarity > 0) {
+                                    // 暗通道 D_c（3x3 min）→ 透射率 t_c →
+                                    // 去浊 J_c = (I − A(1−t)) / t，ω=0.85，t 下限 0.2
+                                    int mn = 255;
+                                    for (int yy = y0; yy <= y1; ++yy) {
+                                        for (int xx = x0; xx <= x1; ++xx) {
+                                            const int q = tp[((size_t)yy * tW + xx) * 4 + c];
+                                            if (q < mn) mn = q;
+                                        }
+                                    }
+                                    int t255 = 255 - (85 * mn * 255) / (Ac[c] * 100);
+                                    if (t255 < 51) t255 = 51;
+                                    else if (t255 > 255) t255 = 255;
+                                    int J = (I * 255 - Ac[c] * (255 - t255)) / t255;
+                                    if (J < 0) J = 0;
+                                    else if (J > 255) J = 255;
+                                    inc += clarity * (J - I) / 100;
+                                }
+                                if (colorS > 0) {
+                                    // 灰世界白平衡：I × A_luma/A_c（红通道水下衰减最重 → 增益最大）
+                                    int wb = I * aLuma / Ac[c];
+                                    if (wb > 255) wb = 255;
+                                    inc += colorS * (wb - I) / 100;
+                                }
+                                const int v = inc + 128;
+                                pk[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+                            }
+                            pk[3] = 255;
+                        }
+                    }
+                    libyuv::ARGBScale(srPackBuf_.data(), (size_t)tW * 4, tW, tH,
+                                      srLayerTmp_.data(), (size_t)W * 4, W, H,
+                                      libyuv::kFilterBilinear);
+                    std::lock_guard<std::mutex> dlk(srDeltaMutex_);
+                    const size_t n = (size_t)W * H;
+                    const bool blend = srDeltaValid_.load() && srClarityBuf_.size() == n * 3;
+                    if (!blend) srClarityBuf_.assign(n * 3, 0);
+                    int8_t *dst = srClarityBuf_.data();
+                    const uint8_t *p = srLayerTmp_.data();
+                    for (size_t i = 0; i < n; ++i, p += 4, dst += 3) {
+                        for (int c = 0; c < 3; ++c) {
+                            int dv = (int)p[c] - 128;
+                            if (dv > 96) dv = 96;
+                            else if (dv < -96) dv = -96;
+                            if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
+                            dst[c] = (int8_t)dv;
+                        }
+                    }
+                }
+            }
         }
         srBusy_.store(false);
     }
 }
 
-// ★ AI 细节层合成（v3，相机线程每帧调用）：基底 + 最新细节层（按龄衰减）叠加。
-//   细节层由 SR 工作线程以推理节奏（约 2~7Hz）刷新，相机帧全帧率渲染——
-//   基底实时、细节层半静态，画面流畅不跳帧；
+// ★ AI 修复层合成（v3，相机线程每帧调用）：基底 + 最新三层（按龄衰减）叠加。
+//   三层均由 SR 工作线程以推理节奏（约 2~7Hz）异步刷新，相机帧全帧率渲染——
+//   基底实时、修复层半静态，画面流畅不跳帧：
+//   ① 细节层：增益 = 强度滑条 0~220%，±64 软限幅
+//   ② 降噪层：增益 = 降噪滑条 0~130%（层内容=平滑−原帧，负向噪声分量）
+//   ③ 去浊层：低频校正（去浊/色彩滑条已在工作线程烘焙进层），增益=fade
 //   龄衰减窗口 = max(500, 2×推理周期)（cap 1200ms）内全强度，之后 400ms 线性淡出：
-//   SR 持续刷新时永不衰减（稳定不呼吸），管线停更/场景切走后旧细节自然消失
-void YuvPipeline::CompositeSrDelta(uint8_t *rgba, int W, int H) {
+//   SR 持续刷新时永不衰减（稳定不呼吸），管线停更/场景切走后旧层自然消失
+void YuvPipeline::CompositeAiLayers(uint8_t *rgba, int W, int H) {
     const int strength = g_usb_sr_strength.load();
-    if (strength <= 0) return;
+    const int denoise = g_ai_denoise.load();
+    const bool clarityOn = (g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
+    if (strength <= 0 && denoise <= 0 && !clarityOn) return;
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(srDeltaMutex_);
     if (!srDeltaValid_.load() || srDeltaW_ != W || srDeltaH_ != H ||
@@ -1303,18 +1540,36 @@ void YuvPipeline::CompositeSrDelta(uint8_t *rgba, int W, int H) {
     int fade100 = 100;
     if (ageMs > fadeStart) fade100 = 100 - (int)((ageMs - fadeStart) * 100 / 400);
     if (fade100 <= 0) return;
-    // 增益 = 强度滑条 0~100 → 0~220%（v3 网格在显示分辨率，细节零降采样衰减，
-    // 加倍注入后边缘轮廓增量肉眼显著）；±64 软限幅防爆点
-    const int gain100 = strength * 220 / 100 * fade100 / 100;
-    const int8_t *dl = srDeltaBuf_.data();
-    uint8_t *d = rgba;
     const size_t n = (size_t)W * H;
+    // ① 细节：0~220% 增益注入（v3 网格在显示分辨率，细节零降采样衰减）；
+    //    ② 降噪：0~130%；③ 去浊：滑条已烘焙，只按 fade 衰减
+    const int gainD = strength > 0 ? strength * 220 / 100 * fade100 / 100 : 0;
+    const int gainN = denoise > 0 ? denoise * 130 / 100 * fade100 / 100 : 0;
+    const int gainC = clarityOn ? fade100 : 0;
+    const int8_t *dl = srDeltaBuf_.data();
+    const int8_t *nl = (gainN > 0 && srNoiseBuf_.size() == n * 3) ? srNoiseBuf_.data() : nullptr;
+    const int8_t *cl = (gainC > 0 && srClarityBuf_.size() == n * 3) ? srClarityBuf_.data() : nullptr;
+    if (gainD <= 0 && nl == nullptr && cl == nullptr) return;
+    uint8_t *d = rgba;
     for (size_t i = 0; i < n; ++i, d += 4, dl += 3) {
+        const size_t o = i * 3;
         for (int c = 0; c < 3; ++c) {
-            int dv = (int)dl[c] * gain100 / 100;
-            if (dv > 64) dv = 64 + (dv - 64) / 2;
-            else if (dv < -64) dv = -64 + (dv + 64) / 2;
-            int v = d[c] + dv;
+            int v = d[c];
+            if (gainD > 0) {
+                int dv = (int)dl[c] * gainD / 100;
+                if (dv > 64) dv = 64 + (dv - 64) / 2;
+                else if (dv < -64) dv = -64 + (dv + 64) / 2;
+                v += dv;
+            }
+            if (nl != nullptr) {
+                int nv = (int)nl[o + c] * gainN / 100;
+                if (nv > 64) nv = 64 + (nv - 64) / 2;
+                else if (nv < -64) nv = -64 + (nv + 64) / 2;
+                v += nv;
+            }
+            if (cl != nullptr) {
+                v += (int)cl[o + c] * gainC / 100;
+            }
             d[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
         }
     }
@@ -1348,9 +1603,12 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
     const uint8_t *src = rgba + ((size_t)sy * w + sx) * 4;
     const int mode = g_usb_mode.load();
 
-    // ★ AI 画质增强（mode 2，v3 细节层解耦架构）：忙时只跳过投喂（细节层照常合成，
-    //   推理节奏与渲染节奏彻底解耦——相机帧永远全帧率上屏，无丢帧跳帧）
-    const bool aiOn = mode == 2 && g_usb_sr_strength.load() > 0 && ocr_bridge::srIsReady();
+    // ★ AI 画质增强（mode 2，v3 修复层解耦架构）：忙时只跳过投喂（修复层照常合成，
+    //   推理节奏与渲染节奏彻底解耦——相机帧永远全帧率上屏，无丢帧跳帧）；
+    //   四个 AI 模块（超分/降噪/去浊/色彩）任一开启即激活
+    const bool aiOn = mode == 2 && ocr_bridge::srIsReady() &&
+        (g_usb_sr_strength.load() > 0 || g_ai_denoise.load() > 0 ||
+         g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
     if (aiOn) {
         const int W = displayWidth_, H = displayHeight_;
         if (W > 0 && H > 0 && !srBusy_.load()) {
@@ -1387,9 +1645,9 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
     }
 
     if (aiOn) {
-        // ★ 细节层合成（按龄衰减+增益+软限幅）+ AI 档双重精修锐化
+        // ★ 修复层合成（细节/降噪/去浊，按龄衰减+增益+软限幅）+ AI 档双重精修锐化
         //   （细锐 3x3 unsharp + Clarity 中频局部对比，比非AI 0.45 强一档）
-        CompositeSrDelta(rgbaBuf_.data(), width_, height_);
+        CompositeAiLayers(rgbaBuf_.data(), width_, height_);
         sharpenRgba(rgbaBuf_.data(), width_, height_, 0.75f);
         clarityRgba(rgbaBuf_.data(), width_, height_, 0.50f);
     } else if (mode >= 1) {

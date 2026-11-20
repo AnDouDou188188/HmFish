@@ -1,17 +1,21 @@
-// ★ 画面设置弹窗：识别框/文字开关、USB 画面增强（三模式 + 亮度/锐度/对比度/
-//   饱和度滑条 + AI 细节强度）、人脸识别开关（SCRFD + 106 关键点 + 性别年龄颜值）
+// ★ 画面设置弹窗：识别框/文字开关、画面增强（三模式 + 亮度/锐度/对比度/
+//   饱和度滑条 + 恢复水下默认值 + AI 四模块：超分/降噪/去浊/色彩）、人脸识别开关
 @Component
 export struct PictureSheet {
   // ★ 识别框/标签画面显示开关：关闭后画面干净不画框/文字（识别与自动录像不受影响）
   @Prop drawBoxesOn: boolean = true;
-  // ★ USB 画面增强（仅 USB 摄像头画面生效）：
-  //   模式 0关/1非AI(亮度+锐度+对比度+饱和度)/2 AI超分(QuickSRNetMedium x4 + 精修锐化)
+  // ★ 画面增强（USB + 手机前后置全部相机生效）：
+  //   模式 0关/1非AI(亮度+锐度+对比度+饱和度)/2 AI增强(超分+降噪+去浊+色彩还原)
   @Prop usbBrightness: number = 0;
   @Prop usbSharpness: number = 0;
   @Prop usbContrast: number = 0;
   @Prop usbSaturation: number = 0;
   @Prop usbEnhanceMode: number = 0;
   @Prop usbSrStrength: number = 100;
+  // ★ AI 增强附加模块（mode 2 内独立滑条 0~100，修复层异步合成）
+  @Prop aiDenoise: number = 50;
+  @Prop aiClarity: number = 50;
+  @Prop aiColorRestore: number = 60;
   // ★ 人脸识别开关：SCRFD 检测 + 106 关键点连线框 + 性别年龄颜值标注
   @Prop faceEnabled: boolean = false;
 
@@ -23,6 +27,10 @@ export struct PictureSheet {
   onUsbContrastChange?: (v: number) => void;
   onUsbSaturationChange?: (v: number) => void;
   onUsbSrStrengthChange?: (v: number) => void;
+  onUsbResetDefaults?: () => void;
+  onAiDenoiseChange?: (v: number) => void;
+  onAiClarityChange?: (v: number) => void;
+  onAiColorRestoreChange?: (v: number) => void;
   onFaceToggle?: () => void;
 
   @State appear: boolean = false;
@@ -32,6 +40,9 @@ export struct PictureSheet {
   @State localUsbContrast: number = 0;
   @State localUsbSaturation: number = 0;
   @State localSrStrength: number = 100;
+  @State localAiDenoise: number = 50;
+  @State localAiClarity: number = 50;
+  @State localAiColorRestore: number = 60;
 
   aboutToAppear(): void {
     this.localUsbBright = this.usbBrightness;
@@ -39,6 +50,9 @@ export struct PictureSheet {
     this.localUsbContrast = this.usbContrast;
     this.localUsbSaturation = this.usbSaturation;
     this.localSrStrength = this.usbSrStrength;
+    this.localAiDenoise = this.aiDenoise;
+    this.localAiClarity = this.aiClarity;
+    this.localAiColorRestore = this.aiColorRestore;
     setTimeout(() => { this.appear = true; }, 30);
   }
 
@@ -142,25 +156,47 @@ export struct PictureSheet {
               .fontSize(10).fontColor('#8E97A3')
               .width('100%').margin({ top: 6 })
 
-            // ★ USB 画面增强：仅 USB 摄像头画面生效（3 模式：关/非AI/AI超分）
-            this.SectionTitle('▣', 'USB 画面增强', '仅 USB 摄像头')
+            // ★ 画面增强：USB + 手机前后置全部相机生效（3 模式：关/非AI/AI增强）
+            this.SectionTitle('▣', '画面增强', '全部相机生效')
 
             Flex({ wrap: FlexWrap.Wrap, alignItems: ItemAlign.Center }) {
               this.UsbModePill('关闭', 0)
               this.UsbModePill('非AI增强', 1)
-              this.UsbModePill('AI超分', 2)
+              this.UsbModePill('AI增强', 2)
             }
             .width('100%')
             .margin({ top: 12, bottom: 2 })
 
             if (this.usbEnhanceMode === 0) {
-              Text('关闭所有 USB 画面增强处理，保持原始画面')
+              Text('关闭所有画面增强处理，保持原始画面')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
             } else if (this.usbEnhanceMode === 1) {
               Text('亮度/锐度/对比度/饱和度调节，不占用 AI 算力')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
+
+              // ★ 恢复默认值（水下场景优化）：一键回到推荐参数（清晰优先，饱和度适度）
+              Row({ space: 8 }) {
+                Text('💧').fontSize(13).fontColor('#00E5FF')
+                Text('水下推荐：亮度+15 · 锐度60 · 对比度+20 · 饱和度+10')
+                  .fontSize(10).fontColor('#8E97A3').layoutWeight(1)
+                Text('恢复默认').fontSize(12).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .backgroundColor('rgba(0,229,255,0.15)')
+                  .borderRadius(12)
+                  .border({ width: 1, color: 'rgba(0,229,255,0.5)' })
+                  .onClick(() => {
+                    // 本地滑条立即跳到默认值 + 提交父组件
+                    this.localUsbBright = 15;
+                    this.localUsbSharp = 60;
+                    this.localUsbContrast = 20;
+                    this.localUsbSaturation = 10;
+                    this.onUsbResetDefaults?.();
+                  })
+              }
+              .width('100%')
+              .margin({ top: 10, bottom: 2 })
 
               Row({ space: 6 }) {
                 Text('☀').fontSize(13).fontColor('#00E5FF')
@@ -277,16 +313,18 @@ export struct PictureSheet {
               }
               .width('100%')
             } else {
-              Text('AI画质增强（v2 显示分辨率超分）：AI 细节 0~220% 增益注入原图 + 双重锐化加强档，效果直观可辨')
+              Text('AI 增强（修复层异步架构）：四个模块独立调节、互不干扰，全部后台异步合成，画面丝滑不卡顿（USB + 手机前后置均生效）')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
 
+              // ── 模块 1：AI 超分细节 ──
               Row({ space: 6 }) {
                 Text('🎛').fontSize(13).fontColor('#00E5FF')
-                Text('AI 细节增强强度').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+                Text('AI 超分细节').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
                 Blank()
-                Text(`${this.localSrStrength.toFixed(0)}%`)
-                  .fontSize(13).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+                Text(this.localSrStrength > 0 ? `${this.localSrStrength.toFixed(0)}%` : '关闭')
+                  .fontSize(13).fontColor(this.localSrStrength > 0 ? '#00E5FF' : '#6E7681')
+                  .fontWeight(FontWeight.Bold)
               }
               .width('100%')
               .margin({ top: 14, bottom: 8 })
@@ -308,7 +346,106 @@ export struct PictureSheet {
               }
               .width('100%')
 
-              Text('原始画面细节零损失；AI 细节按强度 0~220% 增益叠加（软限幅防爆点），叠加双重锐化加强档；强度 0=关闭 AI；过慢时自动降档保持流畅')
+              Text('QuickSRNet 超分：原始细节零损失，AI 细节按强度 0~220% 增益叠加 + 双重锐化加强档')
+                .fontSize(10).fontColor('#8E97A3')
+                .width('100%').margin({ top: 6 })
+
+              // ── 模块 2：AI 降噪 ──
+              Row({ space: 6 }) {
+                Text('🔇').fontSize(13).fontColor('#00E5FF')
+                Text('AI 降噪').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+                Blank()
+                Text(this.localAiDenoise > 0 ? `${this.localAiDenoise.toFixed(0)}%` : '关闭')
+                  .fontSize(13).fontColor(this.localAiDenoise > 0 ? '#00E5FF' : '#6E7681')
+                  .fontWeight(FontWeight.Bold)
+              }
+              .width('100%')
+              .margin({ top: 16, bottom: 8 })
+
+              Row({ space: 10 }) {
+                Text('关闭').fontSize(10).fontColor('#6E7681')
+                Slider({ value: this.localAiDenoise, min: 0, max: 100, step: 5 })
+                  .layoutWeight(1)
+                  .selectedColor('#00E5FF')
+                  .trackColor('rgba(255,255,255,0.15)')
+                  .blockColor('#FFFFFF')
+                  .onChange((v: number, mode: SliderChangeMode) => {
+                    this.localAiDenoise = v;
+                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.onAiDenoiseChange?.(v);
+                    }
+                  })
+                Text('最强').fontSize(10).fontColor('#6E7681')
+              }
+              .width('100%')
+
+              Text('以超分输出（无噪）为引导做联合双边滤波：抹平暗光噪点，保留真实边缘纹理')
+                .fontSize(10).fontColor('#8E97A3')
+                .width('100%').margin({ top: 6 })
+
+              // ── 模块 3：AI 水下去浊 ──
+              Row({ space: 6 }) {
+                Text('🌊').fontSize(13).fontColor('#00E5FF')
+                Text('AI 水下去浊').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+                Blank()
+                Text(this.localAiClarity > 0 ? `${this.localAiClarity.toFixed(0)}%` : '关闭')
+                  .fontSize(13).fontColor(this.localAiClarity > 0 ? '#00E5FF' : '#6E7681')
+                  .fontWeight(FontWeight.Bold)
+              }
+              .width('100%')
+              .margin({ top: 16, bottom: 8 })
+
+              Row({ space: 10 }) {
+                Text('关闭').fontSize(10).fontColor('#6E7681')
+                Slider({ value: this.localAiClarity, min: 0, max: 100, step: 5 })
+                  .layoutWeight(1)
+                  .selectedColor('#00E5FF')
+                  .trackColor('rgba(255,255,255,0.15)')
+                  .blockColor('#FFFFFF')
+                  .onChange((v: number, mode: SliderChangeMode) => {
+                    this.localAiClarity = v;
+                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.onAiClarityChange?.(v);
+                    }
+                  })
+                Text('最强').fontSize(10).fontColor('#6E7681')
+              }
+              .width('100%')
+
+              Text('暗通道先验去雾：对抗水下浑浊散射，提升透视感与层次（水质越浑效果越明显）')
+                .fontSize(10).fontColor('#8E97A3')
+                .width('100%').margin({ top: 6 })
+
+              // ── 模块 4：AI 色彩还原 ──
+              Row({ space: 6 }) {
+                Text('🎨').fontSize(13).fontColor('#00E5FF')
+                Text('AI 色彩还原').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+                Blank()
+                Text(this.localAiColorRestore > 0 ? `${this.localAiColorRestore.toFixed(0)}%` : '关闭')
+                  .fontSize(13).fontColor(this.localAiColorRestore > 0 ? '#00E5FF' : '#6E7681')
+                  .fontWeight(FontWeight.Bold)
+              }
+              .width('100%')
+              .margin({ top: 16, bottom: 8 })
+
+              Row({ space: 10 }) {
+                Text('关闭').fontSize(10).fontColor('#6E7681')
+                Slider({ value: this.localAiColorRestore, min: 0, max: 100, step: 5 })
+                  .layoutWeight(1)
+                  .selectedColor('#00E5FF')
+                  .trackColor('rgba(255,255,255,0.15)')
+                  .blockColor('#FFFFFF')
+                  .onChange((v: number, mode: SliderChangeMode) => {
+                    this.localAiColorRestore = v;
+                    if (mode === SliderChangeMode.End || mode === SliderChangeMode.Click) {
+                      this.onAiColorRestoreChange?.(v);
+                    }
+                  })
+                Text('最强').fontSize(10).fontColor('#6E7681')
+              }
+              .width('100%')
+
+              Text('灰世界白平衡：拉回水下偏绿/偏蓝色偏，补偿红通道衰减，色彩自然不艳俗')
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
             }

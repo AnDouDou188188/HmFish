@@ -47,9 +47,11 @@ extern "C" {
     void SetYoloEnabled(bool enabled);
     // ★ 识别框/标签画面显示开关（yuv_pipeline.cpp 定义）
     void SetDrawBoxesEnabled(bool enabled);
-    // ★ USB 画质增强（yuv_pipeline.cpp 定义）：mode 0关/1非AI/2 QuickSRNet超分
+    // ★ USB 画质增强（yuv_pipeline.cpp 定义）：mode 0关/1非AI/2 AI增强
+    //   （超分+降噪+去浊+色彩还原）
     void SetUsbEnhance(int mode, int brightness, int sharpness,
-                       int contrast, int saturation, int strength);
+                       int contrast, int saturation, int strength,
+                       int denoise, int clarity, int color);
     // ★ 人脸识别画面开关（yuv_pipeline.cpp 定义）
     void SetFaceEnabled(bool enabled);
     void SetMotionEnabled(bool enabled);
@@ -393,20 +395,26 @@ static napi_value SetDrawBoxesNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
-// ★ USB 画质增强（仅 USB 外部供帧路径生效）：
-//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 QuickSRNetSmall 超分
+// ★ 画质增强（USB/手机前后置全部相机生效）：
+//   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI增强
+//   （超分细节 + AI降噪 + 水下去浊 + 色彩还原，修复层异步合成不卡顿）
 static napi_value SetUsbEnhanceNapi(napi_env env, napi_callback_info info) {
-    size_t argc = 6; napi_value args[6];
+    size_t argc = 9; napi_value args[9];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
     int32_t mode = 0, brightness = 0, sharpness = 0, contrast = 0, saturation = 0, strength = 100;
+    int32_t denoise = 50, clarity = 50, color = 60;
     if (argc > 0) napi_get_value_int32(env, args[0], &mode);
     if (argc > 1) napi_get_value_int32(env, args[1], &brightness);
     if (argc > 2) napi_get_value_int32(env, args[2], &sharpness);
     if (argc > 3) napi_get_value_int32(env, args[3], &contrast);
     if (argc > 4) napi_get_value_int32(env, args[4], &saturation);
     if (argc > 5) napi_get_value_int32(env, args[5], &strength);
+    if (argc > 6) napi_get_value_int32(env, args[6], &denoise);
+    if (argc > 7) napi_get_value_int32(env, args[7], &clarity);
+    if (argc > 8) napi_get_value_int32(env, args[8], &color);
     SetUsbEnhance((int)mode, (int)brightness, (int)sharpness,
-                  (int)contrast, (int)saturation, (int)strength);
+                  (int)contrast, (int)saturation, (int)strength,
+                  (int)denoise, (int)clarity, (int)color);
     return nullptr;
 }
 

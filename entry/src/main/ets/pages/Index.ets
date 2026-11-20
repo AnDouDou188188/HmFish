@@ -394,14 +394,18 @@ struct Index {
   // ★ 识别框/标签画面显示开关（默认开）：关闭后画面干净不画框/文字，
   //   检测/朗读/自动录像照常；立即保存，重启恢复
   @State drawBoxesOn: boolean = true;
-  // ★ USB 画面增强：亮度/锐度/对比度/饱和度滑条，仅 USB 画面生效
+  // ★ 画质增强：亮度/锐度/对比度/饱和度滑条（USB + 手机前后置全部相机生效）
   @State usbBrightness: number = 0;
-  // ★ USB 画质增强模式：0关/1非AI(亮度锐度对比度饱和度)/2 AI超分(QuickSRNetMedium x4+精修锐化)
+  // ★ 画质增强模式：0关/1非AI/2 AI增强（超分+降噪+去浊+色彩还原）
   @State usbEnhanceMode: number = 0;
   @State usbSharpness: number = 0;
   @State usbSrStrength: number = 100;
   @State usbContrast: number = 0;
   @State usbSaturation: number = 0;
+  // ★ AI 增强附加模块（mode 2 内独立滑条 0~100，修复层异步合成）
+  @State aiDenoise: number = 50;
+  @State aiClarity: number = 50;
+  @State aiColorRestore: number = 60;
   // ★ 人脸识别（SCRFD + 106 关键点连线框 + 性别年龄颜值标注 + HUD 同步）
   @State faceEnabled: boolean = false;
   // ★ 每人脸一行摘要（彩色圆点+文本+"详细"链接），250ms 轮询刷新
@@ -648,6 +652,9 @@ struct Index {
       this.usbSrStrength = s.usbSrStrength;
       this.usbContrast = s.usbContrast;
       this.usbSaturation = s.usbSaturation;
+      this.aiDenoise = s.aiDenoise;
+      this.aiClarity = s.aiClarity;
+      this.aiColorRestore = s.aiColorRestore;
       this.faceEnabled = s.faceEnabled;
       // ★ 旧版迁移：仅存增强参数但模式为关 → 升级为非AI增强模式
       if ((this.usbBrightness !== 0 || this.usbSharpness !== 0 ||
@@ -1120,12 +1127,26 @@ struct Index {
     this.persistSettings();
   }
 
-  // ★ USB 画质增强统一应用入口：模式/亮度/锐度/对比度/饱和度/超分融合强度 → native
+  // ★ 画质增强统一应用入口：模式/亮度/锐度/对比度/饱和度/AI 四模块强度 → native
   private applyUsbEnhanceSettings(): void {
     try {
       entry.setUsbEnhance(this.usbEnhanceMode, this.usbBrightness, this.usbSharpness,
-        this.usbContrast, this.usbSaturation, this.usbSrStrength);
+        this.usbContrast, this.usbSaturation, this.usbSrStrength,
+        this.aiDenoise, this.aiClarity, this.aiColorRestore);
     } catch (_) {}
+  }
+
+  // ★ 非AI增强恢复默认值（水下场景优化：亮度+15 提亮暗水、锐度 60 清晰优先、
+  //   对比度+20 对抗浑浊、饱和度+10 适度还原色彩不艳俗）
+  private onUsbResetDefaults(): void {
+    this.usbBrightness = 15;
+    this.usbSharpness = 60;
+    this.usbContrast = 20;
+    this.usbSaturation = 10;
+    this.applyUsbEnhanceSettings();
+    this.persistSettings();
+    this.showToast('已恢复水下场景默认值');
+    this.speak('已恢复默认值');
   }
 
   // ★ AI 超分模型：rawfile 提取到沙箱 + native 加载（QuickSRNetMedium x4）
@@ -1196,6 +1217,27 @@ struct Index {
   // ★ USB 饱和度（-50~+50）：native 立即生效 + 保存
   private onUsbSaturationChange(v: number): void {
     this.usbSaturation = Math.round(v);
+    this.applyUsbEnhanceSettings();
+    this.persistSettings();
+  }
+
+  // ★ AI 降噪强度（0~100，SR 引导联合双边滤波层）：native 立即生效 + 保存
+  private onAiDenoiseChange(v: number): void {
+    this.aiDenoise = Math.round(v);
+    this.applyUsbEnhanceSettings();
+    this.persistSettings();
+  }
+
+  // ★ AI 水下去浊强度（0~100，暗通道先验去雾层）：native 立即生效 + 保存
+  private onAiClarityChange(v: number): void {
+    this.aiClarity = Math.round(v);
+    this.applyUsbEnhanceSettings();
+    this.persistSettings();
+  }
+
+  // ★ AI 色彩还原强度（0~100，灰世界白平衡层）：native 立即生效 + 保存
+  private onAiColorRestoreChange(v: number): void {
+    this.aiColorRestore = Math.round(v);
     this.applyUsbEnhanceSettings();
     this.persistSettings();
   }
@@ -3218,6 +3260,9 @@ struct Index {
           usbSaturation: this.usbSaturation,
           usbEnhanceMode: this.usbEnhanceMode,
           usbSrStrength: this.usbSrStrength,
+          aiDenoise: this.aiDenoise,
+          aiClarity: this.aiClarity,
+          aiColorRestore: this.aiColorRestore,
           faceEnabled: this.faceEnabled,
           onClose: (): void => { this.pictureSheetVisible = false; },
           onDrawBoxesToggle: (): void => { this.toggleDrawBoxes(); },
@@ -3227,6 +3272,10 @@ struct Index {
           onUsbContrastChange: (v: number): void => { this.onUsbContrastChange(v); },
           onUsbSaturationChange: (v: number): void => { this.onUsbSaturationChange(v); },
           onUsbSrStrengthChange: (v: number): void => { this.onUsbSrStrengthChange(v); },
+          onUsbResetDefaults: (): void => { this.onUsbResetDefaults(); },
+          onAiDenoiseChange: (v: number): void => { this.onAiDenoiseChange(v); },
+          onAiClarityChange: (v: number): void => { this.onAiClarityChange(v); },
+          onAiColorRestoreChange: (v: number): void => { this.onAiColorRestoreChange(v); },
           onFaceToggle: (): void => { this.toggleFace(); }
         })
       }
