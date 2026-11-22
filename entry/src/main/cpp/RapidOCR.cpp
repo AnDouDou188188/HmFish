@@ -42,6 +42,9 @@ namespace rapidocr_wrapper {
     static std::mutex g_result_mutex;
     static std::string g_last_result;
     static std::vector<OcrBox> g_last_boxes;
+    // ★ 框坐标回放因子：detect 输入是降采样后的工作图，返回框在工作图坐标系；
+    //   drawLastBoxes 画在全分辨率显示帧上 → publishPending/final 框都要乘回 1/s
+    static std::atomic<double> g_box_scale(1.0);
 
     // ★ PP-Structure 表格结构识别（SLANet）：独立于 OCR 开关，init 后常驻
     static std::mutex g_table_mutex;
@@ -73,9 +76,11 @@ namespace rapidocr_wrapper {
     }
 
     // 阶段一：det 完成，先发布灰色虚线框（文字尚未识别）
+    // ★ det 回调的框在降采样工作图坐标系：先乘 g_box_scale 还原到显示帧坐标
     static void publishPending(const std::vector<std::vector<cv::Point>> &detBoxes) {
         if (!g_enabled.load() || detBoxes.empty()) return;
         constexpr size_t kMaxBoxes = 30;
+        const double inv = g_box_scale.load();
         std::vector<OcrBox> boxes;
         size_t n = detBoxes.size();
         if (n > kMaxBoxes) n = kMaxBoxes;
@@ -83,6 +88,12 @@ namespace rapidocr_wrapper {
         for (size_t i = 0; i < n; ++i) {
             OcrBox b;
             b.pts = detBoxes[i];
+            if (inv != 1.0) {
+                for (auto &pt : b.pts) {
+                    pt.x = cvRound((double) pt.x * inv);
+                    pt.y = cvRound((double) pt.y * inv);
+                }
+            }
             b.score = 0.f;
             b.pending = true;
             boxes.push_back(std::move(b));
@@ -135,8 +146,9 @@ namespace rapidocr_wrapper {
         if (!g_scene_reset.load() && !g_last_thumb.empty()) {
             cv::Mat diff;
             cv::absdiff(gray, g_last_thumb, diff);
-            // 均值差 < 4/255 视为画面未变（HUD 水印等固定内容不影响灰度差）
-            if (cv::mean(diff)[0] < 4.0) return false;
+            // 均值差 < 2.5/255 视为画面未变（HUD 水印等固定内容不影响灰度差）；
+            //   阈值偏高会让手持慢漂移迟迟不重识别 → 框滞后，2.5 兼顾噪声与响应
+            if (cv::mean(diff)[0] < 2.5) return false;
         }
         g_last_thumb = gray;
         g_scene_reset.store(false);
@@ -215,12 +227,15 @@ namespace rapidocr_wrapper {
             if (job.rgba.empty() || !g_enabled.load()) continue;
 
             // ★ 提速：先降采样到长边 1024（det 输入上限本就 1024，
-            //   INTER_AREA 缩小质量最优），cvtColor/预处理/推理全在小图上跑
+            //   INTER_AREA 缩小质量最优），cvtColor/预处理/推理全在小图上跑；
+            //   记录回放因子 1/s，框坐标乘回去后仍与全分辨率帧对齐
             cv::Mat work = job.rgba;
+            double boxScale = 1.0;
             const int maxSide = std::max(work.cols, work.rows);
             if (maxSide > kMaxSideLen) {
                 const double s = (double) kMaxSideLen / (double) maxSide;
                 cv::resize(work, work, cv::Size(), s, s, cv::INTER_AREA);
+                boxScale = 1.0 / s;
             }
 
             cv::Mat bgr;
@@ -245,6 +260,8 @@ namespace rapidocr_wrapper {
                 std::unique_lock<std::timed_mutex> lk(g_ocr_mutex, std::defer_lock);
                 if (!lk.try_lock_for(std::chrono::milliseconds(150))) continue;
                 if (!g_ocr || !g_enabled.load()) continue;
+                // ★ det 阶段回调（publishPending）在本线程内触发，先放好回放因子
+                g_box_scale.store(boxScale);
                 try {
                     result = g_ocr->detect(bgr, kPadding, kMaxSideLen,
                                            g_db_score.load(), g_db_box.load(),
@@ -257,6 +274,16 @@ namespace rapidocr_wrapper {
                 }
             }
             if (!ok || !g_enabled.load()) continue;
+
+            // ★ 框坐标还原：detect 返回的是降采样工作图坐标 → 乘回 1/s 与显示帧对齐
+            if (boxScale != 1.0) {
+                for (auto &tb : result.textBlocks) {
+                    for (auto &pt : tb.boxPoint) {
+                        pt.x = cvRound((double) pt.x * boxScale);
+                        pt.y = cvRound((double) pt.y * boxScale);
+                    }
+                }
+            }
 
             std::vector<OcrBox> boxes;
             std::string text;
