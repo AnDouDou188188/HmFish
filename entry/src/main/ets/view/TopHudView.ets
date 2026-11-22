@@ -55,8 +55,6 @@ export struct TopHudView {
   @Prop ocrTotal: number = 0;
   // ★ 能耗模式：0省电/1标准/2性能/3自定义（胶囊显示当前档位，点击弹设置）
   @Prop powerMode: number = 1;
-  // ★ 位置水印地名（HUD 位置行展示，点击弹复制地址/坐标）
-  @Prop geoName: string = '';
   // ★ OCR 模型集短名（如"票据"/"普通"）：徽标与文字识别行区分当前是哪个模型
   @Prop ocrModelName: string = '';
   // ★ 人脸识别开关 + 每人脸一行摘要（父组件轮询刷新；点"详细"弹详情面板）
@@ -74,7 +72,6 @@ export struct TopHudView {
   onOpacityChange?: (v: number) => void;
   onShowOcrPopup?: () => void;
   onShowPowerSheet?: () => void;
-  onShowGeoPopup?: () => void;
   // ★ 人脸详情：点某张人脸行的"详细"链接，弹出该脸详情面板（箭头指向人脸框）
   onFaceDetail?: (idx: number) => void;
   // ★ 表格识别：点击"▦ 表格"徽标触发单次表格结构识别
@@ -232,27 +229,6 @@ export struct TopHudView {
               }.width('100%').alignItems(VerticalAlign.Center)
             }, (r: FaceHudRow) => `${r.idx}_${r.text}_${r.color}`)
           }.width('100%')
-        }
-
-        // ★ 位置行：地名展示，点击弹复制地址/坐标（字体略大便于阅读）
-        if (this.geoName.length > 0) {
-          Row({ space: 5 }) {
-            Text('📍').fontSize(12)
-            Text(this.geoName)
-              .fontSize(12).fontColor('#D8DCE2')
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .layoutWeight(1)
-            Text('复制')
-              .fontSize(11).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
-              .padding({ left: 12, right: 12, top: 4, bottom: 4 })
-              .borderRadius(12)
-              .backgroundColor('rgba(0,229,255,0.18)')
-              .border({ width: 1, color: '#00E5FF' })
-          }
-          .width('100%')
-          .padding({ top: 3, bottom: 3 })
-          .onClick(() => this.onShowGeoPopup?.())
         }
 
         Row({ space: 8 }) {

@@ -535,6 +535,9 @@ struct Index {
         usbSrStrength: this.usbSrStrength,
         usbContrast: this.usbContrast,
         usbSaturation: this.usbSaturation,
+        aiDenoise: this.aiDenoise,
+        aiClarity: this.aiClarity,
+        aiColorRestore: this.aiColorRestore,
         faceEnabled: this.faceEnabled
       });
     }, 150);
@@ -3022,7 +3025,6 @@ struct Index {
         recBlink: this.recBlink,
         busy: this.switching || this.loading,
         powerMode: this.powerMode,
-        geoName: this.geoPlaceName,
         ocrModelName: this.shortOcrSetName(),
         faceEnabled: this.faceEnabled,
         faceHudRows: this.faceHudRows,
@@ -3036,7 +3038,6 @@ struct Index {
         onOcrToggle: (): void => { this.toggleOcr(); },
         onOcrLongPress: (): void => { this.ocrSheetVisible = true; },
         onShowPowerSheet: (): void => { this.powerSheetVisible = true; },
-        onShowGeoPopup: (): void => { this.geoPopupVisible = true; },
         onOpacityChange: (v: number): void => { this.hudOpacity = v; this.persistSettings(); },
         onShowOcrPopup: (): void => { this.showOcrPopup(); },
         // ★ 表格识别：点击"▦ 表格"徽标对当前画面做一次 PP-Structure 表格结构识别
@@ -3166,6 +3167,9 @@ struct Index {
         currentMode: this.currentMode,
         recordSec: this.recordSec,
         autoRecordOn: this.autoRecordOn,
+        // ★ 位置行（移自顶部 HUD）：置于变焦气泡行上方
+        geoName: this.geoPlaceName,
+        onShowGeoPopup: (): void => { this.geoPopupVisible = true; },
         onToggleRecord: (): void => { this.toggleRecord(); },
         // ★ 记录按钮与识别/水深/运动一致：短按=开关自动记录，长按=弹记录设置菜单
         onAutoRecordToggle: (): void => { this.toggleAutoRecord(); },

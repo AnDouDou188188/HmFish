@@ -19,7 +19,7 @@ include_directories(
     ${NCNN_DIR}/include
     ${NCNN_DIR}/include/ncnn
     ${OCRLITE_DIR}/include
-    ${OPENCV_DIR}/include/opencv4
+    ${OPENCV_DIR}/include/opencv5
     ${ONNXRT_DIR}/include
 )
 
@@ -121,7 +121,7 @@ target_include_directories(uvc PUBLIC
 target_compile_options(uvc PRIVATE -O2 -fPIC -D__ANDROID__ -Wno-unused-parameter -Wno-unused-function -Wno-sign-compare -Wno-format)
 target_link_libraries(uvc PUBLIC
     usb100
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibjpeg-turbo.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibjpeg-turbo.a
 )
 
 # ─────────────── ocrlite (RapidOCR) ───────────────
@@ -137,7 +137,7 @@ add_library(ocrlite STATIC
 )
 target_include_directories(ocrlite PUBLIC
     ${OCRLITE_DIR}/include
-    ${OPENCV_DIR}/include/opencv4
+    ${OPENCV_DIR}/include/opencv5
     ${ONNXRT_DIR}/include
 )
 target_compile_options(ocrlite PRIVATE -O2 -std=c++17 -Wno-unused-parameter -Wno-deprecated-declarations)
@@ -154,21 +154,26 @@ add_library(ocr SHARED
 target_include_directories(ocr PRIVATE
     ${NATIVERENDER_ROOT_PATH}
     ${OCRLITE_DIR}/include
-    ${OPENCV_DIR}/include/opencv4
+    ${OPENCV_DIR}/include/opencv5
     ${ONNXRT_DIR}/include
 )
 target_link_libraries(ocr PRIVATE
     ocrlite
     ${OPENCV_DIR}/lib/libopencv_imgcodecs.a
     ${OPENCV_DIR}/lib/libopencv_imgproc.a
+    ${OPENCV_DIR}/lib/libopencv_geometry.a
+    ${OPENCV_DIR}/lib/libopencv_flann.a
     ${OPENCV_DIR}/lib/libopencv_core.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibjpeg-turbo.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibopenjp2.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibpng.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibtiff.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/liblibwebp.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/libittnotify.a
-    ${OPENCV_DIR}/lib/opencv4/3rdparty/libtegra_hal.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibjpeg-turbo.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibopenjp2.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibpng.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibtiff.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibwebp.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/liblibharfbuzz.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libtegra_hal.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv_hal.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv_thread.a
     ${NATIVERENDER_ROOT_PATH}/../../../libs/arm64-v8a/libonnxruntime.so
     libhilog_ndk.z.so
     libz.so

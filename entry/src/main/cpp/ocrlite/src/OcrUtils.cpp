@@ -1,5 +1,7 @@
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+// OpenCV 5：getPerspectiveTransform/minAreaRect 从 imgproc 迁移至 geometry 模块
+#include <opencv2/geometry/2d.hpp>
 #include <numeric>
 #include "OcrUtils.h"
 #include "clipper.hpp"

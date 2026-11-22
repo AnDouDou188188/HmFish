@@ -88,6 +88,12 @@ namespace {
         float ages[7] = {0};   // 年龄环形缓冲（中值滤波）
         int ageIdx = 0;
         int ageCnt = 0;
+        float beauties[7] = {0};    // 颜值环形缓冲（中值滤波，同年龄）
+        int beautyIdx = 0;
+        int beautyCnt = 0;
+        float compBufs[7][7] = {{0}}; // 7 分项各 7 样本环形缓冲（中值滤波）
+        int compIdx = 0;
+        int compCnt = 0;
     };
     std::vector<FaceTrack> g_tracks;
 
@@ -244,9 +250,10 @@ namespace {
         if (w < 4.0f || h < 4.0f) return false;
         const float cx = (b.x1 + b.x2) * 0.5f, cy = (b.y1 + b.y2) * 0.5f;
         const float s = (float)S / (std::max(w, h) * 1.5f);
-        cv::Mat M = (cv::Mat_<float>(2, 3) <<
+        // OpenCV 5 移除了 Mat_ 逗号初始化器，改用 initializer_list 构造
+        cv::Mat M = cv::Mat_<float>({2, 3}, {
                      1.0f / s, 0.0f, cx - (S * 0.5f) / s,
-                     0.0f, 1.0f / s, cy - (S * 0.5f) / s);
+                     0.0f, 1.0f / s, cy - (S * 0.5f) / s});
         // 注意：M 是逆变换（dst→src），必须带 WARP_INVERSE_MAP。
         // 此前漏了该标志：OpenCV 把 M 当正向变换再内部求逆，采样点全落负
         // 坐标 → 裁剪图全黑 → genderage/106det 一直吃全零输入（性别恒
@@ -687,6 +694,10 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
                 tr->age = -1.0f;
                 tr->ageIdx = 0;
                 tr->ageCnt = 0;
+                tr->beautyIdx = 0;
+                tr->beautyCnt = 0;
+                tr->compIdx = 0;
+                tr->compCnt = 0;
                 needGa = true;
             }
             tr->x1 = b.x1; tr->y1 = b.y1; tr->x2 = b.x2; tr->y2 = b.y2;
@@ -734,11 +745,30 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
             float comp[7] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
             float dbg[8] = {0};
             const float beauty = faceBeautyScore(pts, comp, dbg);
-            o[7] = beauty;
-            // ★ 分项写 [220..226]：106 点占 [8..219]，旧版写在 [216..222]
-            //   与末 4 个 float（104/105 号点=左眉上沿）重叠——分项分值
-            //   （0~100 小值）当作帧坐标画出，就是"直线拉向左上角"的根因
-            for (int ci = 0; ci < 7; ++ci) o[220 + ci] = comp[ci];
+            if (beauty >= 0.0f) {
+                // ★ 颜值/分项稳定性（同年龄）：环形 7 样本中值滤波——
+                //   关键点单帧抖动/遮挡只是离群样本，中值稳健不跟随
+                tr->beauties[tr->beautyIdx] = beauty;
+                tr->beautyIdx = (tr->beautyIdx + 1) % 7;
+                tr->beautyCnt = std::min(7, tr->beautyCnt + 1);
+                for (int ci = 0; ci < 7; ++ci) {
+                    tr->compBufs[ci][tr->compIdx] = comp[ci];
+                }
+                tr->compIdx = (tr->compIdx + 1) % 7;
+                tr->compCnt = std::min(7, tr->compCnt + 1);
+                o[7] = medianOf(tr->beauties, tr->beautyCnt);
+                // ★ 分项写 [220..226]：106 点占 [8..219]，旧版写在 [216..222]
+                //   与末 4 个 float（104/105 号点=左眉上沿）重叠——分项分值
+                //   （0~100 小值）当作帧坐标画出，就是"直线拉向左上角"的根因
+                for (int ci = 0; ci < 7; ++ci) o[220 + ci] = medianOf(tr->compBufs[ci], tr->compCnt);
+            } else if (tr->beautyCnt > 0) {
+                // 本帧几何校验未过：沿用最近中值，避免 UI 数值闪跳
+                o[7] = medianOf(tr->beauties, tr->beautyCnt);
+                for (int ci = 0; ci < 7; ++ci) o[220 + ci] = medianOf(tr->compBufs[ci], tr->compCnt);
+            } else {
+                o[7] = -1.0f;
+                for (int ci = 0; ci < 7; ++ci) o[220 + ci] = -1.0f;
+            }
             // 诊断：分项与原始比值（每 30 脸一条）——定位某分项异常是关键点
             // 错位还是理想值校准问题
             {
@@ -758,8 +788,14 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
             }
         } else {
             std::memset(pts, 0, sizeof(float) * 212);
-            o[7] = -1.0f;
-            for (int ci = 0; ci < 7; ++ci) o[220 + ci] = -1.0f;
+            if (tr->beautyCnt > 0) {
+                // 裁剪失败帧：沿用最近中值，避免 UI 数值闪跳
+                o[7] = medianOf(tr->beauties, tr->beautyCnt);
+                for (int ci = 0; ci < 7; ++ci) o[220 + ci] = medianOf(tr->compBufs[ci], tr->compCnt);
+            } else {
+                o[7] = -1.0f;
+                for (int ci = 0; ci < 7; ++ci) o[220 + ci] = -1.0f;
+            }
         }
         ++n;
     }

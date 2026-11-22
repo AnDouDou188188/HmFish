@@ -5,12 +5,13 @@ import { image } from '@kit.ImageKit';
 // ══════════════════ 底排调参区（改数值即可，单位 px） ══════════════════
 const ALBUM_BTN_SIZE = 34;      // 相册 / 记录 外框边长（两侧统一）
 const SHUTTER_SIZE = 46;        // 中间快门圆直径
-const ROW_GAP_ZOOM = 6;         // 变焦气泡行 距面板顶
+const ROW_GAP_GEO = 4;          // 地址行 距面板顶
+const ROW_GAP_ZOOM = 6;         // 变焦气泡行 距地址行
 const ROW_GAP_SLIDER_TOP = 2;   // 滑杆行 距上
 const ROW_GAP_SLIDER_BOTTOM = 2;// 滑杆行 距下
 const ROW_GAP_BUTTONS = 10;      // 功能按钮行 距底排
 const SLIDER_HEIGHT = 30;       // 变焦滑杆高度
-const PANEL_HEIGHT = 196;       // 面板总高
+const PANEL_HEIGHT = 222;       // 面板总高（含地址行 26）
 const PANEL_PAD_BOTTOM = 50;    // 底 padding（内容距屏幕底 = 50-16 = 34，避开手势条）
 const PANEL_TUCK = 16;          // 面板背景下探屏幕外像素（视觉全宽贴底）
 // ★ 供 Index 计算预览可见区域（位置水印需画在面板顶边之上）
@@ -110,6 +111,8 @@ export struct BottomPanel {
   @Prop currentMode: string;
   @Prop recordSec: number = -1;
   @Prop autoRecordOn: boolean = false;
+  // ★ 位置行（移自顶部 HUD）：地名展示，点击弹复制地址/坐标
+  @Prop geoName: string = '';
   // ★ 变焦上限按相机支持范围动态设定：手机用 getZoomRatioRange 上限，USB 默认 4x
   @Prop zoomMax: number = 4.0;
   // ★ 摄像头主要参数（预览分辨率）：变焦气泡旁展示
@@ -129,6 +132,7 @@ export struct BottomPanel {
   onDepthToggle?: () => void;
   onDepthLongPress?: () => void;
   onZoomChange?: (v: number) => void;
+  onShowGeoPopup?: () => void;
 
   @Builder
   SideBtn(icon: string, label: string, onTap: () => void) {
@@ -146,6 +150,28 @@ export struct BottomPanel {
 
   build() {
     Column() {
+      // ★ 位置行（移自顶部 HUD）：地名 + 复制胶囊，置于变焦气泡行上一行
+      if (this.geoName.length > 0) {
+        Row({ space: 5 }) {
+          Text('📍').fontSize(12)
+          Text(this.geoName)
+            .fontSize(12).fontColor('#D8DCE2')
+            .maxLines(1)
+            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .layoutWeight(1)
+          Text('复制')
+            .fontSize(11).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+            .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+            .borderRadius(12)
+            .backgroundColor('rgba(0,229,255,0.18)')
+            .border({ width: 1, color: '#00E5FF' })
+        }
+        .width('90%')
+        .padding({ top: 3, bottom: 3 })
+        .margin({ top: ROW_GAP_GEO })
+        .onClick(() => this.onShowGeoPopup?.())
+      }
+
       // ★ 变焦当前倍数 + 摄像头主要参数：变焦条上方居中展示（>1x 青色高亮）
       Row({ space: 8 }) {
         Text(`${this.zoomRatio.toFixed(1)}x`)
