@@ -574,12 +574,12 @@ struct Index {
       try {
         const win = await window.getLastWindow(ctx);
         await win.setWindowKeepScreenOn(true);
-        // ★ HUD 顶部避让系统状态栏：取安全区上高度+小间距，HUD 从状态栏下方开始
+        // ★ HUD 顶部避让系统状态栏：取安全区上高度，与顶部 0 间距（紧贴状态栏下沿）
         const area = win.getWindowAvoidArea(window.AvoidAreaType.TYPE_SYSTEM);
-        this.hudTopOffset = this.getUIContext().px2vp(area.topRect.height) + 4;
+        this.hudTopOffset = this.getUIContext().px2vp(area.topRect.height);
         win.on('avoidAreaChange', (data: window.AvoidAreaOptions): void => {
           if (data.type === window.AvoidAreaType.TYPE_SYSTEM) {
-            this.hudTopOffset = this.getUIContext().px2vp(data.area.topRect.height) + 4;
+            this.hudTopOffset = this.getUIContext().px2vp(data.area.topRect.height);
           }
         });
       } catch (_) {}

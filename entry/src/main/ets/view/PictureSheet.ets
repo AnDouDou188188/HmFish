@@ -56,6 +56,22 @@ export struct PictureSheet {
     setTimeout(() => { this.appear = true; }, 30);
   }
 
+  // ★ 完成：提交当前模式全部本地滑条值（兜底防拖动中断丢值）并关闭弹窗
+  commitAndClose(): void {
+    if (this.usbEnhanceMode === 1) {
+      if (this.localUsbBright !== this.usbBrightness) this.onUsbBrightnessChange?.(this.localUsbBright);
+      if (this.localUsbSharp !== this.usbSharpness) this.onUsbSharpnessChange?.(this.localUsbSharp);
+      if (this.localUsbContrast !== this.usbContrast) this.onUsbContrastChange?.(this.localUsbContrast);
+      if (this.localUsbSaturation !== this.usbSaturation) this.onUsbSaturationChange?.(this.localUsbSaturation);
+    } else if (this.usbEnhanceMode === 2) {
+      if (this.localSrStrength !== this.usbSrStrength) this.onUsbSrStrengthChange?.(this.localSrStrength);
+      if (this.localAiDenoise !== this.aiDenoise) this.onAiDenoiseChange?.(this.localAiDenoise);
+      if (this.localAiClarity !== this.aiClarity) this.onAiClarityChange?.(this.localAiClarity);
+      if (this.localAiColorRestore !== this.aiColorRestore) this.onAiColorRestoreChange?.(this.localAiColorRestore);
+    }
+    this.onClose?.();
+  }
+
   @Builder
   SectionTitle(icon: string, title: string, extra: string) {
     Row({ space: 6 }) {
@@ -457,6 +473,24 @@ export struct PictureSheet {
         .width('100%')
         .layoutWeight(1)
         .align(Alignment.Center)
+
+        // ★ 底部固定"完成"按钮：提交当前模式全部滑条值并关闭
+        Column() {
+          Row() {
+            Text('完成')
+              .fontSize(15)
+              .fontColor('#06131A')
+              .fontWeight(FontWeight.Bold)
+          }
+          .justifyContent(FlexAlign.Center)
+          .width('100%')
+          .height(46)
+          .backgroundColor('#00E5FF')
+          .borderRadius(23)
+          .onClick(() => this.commitAndClose())
+        }
+        .width('100%')
+        .padding({ left: 20, right: 20, top: 8, bottom: 22 })
       }
       .width('100%')
       .constraintSize({ maxHeight: '82%' })

@@ -197,6 +197,12 @@ target_link_libraries(entry PUBLIC
     uvc
     usb100
     ${NCNN_DIR}/lib/libncnn.a
+    ${OPENCV_DIR}/lib/libopencv_imgproc.a
+    ${OPENCV_DIR}/lib/libopencv_core.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libtegra_hal.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv_hal.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv.a
+    ${OPENCV_DIR}/lib/opencv5/3rdparty/libkleidicv_thread.a
     libace_napi.z.so
     libhilog_ndk.z.so
     libohimage.so

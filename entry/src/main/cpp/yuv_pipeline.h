@@ -197,7 +197,12 @@ private:
     //   帧率与推理速度彻底解耦（v2"推理期间丢帧"的跳帧/闪烁根因），
     //   各层新旧 65/35 时域混合，因子自适应带滞回防震荡
     void SrWorkerLoop();
-    void CompositeAiLayers(uint8_t *rgba, int W, int H);
+    // ★ OpenCV5 深度优化版帧级画质增强（全部相机路径每帧调用）：
+    //   cv::blur（KleidiCV/carotene NEON HAL + parallel_for_ 线程池）产出
+    //   3x3/5x5 盒滤波后，单趟 parallel_for_ 合并全部逐像素处理——
+    //   AI 修复层合成 + 细锐 + Clarity + 亮度/对比度/饱和度，
+    //   替代旧链路每帧 7~11 趟全帧标量循环
+    void ApplyFrameEnhance(uint8_t *rgba, int W, int H);
     std::thread srThread_;
     std::mutex srMutex_;
     std::condition_variable srCv_;

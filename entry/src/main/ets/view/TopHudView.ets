@@ -115,7 +115,7 @@ export struct TopHudView {
   build() {
     Stack() {
       // ★ HUD 紧凑化：间距/内边距整体收紧，减少对画面的遮挡
-      Column({ space: 4 }) {
+        Column({ space: 7 }) {
         if (this.isRecording) {
           Row({ space: 5 }) {
             Row().width(7).height(7).borderRadius(3.5)
@@ -158,7 +158,9 @@ export struct TopHudView {
             .padding({ left: 6, right: 6, top: 2, bottom: 2 })
             .borderRadius(7).backgroundColor('rgba(0,0,0,0.5)')
           Slider({ value: this.localOpacity, min: 0.0, max: 0.95, step: 0.05 })
-            .width(64)
+            .width(46)
+            .trackThickness(2)
+            .blockSize({ width: 8, height: 8 })
             .selectedColor('#FFFFFF')
             .trackColor('rgba(0,0,0,0.5)')
             .blockColor('#FFFFFF')
@@ -185,7 +187,7 @@ export struct TopHudView {
 
         // ★ 折叠态：以下整块隐藏，只留第一行（HUD 徽标切换）
         if (!this.collapsed) {
-        Column({ space: 4 }) {
+      Column({ space: 7 }) {
         Row({ space: 8 }) {
           // ★ 每类摄像头独立配色：USB=橙、后置=蓝、前置=紫；
           //   文案明确是哪个摄像头；选中样式对齐"运动"开启态（半透明彩色底+彩边+彩字）
@@ -194,28 +196,14 @@ export struct TopHudView {
           this.camPill('手机前置', 1, '#AF52DE', 'rgba(175,82,222,0.28)')
         }.justifyContent(FlexAlign.SpaceEvenly).width('100%')
 
-        // ★ 画面设置胶囊：USB 增强/识别框显示/人脸识别统一入口
         Row({ space: 6 }) {
-          Text('▦').fontSize(12).fontColor('#00E5FF')
-          Text('画面设置').fontSize(11).fontColor('#FFFFFF').fontWeight(FontWeight.Bold)
-          Blank()
-          Text('增强 · 识别框 · 人脸').fontSize(9).fontColor('rgba(255,255,255,0.55)')
-        }
-        .padding({ left: 10, right: 10, top: 5, bottom: 5 })
-        .borderRadius(13)
-        .backgroundColor('rgba(0,0,0,0.55)')
-        .border({ width: 1, color: 'rgba(0,229,255,0.4)' })
-        .width('100%')
-        .onClick(() => this.onShowPictureSheet?.())
-
-        Row({ space: 8 }) {
-          // ★ 四徽标统一规格：固定高 28、同圆角/边框/内边距、平分整行宽度，仅配色区分
-          Row({ space: 4 }) {
-            Text(this.yoloEnabled ? '✓' : '✗').fontSize(10).fontColor('#FFFFFF')
+          // ★ 五徽标统一规格：固定高 28、同圆角/边框、平分整行宽度，仅配色区分；
+          //   开关态由背景色表达（绿=开/白=关），不再显示 ✓/✗ 前缀，降低密集感
+          Row({ space: 2 }) {
             Text('YOLO').fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold)
           }
           .height(28)
-          .padding({ left: 4, right: 4 })
+          .padding({ left: 2, right: 2 })
           .borderRadius(9)
           .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
           .backgroundColor(this.yoloEnabled ? '#34C759' : 'rgba(255,255,255,0.1)')
@@ -228,14 +216,13 @@ export struct TopHudView {
               .onAction(() => this.onYoloLongPress?.())
           ))
 
-          Row({ space: 4 }) {
-            Text(this.ocrEnabled ? '✓' : '✗').fontSize(10).fontColor('#FFFFFF')
+          Row({ space: 2 }) {
             // ★ 徽标区分模型：显示"OCR·票据"/"OCR·普通"（当前模型集短名）
             Text(`OCR${this.ocrModelName.length > 0 ? '·' + this.ocrModelName : ''}`)
               .fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).maxLines(1)
           }
           .height(28)
-          .padding({ left: 4, right: 4 })
+          .padding({ left: 2, right: 2 })
           .borderRadius(9)
           .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
           .backgroundColor(this.ocrEnabled ? '#34C759' : 'rgba(255,255,255,0.1)')
@@ -249,12 +236,12 @@ export struct TopHudView {
           ))
 
           // ★ 能耗模式徽标：显示当前档位（省电/标准/性能/自定义），点击弹设置
-          Row({ space: 4 }) {
+          Row({ space: 2 }) {
             Text('⚡').fontSize(10).fontColor('#FFFFFF')
             Text(this.powerLabel()).fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold)
           }
           .height(28)
-          .padding({ left: 4, right: 4 })
+          .padding({ left: 2, right: 2 })
           .borderRadius(9)
           .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
           .backgroundColor(this.powerBg())
@@ -262,8 +249,22 @@ export struct TopHudView {
           .justifyContent(FlexAlign.Center)
           .onClick(() => this.onShowPowerSheet?.())
 
+          // ★ 画面设置徽标：USB增强/识别框/人脸识别统一入口
+          Row({ space: 2 }) {
+            Text('⚙').fontSize(10).fontColor('#FFFFFF')
+            Text('画面').fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).maxLines(1)
+          }
+          .height(28)
+          .padding({ left: 2, right: 2 })
+          .borderRadius(9)
+          .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
+          .backgroundColor('rgba(0,229,255,0.5)')
+          .layoutWeight(1)
+          .justifyContent(FlexAlign.Center)
+          .onClick(() => this.onShowPictureSheet?.())
+
           // ★ 表格识别徽标：点击对当前画面做一次 PP-Structure 表格结构识别
-          Row({ space: 4 }) {
+          Row({ space: 2 }) {
             if (this.tableBusy) {
               LoadingProgress().width(10).height(10).color('#FFD60A')
             } else {
@@ -272,7 +273,7 @@ export struct TopHudView {
             Text('表格').fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).maxLines(1)
           }
           .height(28)
-          .padding({ left: 4, right: 4 })
+          .padding({ left: 2, right: 2 })
           .borderRadius(9)
           .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
           .backgroundColor(this.tableBusy ? 'rgba(255,214,10,0.45)' : 'rgba(255,159,10,0.75)')
@@ -426,7 +427,7 @@ export struct TopHudView {
       // ★ 顶部菜单：100% 全宽、无边框；顶部偏移=状态栏安全区高度+小间距，
       //   不覆盖系统信号/电量等信息栏
       .width('100%')
-      .padding({ left: 10, right: 10, top: 6, bottom: 8 })
+      .padding({ left: 10, right: 10, top: 2, bottom: 8 })
       .backgroundColor(`rgba(17, 21, 25, ${this.hudOpacity})`)
       .position({ x: 0, y: this.hudTopOffset })
 

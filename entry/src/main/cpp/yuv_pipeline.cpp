@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <chrono>
 #include <libyuv/scale_argb.h>
+// ★ OpenCV5：帧级增强深度优化（cv::blur NEON HAL + parallel_for_ 线程池）
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -61,10 +64,6 @@ static std::atomic<bool> g_face_enabled(false);
 //   SR 输出与显示 1:1 像素对齐零重采样；f=8 兜底最快。
 //   按实测推理耗时自适应：>500ms 升档保流畅，<200ms 降档保质量
 static std::atomic<int>  g_sr_factor(2);
-// ★ 前置声明：ProcessFrame（手机相机路径）先于定义处调用增强链
-static void sharpenRgba(uint8_t* rgba, int w, int h, float amount);
-static void clarityRgba(uint8_t* rgba, int w, int h, float amount);
-static void applyUsbEnhance(uint8_t* rgba, int w, int h);
 
 // ───────── 运动 & 水深 ─────────
 static pthread_mutex_t g_motion_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -888,14 +887,10 @@ void YuvPipeline::ProcessFrame(OH_ImageNative *image) {
                 srBusy_.store(true);
                 srCv_.notify_all();
             }
-            CompositeAiLayers(rgbaBuf_.data(), displayWidth_, displayHeight_);
-            sharpenRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.75f);
-            clarityRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.50f);
-        } else if (enhMode >= 1) {
-            // 非AI基线锐化（mode≥1 固定生效，与 USB 路径一致）
-            sharpenRgba(rgbaBuf_.data(), displayWidth_, displayHeight_, 0.45f);
         }
-        applyUsbEnhance(rgbaBuf_.data(), displayWidth_, displayHeight_);
+        // ★ OpenCV5 深度优化：全部逐像素增强合并单趟并行 pass
+        //   （替代旧链路每帧 7~11 趟全帧标量循环 → 2 趟 HAL 滤波 + 1 趟并行合成）
+        ApplyFrameEnhance(rgbaBuf_.data(), displayWidth_, displayHeight_);
     }
 
     ProcessCommonTail();
@@ -1079,151 +1074,6 @@ void YuvPipeline::SetLocationBottomRatio(float ratio) {
     locBottomRatio_ = ratio;
 }
 
-// ★ unsharp mask 锐化（非AI增强"锐度"滑条）：out = clamp(orig + amount*(orig - blur3x3))
-//   分离两趟 3tap 盒滤波，边界 clamp；缓冲 static 复用（仅相机线程调用）
-static void sharpenRgba(uint8_t* rgba, int w, int h, float amount) {
-    if (amount <= 0.001f || w < 3 || h < 3) return;
-    static std::vector<uint16_t> hbuf;
-    static std::vector<uint8_t> blur;
-    const size_t n = (size_t)w * h;
-    hbuf.resize(n * 3);
-    blur.resize(n * 4);
-    // 水平 3tap：hsum[x] = p[x-1]+p[x]+p[x+1]
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* row = rgba + (size_t)y * w * 4;
-        uint16_t* hr = hbuf.data() + (size_t)y * w * 3;
-        for (int x = 0; x < w; ++x) {
-            const int xm = x > 0 ? x - 1 : 0;
-            const int xp = x < w - 1 ? x + 1 : w - 1;
-            hr[x * 3 + 0] = (uint16_t)(row[xm * 4] + row[x * 4] + row[xp * 4]);
-            hr[x * 3 + 1] = (uint16_t)(row[xm * 4 + 1] + row[x * 4 + 1] + row[xp * 4 + 1]);
-            hr[x * 3 + 2] = (uint16_t)(row[xm * 4 + 2] + row[x * 4 + 2] + row[xp * 4 + 2]);
-        }
-    }
-    // 垂直 3tap → blur = 9 邻域均值
-    for (int y = 0; y < h; ++y) {
-        const int ym = y > 0 ? y - 1 : 0;
-        const int yp = y < h - 1 ? y + 1 : h - 1;
-        const uint16_t* r0 = hbuf.data() + (size_t)ym * w * 3;
-        const uint16_t* r1 = hbuf.data() + (size_t)y * w * 3;
-        const uint16_t* r2 = hbuf.data() + (size_t)yp * w * 3;
-        uint8_t* d = blur.data() + (size_t)y * w * 4;
-        for (int x = 0; x < w; ++x, d += 4) {
-            d[0] = (uint8_t)((r0[x * 3] + r1[x * 3] + r2[x * 3]) / 9);
-            d[1] = (uint8_t)((r0[x * 3 + 1] + r1[x * 3 + 1] + r2[x * 3 + 1]) / 9);
-            d[2] = (uint8_t)((r0[x * 3 + 2] + r1[x * 3 + 2] + r2[x * 3 + 2]) / 9);
-        }
-    }
-    const int amt1000 = (int)(amount * 1000.0f);
-    uint8_t* q = rgba;
-    const uint8_t* b = blur.data();
-    for (size_t i = 0; i < n; ++i, q += 4, b += 4) {
-        for (int c = 0; c < 3; ++c) {
-            int v = q[c] + ((q[c] - (int)b[c]) * amt1000) / 1000;
-            q[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
-        }
-    }
-}
-
-// ★ Clarity 局部对比增强（粗尺度 unsharp，半径 2 的 5tap 分离盒滤波）：
-//   与 sharpenRgba 的 3x3 细锐不同，clarity 提升中频对比（物体轮廓/纹理块
-//   与邻域的明暗差），是肉眼"清晰感"最敏感的频段；两者叠加=专业修图
-//   的 Clarity+Sharpen 双重锐化
-static void clarityRgba(uint8_t* rgba, int w, int h, float amount) {
-    if (amount <= 0.001f || w < 5 || h < 5) return;
-    static std::vector<uint16_t> hbuf;
-    static std::vector<uint8_t> blur;
-    const size_t n = (size_t)w * h;
-    hbuf.resize(n * 3);
-    blur.resize(n * 4);
-    // 水平 5tap：hsum[x] = p[x-2]+p[x-1]+p[x]+p[x+1]+p[x+2]
-    for (int y = 0; y < h; ++y) {
-        const uint8_t* row = rgba + (size_t)y * w * 4;
-        uint16_t* hr = hbuf.data() + (size_t)y * w * 3;
-        for (int x = 0; x < w; ++x) {
-            const int xm2 = x > 1 ? x - 2 : 0;
-            const int xm1 = x > 0 ? x - 1 : 0;
-            const int xp1 = x < w - 1 ? x + 1 : w - 1;
-            const int xp2 = x < w - 2 ? x + 2 : w - 1;
-            for (int c = 0; c < 3; ++c) {
-                hr[x * 3 + c] = (uint16_t)(row[xm2 * 4 + c] + row[xm1 * 4 + c] +
-                                           row[x * 4 + c] + row[xp1 * 4 + c] + row[xp2 * 4 + c]);
-            }
-        }
-    }
-    // 垂直 5tap → blur = 25 邻域均值
-    for (int y = 0; y < h; ++y) {
-        const int ym2 = y > 1 ? y - 2 : 0;
-        const int ym1 = y > 0 ? y - 1 : 0;
-        const int yp1 = y < h - 1 ? y + 1 : h - 1;
-        const int yp2 = y < h - 2 ? y + 2 : h - 1;
-        const uint16_t* r0 = hbuf.data() + (size_t)ym2 * w * 3;
-        const uint16_t* r1 = hbuf.data() + (size_t)ym1 * w * 3;
-        const uint16_t* r2 = hbuf.data() + (size_t)y * w * 3;
-        const uint16_t* r3 = hbuf.data() + (size_t)yp1 * w * 3;
-        const uint16_t* r4 = hbuf.data() + (size_t)yp2 * w * 3;
-        uint8_t* d = blur.data() + (size_t)y * w * 4;
-        for (int x = 0; x < w; ++x, d += 4) {
-            for (int c = 0; c < 3; ++c) {
-                d[c] = (uint8_t)((r0[x * 3 + c] + r1[x * 3 + c] + r2[x * 3 + c] +
-                                  r3[x * 3 + c] + r4[x * 3 + c]) / 25);
-            }
-        }
-    }
-    const int amt1000 = (int)(amount * 1000.0f);
-    uint8_t* q = rgba;
-    const uint8_t* b = blur.data();
-    for (size_t i = 0; i < n; ++i, q += 4, b += 4) {
-        for (int c = 0; c < 3; ++c) {
-            int v = q[c] + ((q[c] - (int)b[c]) * amt1000) / 1000;
-            q[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
-        }
-    }
-}
-
-// ★ USB 非AI画面增强（mode 1，仅外部供帧路径调用）：
-//   亮度 ±50 直接加；对比度 ±50 → 围绕中值 0.5~1.5 倍拉伸；
-//   饱和度 ±50 → 围绕灰度基准 0.5~1.5 倍推远；锐度 0~100 → unsharp mask 0~1.6；
-//   定点整数实现（1/256 定标），全部 0/关闭时零逐像素开销；
-//   在缩放入 rgbaBuf_ 之后、叠加绘制之前执行 → 水印/识别框/人脸框不被增强污染
-static void applyUsbEnhance(uint8_t* rgba, int w, int h) {
-    // ★ mode 0 = 完全关闭（亮度/锐度/对比度/饱和度全部不生效）
-    if (g_usb_mode.load() == 0) return;
-    const int bright = g_usb_brightness.load();
-    const int contrast = g_usb_contrast.load();
-    const int saturation = g_usb_saturation.load();
-    const int sharp = g_usb_sharpness.load();
-    if (bright == 0 && contrast == 0 && saturation == 0 && sharp == 0) return;
-    if (bright != 0 || contrast != 0 || saturation != 0) {
-        // 定标 256：contrast 因子 = (100+c)/100 ∈ [128,384]，saturation 同
-        const int cf = 256 * (100 + contrast) / 100;
-        const int sf = 256 * (100 + saturation) / 100;
-        const size_t n = (size_t)w * h;
-        uint8_t* p = rgba;
-        for (size_t i = 0; i < n; ++i, p += 4) {
-            int r = p[0], g = p[1], b = p[2];
-            if (contrast != 0) {
-                r = ((r - 128) * cf >> 8) + 128;
-                g = ((g - 128) * cf >> 8) + 128;
-                b = ((b - 128) * cf >> 8) + 128;
-            }
-            if (saturation != 0) {
-                const int gray = (r * 299 + g * 587 + b * 114) / 1000;
-                r = gray + ((r - gray) * sf >> 8);
-                g = gray + ((g - gray) * sf >> 8);
-                b = gray + ((b - gray) * sf >> 8);
-            }
-            if (bright != 0) { r += bright; g += bright; b += bright; }
-            p[0] = r < 0 ? 0 : (r > 255 ? 255 : (uint8_t)r);
-            p[1] = g < 0 ? 0 : (g > 255 ? 255 : (uint8_t)g);
-            p[2] = b < 0 ? 0 : (b > 255 ? 255 : (uint8_t)b);
-        }
-    }
-    if (sharp > 0) {
-        sharpenRgba(rgba, w, h, sharp / 100.0f * 1.6f);
-    }
-}
-
 // ★ AI 画质增强工作线程（v3，细节层异步产出）：
 //   等待 pending → SR 推理 → delta = SR(小图) − 双线性(小图)（对齐到显示尺寸）
 //   → 与旧层 65/35 时域混合 → 发布细节层快照 → 复位 busy。
@@ -1324,15 +1174,23 @@ void YuvPipeline::SrWorkerLoop() {
                                    srDeltaH_ == H && srDeltaBuf_.size() == n * 3;
                 if (!blend) srDeltaBuf_.assign(n * 3, 0);
                 int8_t *dst = srDeltaBuf_.data();
-                for (size_t i = 0; i < n; ++i, srF += 4, upF += 4, dst += 3) {
-                    for (int c = 0; c < 3; ++c) {
-                        int dv = (int)srF[c] - (int)upF[c];
-                        if (dv > 96) dv = 96;
-                        else if (dv < -96) dv = -96;
-                        if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
-                        dst[c] = (int8_t)dv;
+                // ★ OpenCV5 parallel_for_ 行条带并行（原单线程全帧标量循环）
+                cv::parallel_for_(cv::Range(0, H), [&](const cv::Range &r) {
+                    const uint8_t *sf = srF + (size_t)r.start * W * 4;
+                    const uint8_t *uf = upF + (size_t)r.start * W * 4;
+                    int8_t *dd = dst + (size_t)r.start * W * 3;
+                    for (int y = r.start; y < r.end; ++y) {
+                        for (int x = 0; x < W; ++x, sf += 4, uf += 4, dd += 3) {
+                            for (int c = 0; c < 3; ++c) {
+                                int dv = (int)sf[c] - (int)uf[c];
+                                if (dv > 96) dv = 96;
+                                else if (dv < -96) dv = -96;
+                                if (blend) dv = (dv * 65 + (int)dd[c] * 35) / 100;
+                                dd[c] = (int8_t)dv;
+                            }
+                        }
                     }
-                }
+                }, 64);
                 srDeltaW_ = W;
                 srDeltaH_ = H;
                 srDeltaCycleMs_ = (int)inferMs;
@@ -1348,11 +1206,13 @@ void YuvPipeline::SrWorkerLoop() {
                               srGuideBuf_.data(), (size_t)inW * 4, inW, inH,
                               libyuv::kFilterBilinear);
             srPackBuf_.resize((size_t)inW * inH * 4);
-            {
+            // ★ OpenCV5 parallel_for_ 行条带并行（原单线程 25 抽头/像素标量循环，
+            //    SR 工作线程内最重的一段；各像素独立，天然可并行）
+            cv::parallel_for_(cv::Range(0, inH), [&](const cv::Range &r) {
                 const uint8_t *gd = srGuideBuf_.data();
                 const uint8_t *bs = srWorkIn_.data();
                 uint8_t *pk = srPackBuf_.data();
-                for (int y = 0; y < inH; ++y) {
+                for (int y = r.start; y < r.end; ++y) {
                     const int y0 = std::max(0, y - 2), y1 = std::min(inH - 1, y + 2);
                     for (int x = 0; x < inW; ++x, pk += 4) {
                         const size_t c0 = (size_t)y * inW + x;
@@ -1388,7 +1248,7 @@ void YuvPipeline::SrWorkerLoop() {
                         pk[3] = 255;
                     }
                 }
-            }
+            }, 32);
             srLayerTmp_.resize((size_t)W * H * 4);
             libyuv::ARGBScale(srPackBuf_.data(), (size_t)inW * 4, inW, inH,
                               srLayerTmp_.data(), (size_t)W * 4, W, H,
@@ -1400,15 +1260,22 @@ void YuvPipeline::SrWorkerLoop() {
                 if (!blend) srNoiseBuf_.assign(n * 3, 0);
                 int8_t *dst = srNoiseBuf_.data();
                 const uint8_t *p = srLayerTmp_.data();
-                for (size_t i = 0; i < n; ++i, p += 4, dst += 3) {
-                    for (int c = 0; c < 3; ++c) {
-                        int dv = (int)p[c] - 128;
-                        if (dv > 96) dv = 96;
-                        else if (dv < -96) dv = -96;
-                        if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
-                        dst[c] = (int8_t)dv;
+                // ★ OpenCV5 parallel_for_ 行条带并行
+                cv::parallel_for_(cv::Range(0, H), [&](const cv::Range &r) {
+                    const uint8_t *pp = p + (size_t)r.start * W * 4;
+                    int8_t *dd = dst + (size_t)r.start * W * 3;
+                    for (int y = r.start; y < r.end; ++y) {
+                        for (int x = 0; x < W; ++x, pp += 4, dd += 3) {
+                            for (int c = 0; c < 3; ++c) {
+                                int dv = (int)pp[c] - 128;
+                                if (dv > 96) dv = 96;
+                                else if (dv < -96) dv = -96;
+                                if (blend) dv = (dv * 65 + (int)dd[c] * 35) / 100;
+                                dd[c] = (int8_t)dv;
+                            }
+                        }
                     }
-                }
+                }, 64);
             }
 
             // ── ③ AI 水下去浊+色彩还原层：微缩图（长边 128）上估计环境光与
@@ -1498,15 +1365,22 @@ void YuvPipeline::SrWorkerLoop() {
                     if (!blend) srClarityBuf_.assign(n * 3, 0);
                     int8_t *dst = srClarityBuf_.data();
                     const uint8_t *p = srLayerTmp_.data();
-                    for (size_t i = 0; i < n; ++i, p += 4, dst += 3) {
-                        for (int c = 0; c < 3; ++c) {
-                            int dv = (int)p[c] - 128;
-                            if (dv > 96) dv = 96;
-                            else if (dv < -96) dv = -96;
-                            if (blend) dv = (dv * 65 + (int)dst[c] * 35) / 100;
-                            dst[c] = (int8_t)dv;
+                    // ★ OpenCV5 parallel_for_ 行条带并行
+                    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range &r) {
+                        const uint8_t *pp = p + (size_t)r.start * W * 4;
+                        int8_t *dd = dst + (size_t)r.start * W * 3;
+                        for (int y = r.start; y < r.end; ++y) {
+                            for (int x = 0; x < W; ++x, pp += 4, dd += 3) {
+                                for (int c = 0; c < 3; ++c) {
+                                    int dv = (int)pp[c] - 128;
+                                    if (dv > 96) dv = 96;
+                                    else if (dv < -96) dv = -96;
+                                    if (blend) dv = (dv * 65 + (int)dd[c] * 35) / 100;
+                                    dd[c] = (int8_t)dv;
+                                }
+                            }
                         }
-                    }
+                    }, 64);
                 }
             }
         }
@@ -1514,65 +1388,137 @@ void YuvPipeline::SrWorkerLoop() {
     }
 }
 
-// ★ AI 修复层合成（v3，相机线程每帧调用）：基底 + 最新三层（按龄衰减）叠加。
-//   三层均由 SR 工作线程以推理节奏（约 2~7Hz）异步刷新，相机帧全帧率渲染——
-//   基底实时、修复层半静态，画面流畅不跳帧：
-//   ① 细节层：增益 = 强度滑条 0~220%，±64 软限幅
-//   ② 降噪层：增益 = 降噪滑条 0~130%（层内容=平滑−原帧，负向噪声分量）
-//   ③ 去浊层：低频校正（去浊/色彩滑条已在工作线程烘焙进层），增益=fade
-//   龄衰减窗口 = max(500, 2×推理周期)（cap 1200ms）内全强度，之后 400ms 线性淡出：
-//   SR 持续刷新时永不衰减（稳定不呼吸），管线停更/场景切走后旧层自然消失
-void YuvPipeline::CompositeAiLayers(uint8_t *rgba, int W, int H) {
-    const int strength = g_usb_sr_strength.load();
-    const int denoise = g_ai_denoise.load();
-    const bool clarityOn = (g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
-    if (strength <= 0 && denoise <= 0 && !clarityOn) return;
-    const auto now = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> lk(srDeltaMutex_);
-    if (!srDeltaValid_.load() || srDeltaW_ != W || srDeltaH_ != H ||
-        srDeltaBuf_.size() != (size_t)W * H * 3) {
+// ★ OpenCV5 深度优化版帧级画质增强（v4，全部相机路径每帧调用）：
+//   旧链路 = 修复层合成 + 细锐 3x3 + Clarity 5x5 + 亮度/对比度/饱和度 + 用户锐度，
+//   每帧最多 11 趟全帧标量循环（无 NEON 无并行）→ 真机实测明显卡顿。
+//   新链路（OpenCV 5.1，KleidiCV/carotene NEON HAL + parallel_for_ 线程池）：
+//   ① cv::blur 两趟盒滤波（HAL NEON + 多核并行，边界 REPLICATE 与旧 clamp 一致）
+//   ② 单趟 parallel_for_ 合并全部逐像素处理（行条带并行），
+//      一次访存同时做：AI 修复层（细节/降噪/去浊，按龄衰减+增益+软限幅）
+//      + 多尺度 unsharp（3x3 细锐 + 5x5 Clarity，4.12 定标）
+//      + 对比度/饱和度/亮度（1/256 定标）→ 内存带宽占用降为旧链路 ~1/4
+void YuvPipeline::ApplyFrameEnhance(uint8_t *rgba, int W, int H) {
+    const int mode = g_usb_mode.load();
+    if (mode == 0 || W < 8 || H < 8) return;
+
+    const int bright = g_usb_brightness.load();
+    const int contrast = g_usb_contrast.load();
+    const int saturation = g_usb_saturation.load();
+    const int sharp = g_usb_sharpness.load();
+    const bool anyBcs = (bright != 0 || contrast != 0 || saturation != 0);
+
+    // ── AI 修复层增益快照（含龄衰减；有层时持锁跑合成，与旧版一致）──
+    const bool aiOn = mode == 2 && ocr_bridge::srIsReady() &&
+        (g_usb_sr_strength.load() > 0 || g_ai_denoise.load() > 0 ||
+         g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
+    int gainD = 0, gainN = 0, gainC = 0;
+    const int8_t *dl = nullptr, *nl = nullptr, *cl = nullptr;
+    const size_t nPix = (size_t)W * H;
+    std::unique_lock<std::mutex> layerLk(srDeltaMutex_, std::defer_lock);
+    if (aiOn) {
+        layerLk.lock();
+        if (srDeltaValid_.load() && srDeltaW_ == W && srDeltaH_ == H &&
+            srDeltaBuf_.size() == nPix * 3) {
+            const int64_t ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - srDeltaTime_).count();
+            const int fadeStart = std::min(1200, std::max(500, srDeltaCycleMs_ * 2));
+            if (ageMs <= fadeStart + 400) {
+                const int fade100 = ageMs > fadeStart
+                    ? 100 - (int)((ageMs - fadeStart) * 100 / 400) : 100;
+                if (fade100 > 0) {
+                    const int strength = g_usb_sr_strength.load();
+                    const int denoise = g_ai_denoise.load();
+                    const bool clarityOn = (g_ai_clarity.load() > 0 || g_ai_color.load() > 0);
+                    gainD = strength > 0 ? strength * 220 / 100 * fade100 / 100 : 0;
+                    gainN = denoise > 0 ? denoise * 130 / 100 * fade100 / 100 : 0;
+                    gainC = clarityOn ? fade100 : 0;
+                    dl = gainD > 0 ? srDeltaBuf_.data() : nullptr;
+                    nl = (gainN > 0 && srNoiseBuf_.size() == nPix * 3) ? srNoiseBuf_.data() : nullptr;
+                    cl = (gainC > 0 && srClarityBuf_.size() == nPix * 3) ? srClarityBuf_.data() : nullptr;
+                    if (dl == nullptr && nl == nullptr && cl == nullptr) {
+                        gainD = 0; gainN = 0; gainC = 0;
+                    }
+                }
+            }
+        }
+        if (gainD <= 0 && gainN <= 0 && gainC <= 0) layerLk.unlock();
+    }
+
+    // ── 锐化系数量化（4.12 定标）：AI 档 0.75 细锐 + 0.50 Clarity，
+    //    非AI 档 0.45 基线；用户锐度滑条 0~1.6 叠加（多尺度 unsharp 同源合成）──
+    const int userSharp = sharp > 0 ? sharp * 1600 / 100 : 0;
+    const int a3 = (aiOn ? 3072 : 1843) + userSharp;
+    const int a5 = aiOn ? 2048 : 0;
+    const bool need3 = a3 > 0;
+    const bool need5 = a5 > 0;
+    if (!need3 && !need5 && !anyBcs && gainD <= 0 && gainN <= 0 && gainC <= 0) {
+        if (layerLk.owns_lock()) layerLk.unlock();
         return;
     }
-    const int64_t ageMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - srDeltaTime_).count();
-    const int fadeStart = std::min(1200, std::max(500, srDeltaCycleMs_ * 2));
-    if (ageMs > fadeStart + 400) return;
-    int fade100 = 100;
-    if (ageMs > fadeStart) fade100 = 100 - (int)((ageMs - fadeStart) * 100 / 400);
-    if (fade100 <= 0) return;
-    const size_t n = (size_t)W * H;
-    // ① 细节：0~220% 增益注入（v3 网格在显示分辨率，细节零降采样衰减）；
-    //    ② 降噪：0~130%；③ 去浊：滑条已烘焙，只按 fade 衰减
-    const int gainD = strength > 0 ? strength * 220 / 100 * fade100 / 100 : 0;
-    const int gainN = denoise > 0 ? denoise * 130 / 100 * fade100 / 100 : 0;
-    const int gainC = clarityOn ? fade100 : 0;
-    const int8_t *dl = srDeltaBuf_.data();
-    const int8_t *nl = (gainN > 0 && srNoiseBuf_.size() == n * 3) ? srNoiseBuf_.data() : nullptr;
-    const int8_t *cl = (gainC > 0 && srClarityBuf_.size() == n * 3) ? srClarityBuf_.data() : nullptr;
-    if (gainD <= 0 && nl == nullptr && cl == nullptr) return;
-    uint8_t *d = rgba;
-    for (size_t i = 0; i < n; ++i, d += 4, dl += 3) {
-        const size_t o = i * 3;
-        for (int c = 0; c < 3; ++c) {
-            int v = d[c];
-            if (gainD > 0) {
-                int dv = (int)dl[c] * gainD / 100;
-                if (dv > 64) dv = 64 + (dv - 64) / 2;
-                else if (dv < -64) dv = -64 + (dv + 64) / 2;
-                v += dv;
+
+    // ── ① HAL 盒滤波（cv::blur：KleidiCV/carotene NEON + parallel_for_ 线程池）──
+    cv::Mat m(H, W, CV_8UC4, rgba);
+    static cv::Mat blur3m, blur5m;
+    if (need3) cv::blur(m, blur3m, cv::Size(3, 3), cv::Point(-1, -1), cv::BORDER_REPLICATE);
+    if (need5) cv::blur(m, blur5m, cv::Size(5, 5), cv::Point(-1, -1), cv::BORDER_REPLICATE);
+
+    // ── ② 单趟并行合成：一次遍历同时做 修复层 + 细锐 + Clarity + B/C/S ──
+    const int cf = 256 * (100 + contrast) / 100;
+    const int sf = 256 * (100 + saturation) / 100;
+    cv::parallel_for_(cv::Range(0, H), [&](const cv::Range &r) {
+        for (int y = r.start; y < r.end; ++y) {
+            uint8_t *d = rgba + (size_t)y * W * 4;
+            const uint8_t *b3 = need3 ? blur3m.ptr(y) : nullptr;
+            const uint8_t *b5 = need5 ? blur5m.ptr(y) : nullptr;
+            const int8_t *pdl = dl != nullptr ? dl + (size_t)y * W * 3 : nullptr;
+            const int8_t *pnl = nl != nullptr ? nl + (size_t)y * W * 3 : nullptr;
+            const int8_t *pcl = cl != nullptr ? cl + (size_t)y * W * 3 : nullptr;
+            for (int x = 0; x < W; ++x, d += 4) {
+                const int x4 = x * 4, x3 = x * 3;
+                int rgb[3];
+                for (int c = 0; c < 3; ++c) {
+                    int v = d[c];
+                    // 多尺度 unsharp：细锐 3x3 + Clarity 5x5（同一基源，时域更稳）
+                    if (b3 != nullptr) v += ((v - (int)b3[x4 + c]) * a3) >> 12;
+                    if (b5 != nullptr) v += ((v - (int)b5[x4 + c]) * a5) >> 12;
+                    // AI 修复层：细节/降噪（±64 软限幅）+ 去浊色彩（增益直加）
+                    if (pdl != nullptr) {
+                        int t = (int)pdl[x3 + c] * gainD / 100;
+                        if (t > 64) t = 64 + (t - 64) / 2;
+                        else if (t < -64) t = -64 + (t + 64) / 2;
+                        v += t;
+                    }
+                    if (pnl != nullptr) {
+                        int t = (int)pnl[x3 + c] * gainN / 100;
+                        if (t > 64) t = 64 + (t - 64) / 2;
+                        else if (t < -64) t = -64 + (t + 64) / 2;
+                        v += t;
+                    }
+                    if (pcl != nullptr) v += (int)pcl[x3 + c] * gainC / 100;
+                    rgb[c] = v;
+                }
+                // 对比度（1/256 定标）→ 饱和度（灰度基准）→ 亮度
+                if (contrast != 0) {
+                    for (int c = 0; c < 3; ++c) {
+                        rgb[c] = ((rgb[c] - 128) * cf >> 8) + 128;
+                    }
+                }
+                if (saturation != 0) {
+                    const int gray = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000;
+                    for (int c = 0; c < 3; ++c) {
+                        rgb[c] = gray + ((rgb[c] - gray) * sf >> 8);
+                    }
+                }
+                if (bright != 0) {
+                    for (int c = 0; c < 3; ++c) rgb[c] += bright;
+                }
+                for (int c = 0; c < 3; ++c) {
+                    const int v = rgb[c];
+                    d[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
+                }
             }
-            if (nl != nullptr) {
-                int nv = (int)nl[o + c] * gainN / 100;
-                if (nv > 64) nv = 64 + (nv - 64) / 2;
-                else if (nv < -64) nv = -64 + (nv + 64) / 2;
-                v += nv;
-            }
-            if (cl != nullptr) {
-                v += (int)cl[o + c] * gainC / 100;
-            }
-            d[c] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t)v);
         }
-    }
+    }, 64);
 }
 
 void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
@@ -1644,20 +1590,10 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
                           libyuv::kFilterBilinear);
     }
 
-    if (aiOn) {
-        // ★ 修复层合成（细节/降噪/去浊，按龄衰减+增益+软限幅）+ AI 档双重精修锐化
-        //   （细锐 3x3 unsharp + Clarity 中频局部对比，比非AI 0.45 强一档）
-        CompositeAiLayers(rgbaBuf_.data(), width_, height_);
-        sharpenRgba(rgbaBuf_.data(), width_, height_, 0.75f);
-        clarityRgba(rgbaBuf_.data(), width_, height_, 0.50f);
-    } else if (mode >= 1) {
-        // ★ 非AI基线锐化（mode≥1 固定生效，滑条全 0 也能看出增强开启；
-        //   否则"非AI增强"与"关闭"肉眼无差别）。用户锐度滑条在其后叠加
-        sharpenRgba(rgbaBuf_.data(), width_, height_, 0.45f);
-    }
-
-    // ★ USB 画面增强（亮度/锐度/画质）：作用于最终画面，叠加层在其后绘制不受影响
-    applyUsbEnhance(rgbaBuf_.data(), width_, height_);
+    // ★ OpenCV5 深度优化：全部逐像素增强合并单趟并行 pass
+    //   （替代旧链路每帧 7~11 趟全帧标量循环 → 2 趟 HAL 滤波 + 1 趟并行合成），
+    //   在缩放入 rgbaBuf_ 之后、叠加绘制之前执行 → 水印/识别框/人脸框不被增强污染
+    ApplyFrameEnhance(rgbaBuf_.data(), width_, height_);
 
     ProcessCommonTail();
 }
