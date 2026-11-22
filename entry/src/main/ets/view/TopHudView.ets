@@ -208,29 +208,6 @@ export struct TopHudView {
         .width('100%')
         .onClick(() => this.onShowPictureSheet?.())
 
-        // ★ 人脸识别 HUD 行：每张人脸一行（彩色圆点 + 摘要 + "详细"链接，父组件轮询刷新）
-        if (this.faceEnabled && this.faceHudRows.length > 0) {
-          Column({ space: 2 }) {
-            ForEach(this.faceHudRows, (r: FaceHudRow) => {
-              Row({ space: 5 }) {
-                Row().width(7).height(7).borderRadius(3.5).backgroundColor(r.color)
-                Text(r.text)
-                  .fontSize(11).fontColor('#B8FFE3').fontWeight(FontWeight.Bold)
-                  .maxLines(1)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .layoutWeight(1)
-                Text('详细')
-                  .fontSize(11).fontColor(r.color).fontWeight(FontWeight.Bold)
-                  .padding({ left: 12, right: 12, top: 4, bottom: 4 })
-                  .borderRadius(12)
-                  .backgroundColor(faceRowBg(r.color))
-                  .border({ width: 1, color: r.color })
-                  .onClick(() => this.onFaceDetail?.(r.idx))
-              }.width('100%').alignItems(VerticalAlign.Center)
-            }, (r: FaceHudRow) => `${r.idx}_${r.text}_${r.color}`)
-          }.width('100%')
-        }
-
         Row({ space: 8 }) {
           // ★ 四徽标统一规格：固定高 28、同圆角/边框/内边距、平分整行宽度，仅配色区分
           Row({ space: 4 }) {
@@ -306,6 +283,30 @@ export struct TopHudView {
             this.onRecognizeTable?.();
           })
         }.width('100%').alignItems(VerticalAlign.Center)
+
+        // ★ 人脸识别 HUD 行：移至 YOLO/OCR 按钮行下方，识别数据顺序统一为 人脸→YOLO→OCR；
+        //   每张人脸一行（彩色圆点 + 摘要 + "详细"链接，父组件轮询刷新），与按钮行多留间隔
+        if (this.faceEnabled && this.faceHudRows.length > 0) {
+          Column({ space: 2 }) {
+            ForEach(this.faceHudRows, (r: FaceHudRow) => {
+              Row({ space: 5 }) {
+                Row().width(7).height(7).borderRadius(3.5).backgroundColor(r.color)
+                Text(r.text)
+                  .fontSize(11).fontColor('#B8FFE3').fontWeight(FontWeight.Bold)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .layoutWeight(1)
+                Text('详细')
+                  .fontSize(11).fontColor(r.color).fontWeight(FontWeight.Bold)
+                  .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+                  .borderRadius(12)
+                  .backgroundColor(faceRowBg(r.color))
+                  .border({ width: 1, color: r.color })
+                  .onClick(() => this.onFaceDetail?.(r.idx))
+              }.width('100%').alignItems(VerticalAlign.Center)
+            }, (r: FaceHudRow) => `${r.idx}_${r.text}_${r.color}`)
+          }.width('100%').margin({ top: 5 })
+        }
 
         if (this.yoloEnabled && this.mergedList.length > 0) {
           Divider().color('rgba(255,255,255,0.1)').margin({ top: 1, bottom: 1 })
