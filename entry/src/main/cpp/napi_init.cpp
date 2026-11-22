@@ -700,9 +700,36 @@ static napi_value InitOcr(napi_env env, napi_callback_info info) {
     return promise;
 }
 
-static napi_value ReleaseOcr(napi_env env, napi_callback_info) {
+// ★ 异步释放 OCR 引擎：release() 内部 join OCR worker（可能正跑长推理），
+//   同步调用会卡主线程 >6s 触发 appfreeze，必须放到 napi 异步线程执行
+struct OcrReleaseCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+};
+
+static void OcrReleaseExecute(napi_env env, void *data) {
     ocr_bridge::release();
-    return nullptr;
+}
+
+static void OcrReleaseComplete(napi_env env, napi_status status, void *data) {
+    auto *ctx = static_cast<OcrReleaseCtx *>(data);
+    napi_value result = nullptr;
+    napi_get_undefined(env, &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+static napi_value ReleaseOcr(napi_env env, napi_callback_info) {
+    auto *ctx = new OcrReleaseCtx();
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "releaseOcr", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName,
+                           OcrReleaseExecute, OcrReleaseComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
 }
 
 static napi_value SetOcrEnabledNapi(napi_env env, napi_callback_info info) {

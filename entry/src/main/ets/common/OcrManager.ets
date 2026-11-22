@@ -240,9 +240,11 @@ export class OcrManager {
   }
 
   // 切换模型集：释放旧引擎再按新路径初始化
+  // ★ releaseOcr 为异步 join OCR worker（可能耗时数秒），必须 await，
+  //   否则与后续 initOcrPaths 并发会互相争 g_ocr_mutex
   async switchSet(ctx: common.UIAbilityContext, setId: string): Promise<boolean> {
     try { entry.setOcrEnabled(false); } catch (_) {}
-    try { entry.releaseOcr(); } catch (_) {}
+    try { await entry.releaseOcr(); } catch (_) {}
     this.inited = false;
     this.initedSetId = '';
     return this.initSet(ctx, setId);
