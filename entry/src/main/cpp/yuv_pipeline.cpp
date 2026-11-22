@@ -490,6 +490,9 @@ bool YuvPipeline::CreateReceiver(int width, int height, std::string &outSurfaceI
 void YuvPipeline::Start() {
     if (!receiver_ || running_) return;
     gActivePipeline = this;
+    // ★ 防冲突：限制本库 OpenCV parallel_for_ 线程池（默认=全部核心），
+    //   避免帧增强/SR 并行条带与 ORT 推理线程（YOLO/人脸/OCR）总和超额抢占 CPU
+    cv::setNumThreads(4);
 
     OH_ImageReceiverNative_On(receiver_, [](OH_ImageReceiverNative *) {
         if (gActivePipeline) gActivePipeline->OnImageArrival();
@@ -1035,6 +1038,8 @@ bool YuvPipeline::ConfigureExternal(int width, int height) {
 void YuvPipeline::StartExternal() {
     if (running_) return;
     gActivePipeline = this;
+    // ★ 防冲突：限制 OpenCV parallel_for_ 线程池（同 Start()，外部/UVC 模式）
+    cv::setNumThreads(4);
     running_ = true;
 
     inferRunning_.store(true);

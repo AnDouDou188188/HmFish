@@ -3028,6 +3028,8 @@ struct Index {
         ocrModelName: this.shortOcrSetName(),
         faceEnabled: this.faceEnabled,
         faceHudRows: this.faceHudRows,
+        // ★ 画面徽标按增强模式变色区分（0关/1非AI/2 AI）
+        usbEnhanceMode: this.usbEnhanceMode,
         onFaceDetail: (idx: number): void => { this.openFaceDetail(idx); },
         onCameraSelect: (pos: number): void => { this.selectCamera(pos); },
         // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口

@@ -60,6 +60,8 @@ export struct TopHudView {
   // ★ 人脸识别开关 + 每人脸一行摘要（父组件轮询刷新；点"详细"弹详情面板）
   @Prop faceEnabled: boolean = false;
   @Prop faceHudRows: FaceHudRow[] = [];
+  // ★ 画面增强模式（画面徽标按设置变色区分）：0关/1非AI/2 AI增强
+  @Prop usbEnhanceMode: number = 0;
 
   onCameraSelect?: (pos: number) => void;
   // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口
@@ -249,16 +251,23 @@ export struct TopHudView {
           .justifyContent(FlexAlign.Center)
           .onClick(() => this.onShowPowerSheet?.())
 
-          // ★ 画面设置徽标：USB增强/识别框/人脸识别统一入口
+          // ★ 画面设置徽标：按增强模式变色变字区分（灰=关/青=非AI增强/紫=AI增强），
+          //   一眼看出当前画面增强档位，点开弹设置
           Row({ space: 2 }) {
             Text('⚙').fontSize(10).fontColor('#FFFFFF')
-            Text('画面').fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).maxLines(1)
+            Text(this.usbEnhanceMode === 2 ? '画面·AI' : (this.usbEnhanceMode === 1 ? '画面·增' : '画面'))
+              .fontSize(10).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).maxLines(1)
           }
           .height(28)
           .padding({ left: 2, right: 2 })
           .borderRadius(9)
-          .border({ width: 1, color: 'rgba(255,255,255,0.15)' })
-          .backgroundColor('rgba(0,229,255,0.5)')
+          .border({
+            width: 1,
+            color: this.usbEnhanceMode === 2 ? 'rgba(191,90,242,0.8)' :
+              (this.usbEnhanceMode === 1 ? 'rgba(0,229,255,0.55)' : 'rgba(255,255,255,0.15)')
+          })
+          .backgroundColor(this.usbEnhanceMode === 2 ? 'rgba(191,90,242,0.6)' :
+            (this.usbEnhanceMode === 1 ? 'rgba(0,229,255,0.5)' : 'rgba(255,255,255,0.1)'))
           .layoutWeight(1)
           .justifyContent(FlexAlign.Center)
           .onClick(() => this.onShowPictureSheet?.())

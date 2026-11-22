@@ -1,6 +1,10 @@
 # HmFish — 鸿蒙智能探鱼相机 / Smart Fishing Camera for HarmonyOS
 
-![Version](https://img.shields.io/badge/version-2.0-blue) ![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-green) ![Offline](https://img.shields.io/badge/inference-100%25%20on--device-orange)
+![Version](https://img.shields.io/badge/version-2.1-blue) ![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-green) ![Offline](https://img.shields.io/badge/inference-100%25%20on--device-orange)
+
+> **v2.1 OCR 提效与稳定性 / OCR efficiency & stability**：OpenCV5 静帧门控（64×64 缩略图比对，画面不变不重复推理）· OCR 自适应预处理（暗光 gamma 提亮 + 低对比度直方图裁剪拉伸，普通/票据两种模式共用，低质量帧识别率提升）· 推理前降采样长边 1024 · 模型切换不再卡死（释放引擎移出主线程，修复切换时 appfreeze 闪退）· 表格识别占用引擎时 OCR 自动让路（try-lock 跳过，不抢占 CPU）· OpenCV 线程池上限 4（与 YOLO/人脸/SR 线程预算隔离）· 画面徽标按增强模式变色区分（灰=关/青=增强/紫=AI）· PictureSheet"完成"按钮提交滑条并关闭
+>
+> **v2.1 OCR efficiency & stability**: OpenCV5 static-scene gating (64×64 thumbnail diff, no re-inference on unchanged frames) · adaptive OCR preprocessing (dark gamma boost + low-contrast histogram clip-stretch, shared by both OCR model sets) · pre-inference downscale to 1024 long side · no more appfreeze when switching OCR models (engine release moved off the main thread) · OCR worker yields to in-flight table recognition via try-lock · OpenCV thread pool capped at 4 (isolated budget vs YOLO/face/SR threads) · picture badge recolors by enhancement mode (gray=off / cyan=enhance / purple=AI) · PictureSheet "Done" button commits sliders and closes
 
 > **v2.0 全面升级 / Major v2.0 upgrade**：OpenCV 4.12 → **5.1.0**（源码交叉编译，NEON/FP16 + carotene/KleidiCV 加速 HAL）· 全部相机 AI 画质修复层架构（超分细节 / AI 降噪 / 水下去浊 / 色彩还原，四参数独立调节）· 表格识别阶段事件实时预览 · 画面设置全部即时持久化 · 人脸全参数（年龄/颜值总分/7 分项）7 样本环形中值滤波稳定输出 · HUD 识别数据统一排序（人脸 → YOLO → OCR）· 位置行移入底部面板
 >

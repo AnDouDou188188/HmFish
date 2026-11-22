@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <condition_variable>
 #include <deque>
@@ -25,7 +26,7 @@
 
 namespace rapidocr_wrapper {
 
-    static std::mutex g_ocr_mutex;
+    static std::timed_mutex g_ocr_mutex;
     static std::unique_ptr<OcrLite> g_ocr;
     static std::atomic<bool> g_ready(false);
     static std::atomic<bool> g_enabled(false);
@@ -118,6 +119,84 @@ namespace rapidocr_wrapper {
         }
     }
 
+    // ★ OpenCV5 场景门控：64×64 灰度缩略图比对（INTER_AREA + absdiff），
+    //   静态场景不重复推理（上次结果保留显示）→ 大幅省电提速；
+    //   缩略图只在触发推理时更新，缓慢连续移动也能累计越过阈值
+    static std::mutex g_thumb_mutex;
+    static cv::Mat g_last_thumb;
+    static std::atomic<bool> g_scene_reset(true);
+
+    static bool sceneChanged(const cv::Mat &rgba) {
+        cv::Mat thumb;
+        cv::resize(rgba, thumb, cv::Size(64, 64), 0, 0, cv::INTER_AREA);
+        cv::Mat gray;
+        cv::cvtColor(thumb, gray, cv::COLOR_RGBA2GRAY);
+        std::lock_guard<std::mutex> lk(g_thumb_mutex);
+        if (!g_scene_reset.load() && !g_last_thumb.empty()) {
+            cv::Mat diff;
+            cv::absdiff(gray, g_last_thumb, diff);
+            // 均值差 < 4/255 视为画面未变（HUD 水印等固定内容不影响灰度差）
+            if (cv::mean(diff)[0] < 4.0) return false;
+        }
+        g_last_thumb = gray;
+        g_scene_reset.store(false);
+        return true;
+    }
+
+    // ★ OpenCV5 自适应预处理（普通/票据两种模式共用，提升低质量帧识别率）：
+    //   ① 暗光 gamma 提亮（LUT，NEON 加速）
+    //   ② 低对比度直方图 1% 裁剪线性拉伸（calcHist + LUT）
+    static void enhanceForOcr(cv::Mat &bgr) {
+        cv::Mat gray;
+        cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+        cv::Scalar mean, stddev;
+        cv::meanStdDev(gray, mean, stddev);
+        // ① 暗光：gamma = 1 + (65-均值)/60，均值 5 时约 2.0 封顶
+        if (mean[0] < 65.0) {
+            double gamma = 1.0 + (65.0 - mean[0]) / 60.0;
+            if (gamma > 2.0) gamma = 2.0;
+            cv::Mat lut(1, 256, CV_8U);
+            uint8_t *p = lut.ptr<uint8_t>(0);
+            for (int i = 0; i < 256; i++)
+                p[i] = cv::saturate_cast<uint8_t>(std::pow(i / 255.0, 1.0 / gamma) * 255.0);
+            cv::LUT(bgr, lut, bgr);
+            cv::cvtColor(bgr, gray, cv::COLOR_BGR2GRAY);
+            cv::meanStdDev(gray, mean, stddev);
+        }
+        // ② 低对比度：标准差 < 42 时按 1%/99% 分位裁剪拉伸
+        if (stddev[0] > 0.0 && stddev[0] < 42.0) {
+            const int histSize = 256;
+            const int channels[] = {0};
+            const float range[] = {0.f, 256.f};
+            const float *ranges[] = {range};
+            cv::Mat hist;
+            cv::calcHist(&gray, 1, channels, cv::Mat(), hist, 1, &histSize, ranges);
+            const int total = bgr.rows * bgr.cols;
+            const int clipLow = total / 100;    // 1%
+            const int clipHigh = total / 100;   // 1%
+            int lo = 0, hi = 255, acc = 0;
+            for (int i = 0; i < histSize; i++) {
+                acc += (int) hist.at<float>(i);
+                if (acc >= clipLow) { lo = i; break; }
+            }
+            acc = 0;
+            for (int i = histSize - 1; i >= 0; i--) {
+                acc += (int) hist.at<float>(i);
+                if (acc >= clipHigh) { hi = i; break; }
+            }
+            if (hi - lo >= 30) {  // 拉伸空间足够小才做，避免放大噪声
+                const double scale = 255.0 / (double) (hi - lo);
+                cv::Mat lut(1, 256, CV_8U);
+                uint8_t *p = lut.ptr<uint8_t>(0);
+                for (int i = 0; i < 256; i++) {
+                    int v = (int) ((i - lo) * scale);
+                    p[i] = v < 0 ? 0 : (v > 255 ? 255 : (uint8_t) v);
+                }
+                cv::LUT(bgr, lut, bgr);
+            }
+        }
+    }
+
     static void worker_loop() {
         constexpr int kPadding = 50;
         constexpr int kMaxSideLen = 1024;
@@ -135,21 +214,36 @@ namespace rapidocr_wrapper {
             }
             if (job.rgba.empty() || !g_enabled.load()) continue;
 
+            // ★ 提速：先降采样到长边 1024（det 输入上限本就 1024，
+            //   INTER_AREA 缩小质量最优），cvtColor/预处理/推理全在小图上跑
+            cv::Mat work = job.rgba;
+            const int maxSide = std::max(work.cols, work.rows);
+            if (maxSide > kMaxSideLen) {
+                const double s = (double) kMaxSideLen / (double) maxSide;
+                cv::resize(work, work, cv::Size(), s, s, cv::INTER_AREA);
+            }
+
             cv::Mat bgr;
             try {
-                if (job.rgba.channels() == 4)
-                    cv::cvtColor(job.rgba, bgr, cv::COLOR_RGBA2BGR);
-                else
-                    bgr = job.rgba.clone();
+                cv::cvtColor(work, bgr, cv::COLOR_RGBA2BGR);
             } catch (const cv::Exception &e) {
                 LOGE("ocr cvtColor: %{public}s", e.what());
                 continue;
+            }
+            // ★ 自适应预处理（暗光提亮/对比度拉伸），低质量帧识别率提升
+            try {
+                enhanceForOcr(bgr);
+            } catch (const cv::Exception &e) {
+                LOGE("ocr enhance: %{public}s", e.what());
             }
 
             OcrResult result;
             bool ok = false;
             {
-                std::lock_guard<std::mutex> lk(g_ocr_mutex);
+                // ★ 防冲突：表格识别占用引擎（持有 g_ocr_mutex 做 crop OCR）时
+                //   try_lock 150ms 失败即跳过本轮（上次结果保留显示），不排长队抢占 CPU
+                std::unique_lock<std::timed_mutex> lk(g_ocr_mutex, std::defer_lock);
+                if (!lk.try_lock_for(std::chrono::milliseconds(150))) continue;
                 if (!g_ocr || !g_enabled.load()) continue;
                 try {
                     result = g_ocr->detect(bgr, kPadding, kMaxSideLen,
@@ -211,6 +305,9 @@ namespace rapidocr_wrapper {
         LOGI("ocr init: cls=%{public}s", clsPath.c_str());
         LOGI("ocr init: rec=%{public}s", recPath.c_str());
         LOGI("ocr init: keys=%{public}s", keysPath.c_str());
+        // ★ 防冲突：限制本库 OpenCV parallel_for_ 线程池（默认=全部核心），
+        //   避免与 ORT 推理线程/YOLO/人脸/SR 线程总和超额抢占 CPU
+        cv::setNumThreads(4);
 
         try {
             auto ocr = std::make_unique<OcrLite>();
@@ -225,7 +322,7 @@ namespace rapidocr_wrapper {
                 return false;
             }
             {
-                std::lock_guard<std::mutex> lk(g_ocr_mutex);
+                std::lock_guard<std::timed_mutex> lk(g_ocr_mutex);
                 g_ocr = std::move(ocr);
             }
             g_running.store(true);
@@ -253,7 +350,7 @@ namespace rapidocr_wrapper {
             g_queue.clear();
         }
         {
-            std::lock_guard<std::mutex> lk(g_ocr_mutex);
+            std::lock_guard<std::timed_mutex> lk(g_ocr_mutex);
             g_ocr.reset();
         }
         {
@@ -287,6 +384,9 @@ namespace rapidocr_wrapper {
             }
             LOGI("ocr disabled: queue/result cleared");
         } else {
+            // 开启后强制立即识别一次（绕过静帧门控）
+            g_scene_reset.store(true);
+            g_last_trigger_ms.store(0);
             LOGI("ocr enabled");
         }
     }
@@ -300,6 +400,9 @@ namespace rapidocr_wrapper {
         // 低频节奏 + 结果保留显示，形成"延迟识别"效果
         if (now - last < g_trigger_interval_ms.load()) return;
         g_last_trigger_ms.store(now);
+
+        // ★ 静帧门控：画面无变化不重复推理（上次结果保留显示）
+        if (!sceneChanged(rgba)) return;
 
         OcrJob job;
         job.rgba = rgba.clone();
@@ -328,6 +431,8 @@ namespace rapidocr_wrapper {
         if (dbScore >= 0.1f && dbScore <= 0.9f) g_db_score.store(dbScore);
         if (dbBox >= 0.1f && dbBox <= 0.9f) g_db_box.store(dbBox);
         if (unclip >= 1.0f && unclip <= 3.0f) g_unclip.store(unclip);
+        // 参数变化后强制重新识别一次（绕过静帧门控）
+        g_scene_reset.store(true);
     }
 
     void setNumThreads(int n) {
@@ -356,6 +461,9 @@ namespace rapidocr_wrapper {
     /* ★ 表格结构识别（PP-Structure SLANet） */
 
     bool initTable(const std::string &tableModelPath) {
+        // ★ 防冲突：表格模型初始化也限制 OpenCV 线程池（独立 dlopen 库，
+        //   initPaths 未跑过时兜底）
+        cv::setNumThreads(4);
         std::lock_guard<std::mutex> lk(g_table_mutex);
         if (g_table && g_table->isReady()) return true;
         auto net = std::make_unique<table_net::TableNet>();
@@ -462,7 +570,7 @@ namespace rapidocr_wrapper {
             const int oh = std::min(bgr.rows - oy, (int) (ty1 - ty0 + 2 * padY) + 1);
             if (ow > 8 && oh > 8) {
                 const cv::Mat crop = bgr(cv::Rect(ox, oy, ow, oh)).clone();
-                std::lock_guard<std::mutex> lk(g_ocr_mutex);
+                std::lock_guard<std::timed_mutex> lk(g_ocr_mutex);
                 if (g_ocr) {
                     try {
                         // detect 返回的 boxPoint 已扣 padding（crop 内坐标），加回 (ox, oy) 即工作图坐标
