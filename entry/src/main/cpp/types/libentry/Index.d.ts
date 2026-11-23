@@ -62,6 +62,15 @@ export const setOcrNumThreads: (n: number) => void;
 export const initTable: (tableModelPath: string) => Promise<boolean>;
 export const recognizeTable: (outDir: string,
   onEvent?: (stage: number, path: string) => void) => Promise<string>;
+// ★ AI 旧照片高清彩色修复（相册选择 → 去噪 + 超分 + 褪色修复，全端侧本地）：
+//   buf=输入像素（w*h*4 字节），bgra=输入字节序是否 BGRA_8888；
+//   返回 {buf,w,h} 输出恒 RGBA_8888；参数非法或处理失败返回 null
+export interface RestorePhotoResult {
+  buf: ArrayBuffer;
+  w: number;
+  h: number;
+}
+export const restorePhoto: (buf: ArrayBuffer, w: number, h: number, bgra: boolean) => Promise<RestorePhotoResult | null>;
 export const setupExternalPipeline: (w: number, h: number) => boolean;
 export const uvcConnect: (fd: number, vid: number, pid: number, busnum: number, devaddr: number) => boolean;
 export const uvcStartStreaming: (w: number, h: number, fps: number) => boolean;

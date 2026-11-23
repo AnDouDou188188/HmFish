@@ -431,6 +431,9 @@ struct Index {
   // ★ 相册按钮：预览手机相册最新一张照片
   @State albumPreviewVisible: boolean = false;
   @State albumPreviewPm: image.PixelMap | undefined = undefined;
+  // ★ AI 旧照片修复：PhotoViewPicker 多选 URI（≤9 张）与修复进行中标志
+  @State pendingRestoreUris: string[] = [];
+  @State restoring: boolean = false;
   @State autoRecordOn: boolean = false;
 
   // ★ 语音播报（识别设置弹窗开关+音量）+ 自动录像触发音效（开关+自定义 MP3）
@@ -1243,13 +1246,15 @@ struct Index {
     this.speak('已恢复默认值');
   }
 
-  // ★ AI 超分模型：rawfile 提取到沙箱 + native 加载（QuickSRNetMedium x4）
-  private async initSrModel(mode: number): Promise<boolean> {
+  // ★ SR 模型会话已加载标志：srInit 非幂等（重复调用重建 onnxruntime 会话），
+  //   加载成功后置 true，USB 增强（mode 2）与相册 AI 修复共用同一会话不再重载
+  private srModelReady: boolean = false;
+
+  // ★ AI 超分模型确保加载：rawfile 提取到沙箱 + native 加载（QuickSRNetMedium x4）
+  private async ensureSrModel(): Promise<boolean> {
+    if (this.srModelReady) return true;
     try {
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      if (mode !== 2) {
-        return false;
-      }
       const name = 'quicksrnetmedium.onnx';
       const dest = `${ctx.filesDir}/${name}`;
       if (!fs.accessSync(dest)) {
@@ -1258,10 +1263,20 @@ struct Index {
         fs.writeSync(file.fd, data.buffer);
         fs.closeSync(file);
       }
-      return entry.initSr(dest, this.powerThreads);
+      const ok = entry.initSr(dest, this.powerThreads);
+      this.srModelReady = ok;
+      return ok;
     } catch (e) {
       return false;
     }
+  }
+
+  // ★ AI 超分模型加载入口（USB 画质增强 mode 2 专用）：内部复用 ensureSrModel
+  private async initSrModel(mode: number): Promise<boolean> {
+    if (mode !== 2) {
+      return false;
+    }
+    return this.ensureSrModel();
   }
 
   // ★ USB 画质增强模式切换（0关/1非AI/2 AI超分）：AI 模式先加载模型，失败降级非AI增强
@@ -2127,50 +2142,143 @@ struct Index {
     }
   }
 
-  // ★ 相册按钮：预览手机相册最新一张照片（无相册读取权限时回退本应用缓存缩略图）
-  private async openAlbumPreview(): Promise<void> {
-    this.loading = true;
-    this.loadingMsg = '正在加载相册图片…';
-    let pm: image.PixelMap | undefined = undefined;
+  // ★ 相册按钮：系统 PhotoViewPicker 多选照片（免 READ_IMAGEVIDEO 权限，默认打开
+  //   手机相册图库），选中后预览首张并可对全部所选照片执行 AI 高清彩色修复。
+  //   （旧实现 helper.getAssets 直查媒体库需 ACL 受限权限，永远失败导致
+  //    "暂无可预览的相册图片"——改走系统选择器彻底绕开权限问题）
+  private async openAlbumPicker(): Promise<void> {
     try {
-      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const helper = photoAccessHelper.getPhotoAccessHelper(ctx);
-      const predicates = new dataSharePredicates.DataSharePredicates();
-      predicates.orderByDesc(photoAccessHelper.PhotoKeys.DATE_ADDED);
-      predicates.limit(1, 0);
-      const opts: photoAccessHelper.FetchOptions = { fetchColumns: [], predicates: predicates };
-      const result = await helper.getAssets(opts);
-      const asset = await result.getFirstObject();
-      // 用大尺寸缩略图做预览：PhotoAsset.open 在此 SDK 不存在，
-      // getReadOnlyFd 已废弃且需 READ_IMAGEVIDEO（ACL 未配），getThumbnail 已验证可用
-      pm = await asset.getThumbnail({ width: 1280, height: 1280 });
-      result.close();
-    } catch (e) {
-      pm = undefined;
-    }
-    if (pm) {
+      const photoPicker = new photoAccessHelper.PhotoViewPicker();
+      const selectOpt = new photoAccessHelper.PhotoSelectOptions();
+      selectOpt.MIMEType = photoAccessHelper.PhotoViewMIMETypes.IMAGE_TYPE;
+      selectOpt.maxSelectNumber = 9;
+      const res: photoAccessHelper.PhotoSelectResult = await photoPicker.select(selectOpt);
+      if (!res.photoUris || res.photoUris.length === 0) return;
+      this.pendingRestoreUris = res.photoUris;
+      // 预览首张（长边 ≤720 解码，与修复流水线输入同规格）
+      const pm = await this.decodeForRestore(res.photoUris[0]);
+      if (!pm) {
+        this.pendingRestoreUris = [];
+        this.showToast('图片解码失败');
+        return;
+      }
       this.albumPreviewPm = pm;
       this.albumPreviewVisible = true;
-    } else {
-      // 无相册读取权限 → 回退本应用缓存缩略图
-      try {
-        const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
-        const path = `${ctx.filesDir}/album_thumb.jpg`;
-        if (fs.accessSync(path)) {
-          const file = fs.openSync(path, fs.OpenMode.READ_ONLY);
-          const source = image.createImageSource(file.fd);
-          this.albumPreviewPm = await source.createPixelMap();
-          await source.release();
-          fs.closeSync(file);
-          this.albumPreviewVisible = true;
-        } else {
-          this.showToast('暂无可预览的相册图片');
-        }
-      } catch (_) {
-        this.showToast('暂无可预览的相册图片');
-      }
+    } catch (e) {
+      this.showToast('打开相册选择器失败');
     }
-    this.loading = false;
+  }
+
+  // ★ 解码所选照片：等比缩放至长边 ≤720（SR 全帧 onnxruntime 推理的输入上限，
+  //   同时控制 readPixelsToBuffer 内存），输出像素图供预览与修复共用
+  private async decodeForRestore(uri: string): Promise<image.PixelMap | undefined> {
+    try {
+      const source = image.createImageSource(uri);
+      const info = await source.getImageInfo();
+      const ow = info.size.width;
+      const oh = info.size.height;
+      if (ow <= 0 || oh <= 0) {
+        await source.release();
+        return undefined;
+      }
+      // 等比缩放：目标 desiredSize 按原图宽高比计算，避免拉伸变形
+      const ratio = Math.max(ow, oh) > 720 ? 720 / Math.max(ow, oh) : 1;
+      const dw = Math.max(2, Math.round(ow * ratio));
+      const dh = Math.max(2, Math.round(oh * ratio));
+      const pm = await source.createPixelMap({
+        desiredSize: { width: dw, height: dh }
+      });
+      await source.release();
+      return pm;
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  // ★ 单张照片 AI 修复全链路：解码 ≤720 → readPixelsToBuffer → native
+  //   restorePhoto（去噪+超分×4+褪色修复）→ RGBA 像素图 → JPEG 95 → 入系统相册。
+  //   isFirst：首张成功后同步刷新预览图与缩略图缓存（立即看到修复效果）
+  private async restoreOnePhoto(ctx: common.UIAbilityContext, uri: string, isFirst: boolean): Promise<boolean> {
+    const pm = await this.decodeForRestore(uri);
+    if (!pm) return false;
+    let outPath: string = '';
+    try {
+      // ① 读取像素：按实际 pixelFormat 判断字节序（部分设备解码为 BGRA_8888）
+      const info = await pm.getImageInfo();
+      const w = info.size.width;
+      const h = info.size.height;
+      const isBgra = info.pixelFormat === image.PixelMapFormat.BGRA_8888;
+      const buf = new ArrayBuffer(w * h * 4);
+      await pm.readPixelsToBuffer(buf);
+      // ② native AI 修复（异步数秒，Promise 回调不阻塞 UI）
+      const r = await entry.restorePhoto(buf, w, h, isBgra);
+      if (!r || !r.buf || r.w <= 0 || r.h <= 0) return false;
+      const outPm = image.createPixelMapSync(r.buf, {
+        size: { width: r.w, height: r.h },
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888
+      });
+      // ③ JPEG 编码到沙箱缓存（quality 95 兼顾老照片细节与体积）
+      outPath = `${ctx.cacheDir}/restore_${Date.now()}.jpg`;
+      const file = fs.openSync(outPath, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+      const packer = image.createImagePacker();
+      await packer.packToFile(outPm, file.fd, { format: 'image/jpeg', quality: 95 });
+      packer.release();
+      fs.closeSync(file);
+      // ④ 入系统相册（复用截图保存链路：直接入库 + 授权过期弹窗兜底）
+      const saveRes = await this.media.saveToGallery(ctx, outPath, false);
+      if (!saveRes.success) return false;
+      if (isFirst) {
+        // 首张：更新预览为修复结果 + 刷新缩略图（解码大图做缓存）
+        this.albumPreviewPm = outPm;
+        try { fs.copyFileSync(outPath, `${ctx.filesDir}/album_thumb.jpg`); } catch (_) {}
+        this.loadCachedAlbumThumb();
+      } else {
+        outPm.release();
+      }
+      return true;
+    } catch (e) {
+      return false;
+    } finally {
+      if (outPath) { try { fs.unlinkSync(outPath); } catch (_) {} }
+      pm.release();
+    }
+  }
+
+  // ★ AI 高清彩色修复入口：SR 模型懒加载 → 逐张修复入相册 → 汇总提示。
+  //   修复 = 边缘保持去噪 + AI 超分×4 高清 + 褪色修复（白平衡/对比度/饱和度）
+  private async startPhotoRestore(): Promise<void> {
+    if (this.restoring) return;
+    const uris = this.pendingRestoreUris;
+    if (uris.length === 0) return;
+    this.restoring = true;
+    this.loading = true;
+    let okCount = 0;
+    try {
+      this.loadingMsg = 'AI 修复模型加载中…';
+      const srOk = await this.ensureSrModel();
+      if (!srOk) {
+        // 模型加载失败：仍继续（native 端跳过超分，仅去噪+褪色修复）
+        this.showToast('超分模型加载失败，本次仅去噪与色彩修复');
+      }
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      for (let i = 0; i < uris.length; i++) {
+        this.loadingMsg = `AI 高清彩色修复中… (${i + 1}/${uris.length})`;
+        const ok = await this.restoreOnePhoto(ctx, uris[i], i === 0);
+        if (ok) okCount++;
+      }
+      if (okCount > 0) {
+        this.showToast(`已完成 ${okCount}/${uris.length} 张修复并保存到相册`);
+        this.speak(`修复完成${okCount}张`);
+        this.refreshAlbumThumb();
+      } else {
+        this.showToast('修复失败，请重试');
+      }
+      this.albumPreviewVisible = false;
+      this.pendingRestoreUris = [];
+    } finally {
+      this.restoring = false;
+      this.loading = false;
+    }
   }
 
   private pad2(n: number): string { return n < 10 ? `0${n}` : `${n}`; }
@@ -3324,7 +3432,7 @@ struct Index {
         onDepthLongPress: (): void => { this.depthSheetVisible = true; },
         onMotionToggle: (): void => { this.currentMode = '运动'; this.toggleMotion(); },
         onMotionLongPress: (): void => { this.motionSheetVisible = true; },
-        onAlbumPreview: (): void => { this.openAlbumPreview(); },
+        onAlbumPreview: (): void => { this.openAlbumPicker(); },
         onShowToast: (msg: string): void => { this.showToast(msg); },
         onZoomChange: (v: number): void => {
           this.zoomRatio = v;
@@ -3455,11 +3563,12 @@ struct Index {
         })
       }
 
-      // ★ 相册最新照片预览（点击底部相册按钮弹出，无权限时回退缓存缩略图）
+      // ★ 相册照片预览与 AI 修复（PhotoViewPicker 多选后弹出）：预览首张 +
+      //   "AI 高清彩色修复"批量处理全部所选（去噪+超分×4+褪色修复，端侧本地）
       if (this.albumPreviewVisible && this.albumPreviewPm) {
         Column() {
           Row() {
-            Text('相册最新照片')
+            Text(`已选 ${this.pendingRestoreUris.length} 张照片`)
               .fontSize(16).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).layoutWeight(1)
             Text('✕').fontSize(18).fontColor('#B0B6C0')
               .padding({ left: 12, right: 4, top: 4, bottom: 4 })
@@ -3474,15 +3583,24 @@ struct Index {
             .width('92%')
             .margin({ top: 8, bottom: 12 })
 
-          Button('打开相册')
-            .fontSize(14).fontColor('#003B44')
-            .backgroundColor('#00E5FF')
-            .borderRadius(18).height(38).width(140)
-            .margin({ bottom: 26 })
-            .onClick((): void => {
-              this.albumPreviewVisible = false;
-              this.openGallery();
-            })
+          Row({ space: 12 }) {
+            Button('打开相册')
+              .fontSize(14).fontColor('#E6F7FF')
+              .backgroundColor('rgba(0,229,255,0.16)')
+              .borderRadius(18).height(38).layoutWeight(1)
+              .onClick((): void => {
+                this.albumPreviewVisible = false;
+                this.openGallery();
+              })
+            Button('AI 高清彩色修复')
+              .fontSize(14).fontColor(this.restoring ? '#80A0AA' : '#003B44')
+              .backgroundColor(this.restoring ? 'rgba(0,229,255,0.4)' : '#00E5FF')
+              .borderRadius(18).height(38).layoutWeight(1.6)
+              .enabled(!this.restoring)
+              .onClick((): void => { this.startPhotoRestore(); })
+          }
+          .width('92%')
+          .margin({ bottom: 26 })
         }
         .width('100%').height('100%')
         .backgroundColor('rgba(0,0,0,0.92)')

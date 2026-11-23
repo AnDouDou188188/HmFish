@@ -27,6 +27,10 @@
 #include <atomic>
 #include <hilog/log.h>
 #include <native_window/external_window.h>
+// ★ 旧照片 AI 修复用（bilateralFilter 去噪 / cvtColor）：OpenCV 头为全局
+//   include 目录（见 CMakeLists include_directories），entry 链接 imgproc+core 静态库
+#include "opencv2/core.hpp"
+#include "opencv2/imgproc.hpp"
 
 #undef LOG_DOMAIN
 #undef LOG_TAG
@@ -1296,6 +1300,222 @@ static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ═══════════ AI 旧照片高清彩色修复（相册图库 → restorePhoto）═══════════
+// 处理流水线（全部端侧本地，无云端上传）：
+//   ① 字节序统一：部分设备 readPixelsToBuffer 输出 BGRA_8888，按调用方标志转 RGBA
+//   ② 边缘保持去噪：cv::bilateralFilter（5 邻域 / sigma 40）抑制老照片颗粒与扫描噪点
+//   ③ AI 超分 ×N：quicksrnetmedium.onnx（libocr.so 内 onnxruntime CPU 推理），
+//      模型未就绪或推理失败时优雅回退原尺寸（修复流程不中断）
+//   ④ 褪色修复（纯手写两遍像素循环，无额外依赖）：
+//      4a. 灰世界自动白平衡——R/G/B 通道均值拉齐到总均值，增益夹 [0.8,1.3]
+//          防极端场景色相翻转（典型老照片黄褐偏色由此去除）
+//      4b. 亮度 0.5%~99.5% 百分位裁剪 + 线性拉伸——褪色发灰照片恢复黑白场对比度
+//          （直方图区间 <30 灰阶时放弃拉伸，避免放大平坦图噪声）
+//      4c. 饱和度 ×1.25——围绕亮度轴推离，色彩回鲜但保留明暗层次
+// 输出恒为 RGBA_8888 紧凑像素，供 ArkTS createPixelMapSync + JPEG 编码入库。
+
+// ★ RestorePhotoCtx：修复任务上下文——JS 线程拷入输入像素，napi 工作线程
+//   执行全流水线，Complete 回调（JS 线程）回传输出像素并释放资源
+struct RestorePhotoCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::vector<uint8_t> in;    // 输入像素（bgra=true 时为 BGRA 字节序，否则 RGBA）
+    int w = 0;
+    int h = 0;
+    bool bgra = false;
+    std::vector<uint8_t> out;   // 输出像素（恒 RGBA_8888）
+    int outW = 0;
+    int outH = 0;
+    bool ok = false;
+};
+
+// ★ RestorePhotoExecute：修复执行体（napi 工作线程，数秒级耗时，不阻塞 UI）
+static void RestorePhotoExecute(napi_env env, void *data) {
+    auto *ctx = static_cast<RestorePhotoCtx *>(data);
+    ctx->ok = false;
+    const int w = ctx->w;
+    const int h = ctx->h;
+    if (w < 2 || h < 2 || ctx->in.size() != static_cast<size_t>(w) * h * 4) {
+        return;
+    }
+
+    // ① BGRA → RGBA 统一字节序（仅交换 R/B 两个字节，A 不动）
+    if (ctx->bgra) {
+        for (size_t i = 0; i < ctx->in.size(); i += 4) {
+            std::swap(ctx->in[i], ctx->in[i + 2]);
+        }
+    }
+
+    // ② 边缘保持去噪：RGBA→BGR → bilateralFilter → 回 RGBA（in 缓冲就地更新）
+    cv::Mat rgbaIn(h, w, CV_8UC4, ctx->in.data());
+    cv::Mat bgr;
+    cv::cvtColor(rgbaIn, bgr, cv::COLOR_RGBA2BGR);
+    cv::Mat bgrDenoised;
+    cv::bilateralFilter(bgr, bgrDenoised, 5, 40.0, 40.0);
+    cv::cvtColor(bgrDenoised, rgbaIn, cv::COLOR_BGR2RGBA);
+
+    // ③ AI 超分 ×N：模型就绪时放大，失败/未就绪回退原尺寸
+    const int scale = ocr_bridge::srIsReady() ? ocr_bridge::srScale() : 0;
+    if (scale >= 2) {
+        ctx->outW = w * scale;
+        ctx->outH = h * scale;
+        ctx->out.resize(static_cast<size_t>(ctx->outW) * ctx->outH * 4);
+        if (!ocr_bridge::srUpscale(rgbaIn.data, w, h, ctx->out.data(),
+                                   ctx->outW, ctx->outH)) {
+            OH_LOG_WARN(LOG_APP, "restorePhoto: srUpscale failed, fallback to original size");
+            ctx->outW = w;
+            ctx->outH = h;
+            ctx->out.assign(ctx->in.begin(), ctx->in.end());
+        }
+    } else {
+        ctx->outW = w;
+        ctx->outH = h;
+        ctx->out.assign(ctx->in.begin(), ctx->in.end());
+    }
+
+    // ④ 褪色修复——第一遍：统计直方图 + 三通道均值（灰世界白平衡与百分位拉伸依据）
+    const size_t px = static_cast<size_t>(ctx->outW) * ctx->outH;
+    uint8_t *p = ctx->out.data();
+    int hist[256] = {0};
+    double sumR = 0.0;
+    double sumG = 0.0;
+    double sumB = 0.0;
+    for (size_t i = 0; i < px; i++, p += 4) {
+        // 整数近似亮度（R30 G59 B11 /100），避免浮点直方图
+        hist[(p[0] * 30 + p[1] * 59 + p[2] * 11) / 100]++;
+        sumR += p[0];
+        sumG += p[1];
+        sumB += p[2];
+    }
+    const double meanAll = (sumR + sumG + sumB) / (3.0 * static_cast<double>(px));
+    // 4a. 灰世界增益：meanAll / 通道均值，夹 [0.8, 1.3]（lambda 内联钳制）
+    auto clampGain = [meanAll, px](double chSum) -> float {
+        double g = meanAll / (chSum / static_cast<double>(px) + 1e-6);
+        if (g < 0.8) g = 0.8;
+        if (g > 1.3) g = 1.3;
+        return static_cast<float>(g);
+    };
+    const float gainR = clampGain(sumR);
+    const float gainG = clampGain(sumG);
+    const float gainB = clampGain(sumB);
+    // 4b. 亮度百分位：0.5% 低分位与 99.5% 高分位作为裁剪点
+    const long clipLoCount = static_cast<long>(static_cast<double>(px) * 0.005);
+    const long clipHiCount = static_cast<long>(static_cast<double>(px) * 0.995);
+    int lo = 0;
+    int hi = 255;
+    long acc = 0;
+    for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc >= clipLoCount) { lo = i; break; }
+    }
+    acc = 0;
+    for (int i = 255; i >= 0; i--) {
+        acc += hist[i];
+        if (acc >= px - clipHiCount) { hi = i; break; }
+    }
+    if (hi - lo < 30) {
+        // 拉伸空间不足（近乎纯色/极端曝光图）：放弃拉伸与增益，仅做饱和度微调
+        lo = 0;
+        hi = 255;
+    }
+    const float stretch = 255.0f / static_cast<float>(hi - lo);
+    const float loF = static_cast<float>(lo);
+    // 4c. 第二遍：白平衡 → 亮度拉伸 → 饱和度 1.25x → 钳制写回
+    p = ctx->out.data();
+    for (size_t i = 0; i < px; i++, p += 4) {
+        float r = p[0] * gainR;
+        float g = p[1] * gainG;
+        float b = p[2] * gainB;
+        r = (r - loF) * stretch;
+        g = (g - loF) * stretch;
+        b = (b - loF) * stretch;
+        const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
+        r = lum + (r - lum) * 1.25f;
+        g = lum + (g - lum) * 1.25f;
+        b = lum + (b - lum) * 1.25f;
+        p[0] = r < 0.0f ? 0 : (r > 255.0f ? 255 : static_cast<uint8_t>(r + 0.5f));
+        p[1] = g < 0.0f ? 0 : (g > 255.0f ? 255 : static_cast<uint8_t>(g + 0.5f));
+        p[2] = b < 0.0f ? 0 : (b > 255.0f ? 255 : static_cast<uint8_t>(b + 0.5f));
+    }
+    ctx->ok = true;
+}
+
+// ★ RestorePhotoComplete：完成回调（JS 线程）——resolve {buf,w,h}；
+//   失败 resolve null（调用方按 null 兜底提示），按序清理 async work 与 ctx
+static void RestorePhotoComplete(napi_env env, napi_status status, void *data) {
+    auto *ctx = static_cast<RestorePhotoCtx *>(data);
+    napi_value result = nullptr;
+    if (ctx->ok) {
+        napi_create_object(env, &result);
+        void *abData = nullptr;
+        napi_value ab = nullptr;
+        napi_create_arraybuffer(env, ctx->out.size(), &abData, &ab);
+        if (!ctx->out.empty()) {
+            memcpy(abData, ctx->out.data(), ctx->out.size());
+        }
+        napi_value wv = nullptr;
+        napi_value hv = nullptr;
+        napi_create_int32(env, ctx->outW, &wv);
+        napi_create_int32(env, ctx->outH, &hv);
+        napi_set_named_property(env, result, "buf", ab);
+        napi_set_named_property(env, result, "w", wv);
+        napi_set_named_property(env, result, "h", hv);
+    } else {
+        napi_get_null(env, &result);
+    }
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+// ★ RestorePhoto（ArkTS 调用名：restorePhoto）：单张照片 AI 修复，返回
+//   Promise<{buf: ArrayBuffer, w: number, h: number} | null>。
+//   参数：args[0]=输入像素 ArrayBuffer（w*h*4 字节），args[1]=宽，args[2]=高，
+//   args[3]=是否 BGRA 字节序（image.ImageInfo.pixelFormat === BGRA_8888 时 true）
+static napi_value RestorePhoto(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t w = 0;
+    int32_t h = 0;
+    bool bgra = false;
+    void *data = nullptr;
+    size_t len = 0;
+    if (argc > 1) napi_get_value_int32(env, args[1], &w);
+    if (argc > 2) napi_get_value_int32(env, args[2], &h);
+    if (argc > 3) napi_get_value_bool(env, args[3], &bgra);
+
+    // 参数校验失败：resolve null（ArkTS 侧按修复失败兜底），不 reject 简化调用方
+    if (argc < 3 || w < 2 || h < 2 ||
+        napi_get_arraybuffer_info(env, args[0], &data, &len) != napi_ok || !data ||
+        len != static_cast<size_t>(w) * h * 4) {
+        napi_deferred deferred = nullptr;
+        napi_value promise = nullptr;
+        napi_value nullRes = nullptr;
+        napi_create_promise(env, &deferred, &promise);
+        napi_get_null(env, &nullRes);
+        napi_resolve_deferred(env, deferred, nullRes);
+        return promise;
+    }
+
+    auto *ctx = new RestorePhotoCtx();
+    ctx->w = w;
+    ctx->h = h;
+    ctx->bgra = bgra;
+    // JS 线程内完成输入拷贝（arraybuffer 在工作线程期间可能被调用方释放）
+    ctx->in.assign(static_cast<const uint8_t *>(data),
+                   static_cast<const uint8_t *>(data) + len);
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "restorePhoto", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName,
+                           RestorePhotoExecute, RestorePhotoComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
 // ★ Init：entry 模块初始化回调——把全部导出函数经 napi_property_descriptor
 //   挂载到 exports 对象。每项第一个字符串即 ArkTS 侧 import 'libentry.so' 后
 //   直接调用的方法名（下表为全部 native 能力的唯一权威清单，按功能分组）
@@ -1362,6 +1582,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"setFaceEnabled",       nullptr, SetFaceEnabledNapi,   nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getFaceInfo",          nullptr, GetFaceInfoNapi,      nullptr, nullptr, nullptr, napi_default, nullptr},
         {"recognizeTable",       nullptr, RecognizeTable,       nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"restorePhoto",         nullptr, RestorePhoto,         nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
