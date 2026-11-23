@@ -58,10 +58,12 @@ public:
                      int padding, int maxSideLen,
                      float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle);
 
-    // ★ detect（Mat 版）：完整流水线主入口
+    // ★ detect（Mat 版）：完整流水线主入口；maxDetCandidates 为 det 候选
+    //   封顶（-1 不限，语义见 OcrLite.h）
     OcrResult detect(const cv::Mat &mat,
                      int padding, int maxSideLen,
-                     float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle);
+                     float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle,
+                     int maxDetCandidates = -1);
 
     // ★ detectImageBytes：字节流入口（按 grey 标志解码灰度/彩色）
     OcrResult detectImageBytes(const uint8_t *data, long dataLength, int grey, int padding, int maxSideLen,
@@ -100,10 +102,12 @@ private:
 
     // ★ detect（内部统一版）：路径/Mat 两个入口都汇聚到此，
     //   依次执行 padding→缩放→det→回调→裁行→cls→rec→聚合
+    //   maxDetCandidates：det 候选封顶（-1 不限，语义见 OcrLite.h）
     OcrResult detect(const char *path, const char *imgName,
                      cv::Mat &src, cv::Rect &originRect, ScaleParam &scale,
                      float boxScoreThresh = 0.6f, float boxThresh = 0.3f,
-                     float unClipRatio = 2.0f, bool doAngle = true, bool mostAngle = true);
+                     float unClipRatio = 2.0f, bool doAngle = true, bool mostAngle = true,
+                     int maxDetCandidates = -1);
 };
 
 #endif //__OCR_LITE_IMPL_H__

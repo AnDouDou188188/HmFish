@@ -56,9 +56,16 @@ public:
 
     // ★ detect（Mat 版）：HmFish 主入口——RapidOCR.cpp 以 BGR Mat 直调，
     //   传 padding=50 / maxSideLen=1024 / doAngle=false
+    //   maxDetCandidates：det 候选框数量封顶（-1 不限）。非文字场景（人脸/
+    //   皮肤纹理/水底乱石）DBNet 可能一次给出几十个"伪文本框"，每个都要跑
+    //   一次 CRNN 逐行识别（数十 ms/行）——既拖慢出结果，又与 YOLO/人脸/
+    //   SR 线程抢 CPU 造成互相延迟。>0 时按 det 得分降序保留前 N 个再恢复
+    //   原有阅读顺序；实时识别路径传 20（正常票据行数上限），表格整区域
+    //   OCR 不限（密集表格行数可能超过 20）
     OcrResult detect(const cv::Mat &mat,
                      int padding, int maxSideLen,
-                     float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle);
+                     float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle,
+                     int maxDetCandidates = -1);
 
 private:
     // 实现指针（pImpl 惯用法，构造时 new、析构 delete）

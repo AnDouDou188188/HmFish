@@ -153,6 +153,23 @@ namespace rapidocr_wrapper {
         for (size_t i = 0; i < n; ++i) {
             OcrBox b;
             b.pts = detBoxes[i];
+            // ★ 细碎框过滤：四点外接矩形短边 < 5px（工作图坐标）的细碎候选
+            //   直接丢弃——DbNet 只按"长边 ≥5px"过滤，细长条噪声（人脸皱纹/
+            //   纹理边缘拉出的长条）仍会漏进来。虚线框阶段就拦下，避免垃圾
+            //   框先闪一轮、rec 过滤后才消失的观感。真实文字行在 ≤1024 工作
+            //   图上的高度普遍 ≥8px，5px 门限不会误杀
+            if (!b.pts.empty()) {
+                int minX = b.pts[0].x, minY = b.pts[0].y;
+                int maxX = minX, maxY = minY;
+                for (size_t k = 1; k < b.pts.size(); ++k) {
+                    const cv::Point &pt = b.pts[k];
+                    if (pt.x < minX) minX = pt.x;
+                    if (pt.y < minY) minY = pt.y;
+                    if (pt.x > maxX) maxX = pt.x;
+                    if (pt.y > maxY) maxY = pt.y;
+                }
+                if (std::min(maxX - minX, maxY - minY) < 5) continue;
+            }
             if (inv != 1.0) {
                 for (auto &pt : b.pts) {
                     pt.x = cvRound((double) pt.x * inv);
@@ -301,9 +318,15 @@ namespace rapidocr_wrapper {
         // kPadding：det 输入四边外扩像素——贴边文字感受野不足会检不全，补边提高召回
         // kMaxSideLen：工作图长边上限（DBNet 输入上限本就 1024，再大是浪费）
         // kMaxBoxes：单帧最多发布的框数，防误检风暴拖垮绘制/上层
+        // kMaxDetCandidates：det 候选封顶——非文字场景（前置摄像头人脸/皮肤
+        //   纹理/水底乱石）DBNet 会一次给出几十个"伪文本框"，每个都要跑一次
+        //   CRNN 逐行识别（数十 ms/行）。封顶后误检风暴的 CPU 开销有硬上限，
+        //   与人脸/YOLO 线程的互相抢占（"识别框延迟"的元凶）大幅缓解；
+        //   正常票据行数 ≤20 不受影响（表格路径不走此封顶）
         constexpr int kPadding = 50;
         constexpr int kMaxSideLen = 1024;
         constexpr size_t kMaxBoxes = 30;
+        constexpr int kMaxDetCandidates = 20;
 
         LOGI("ocr worker started");
         while (g_running.load()) {
@@ -357,9 +380,10 @@ namespace rapidocr_wrapper {
                 // ★ det 阶段回调（publishPending）在本线程内触发，先放好回放因子
                 g_box_scale.store(boxScale);
                 try {
+                    // ★ 末参 20：det 候选封顶（见上方 kMaxDetCandidates 注释）
                     result = g_ocr->detect(bgr, kPadding, kMaxSideLen,
                                            g_db_score.load(), g_db_box.load(),
-                                           g_unclip.load(), false, false);
+                                           g_unclip.load(), false, false, kMaxDetCandidates);
                     ok = true;
                 } catch (const std::exception &e) {
                     LOGE("ocr detect exception: %{public}s", e.what());
@@ -380,6 +404,15 @@ namespace rapidocr_wrapper {
             }
 
             // 组装终稿：pts<4 的退化框丢弃；全文把各文本块文字以 \n 拼接
+            // ★ 识别置信度过滤（dropScore，主过滤）：人脸/皮肤纹理/水底乱石
+            //   场景 DBNet 检出的"伪文本行"经 CRNN 识别出的是无意义乱码，
+            //   其逐字符置信度普遍很低（模型对认不出的内容不自信）；真实
+            //   票据文字的 CRNN 均值通常 > 0.7。逐字符置信度均值 <
+            //   kRecDropScore 的框连字带框一起丢弃——前置摄像头人脸场景
+            //   不再刷"垃圾框 + 乱码文字"。0.45 略低于 PaddleOCR 官方默认
+            //   dropScore(0.5)，为暗光/低质量票据留误杀余量；空文字框
+            //   （CTC 全解出 blank，同样多为误检）一并丢弃
+            constexpr float kRecDropScore = 0.45f;
             std::vector<OcrBox> boxes;
             std::string text;
             size_t n = result.textBlocks.size();
@@ -387,6 +420,14 @@ namespace rapidocr_wrapper {
             boxes.reserve(n);
             for (size_t i = 0; i < n; ++i) {
                 const TextBlock &tb = result.textBlocks[i];
+                if (tb.text.empty()) continue;
+                float meanScore = 0.f;
+                if (!tb.charScores.empty()) {
+                    float acc = 0.f;
+                    for (float s : tb.charScores) acc += s;
+                    meanScore = acc / (float) tb.charScores.size();
+                }
+                if (meanScore < kRecDropScore) continue;
                 OcrBox b;
                 b.pts = tb.boxPoint;
                 b.text = tb.text;

@@ -76,9 +76,12 @@ OcrResult OcrLite::detect(const char *path, const char *imgName,
     return pImpl->detect(path, imgName, padding, maxSideLen, boxScoreThresh, boxThresh, unClipRatio, doAngle, mostAngle);
 }
 
-// ★ detect（Mat 版）：转发内存图入口识别（HmFish 主用路径）
+// ★ detect（Mat 版）：转发内存图入口识别（HmFish 主用路径）；
+//   maxDetCandidates 为 det 候选封顶（-1 不限），透传给 impl（语义见 OcrLite.h）
 OcrResult OcrLite::detect(const cv::Mat &mat,
                           int padding, int maxSideLen,
-                          float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle) {
-    return pImpl->detect(mat, padding, maxSideLen, boxScoreThresh, boxThresh, unClipRatio, doAngle, mostAngle);
+                          float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle,
+                          int maxDetCandidates) {
+    return pImpl->detect(mat, padding, maxSideLen, boxScoreThresh, boxThresh, unClipRatio, doAngle, mostAngle,
+                         maxDetCandidates);
 }

@@ -18,6 +18,7 @@
 #include "OcrLiteImpl.h"
 #include "OcrUtils.h"
 #include <stdarg.h> //windows&linux
+#include <algorithm> // std::sort（det 候选封顶按得分排序用）
 
 // ───────────────────────── 生命周期与配置 ─────────────────────────
 
@@ -172,9 +173,9 @@ OcrResult OcrLiteImpl::detectBitmap(uint8_t *bitmapData, int width, int height, 
 
 // ★ detect（Mat 版入口，HmFish 主入口）：内存图直接识别——与文件版逻辑
 //   相同（目标长边取 min(maxSideLen, 原图长边)，padding 计入），path/imgName
-//   传 NULL 表示无调试落盘目录
+//   传 NULL 表示无调试落盘目录；maxDetCandidates 为 det 候选封顶（-1 不限）
 OcrResult OcrLiteImpl::detect(const cv::Mat &mat, int padding, int maxSideLen, float boxScoreThresh, float boxThresh,
-                          float unClipRatio, bool doAngle, bool mostAngle) {
+                          float unClipRatio, bool doAngle, bool mostAngle, int maxDetCandidates) {
     cv::Mat originSrc = mat;
     int originMaxSide = (std::max)(originSrc.cols, originSrc.rows);
     int resize;
@@ -189,7 +190,7 @@ OcrResult OcrLiteImpl::detect(const cv::Mat &mat, int padding, int maxSideLen, f
     ScaleParam scale = getScaleParam(paddingSrc, resize);
     OcrResult result;
     result = detect(NULL, NULL, paddingSrc, paddingRect, scale,
-                    boxScoreThresh, boxThresh, unClipRatio, doAngle, mostAngle);
+                    boxScoreThresh, boxThresh, unClipRatio, doAngle, mostAngle, maxDetCandidates);
     return result;
 }
 
@@ -220,7 +221,8 @@ std::vector<cv::Mat> OcrLiteImpl::getPartImages(cv::Mat &src, std::vector<TextBo
 //   尺寸），最终 TextBlock/OcrResult 输出时统一减去 padding 回到原图坐标
 OcrResult OcrLiteImpl::detect(const char *path, const char *imgName,
                           cv::Mat &src, cv::Rect &originRect, ScaleParam &scale,
-                          float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle) {
+                          float boxScoreThresh, float boxThresh, float unClipRatio, bool doAngle, bool mostAngle,
+                          int maxDetCandidates) {
 
     cv::Mat textBoxPaddingImg = src.clone();
     int thickness = getThickness(src);
@@ -246,6 +248,27 @@ OcrResult OcrLiteImpl::detect(const char *path, const char *imgName,
                textBoxes[i].boxPoint[1].x, textBoxes[i].boxPoint[1].y,
                textBoxes[i].boxPoint[2].x, textBoxes[i].boxPoint[2].y,
                textBoxes[i].boxPoint[3].x, textBoxes[i].boxPoint[3].y);
+    }
+
+    // ★ 候选数封顶（HmFish 定制）：非文字场景（人脸/皮肤纹理/水底乱石）
+    //   DBNet 可能一次给出几十个"伪文本框"，每个框都要跑一次 CRNN 逐行
+    //   识别（数十 ms/行）——既拖慢出结果，又与 YOLO/人脸/SR 线程抢 CPU
+    //   造成互相延迟。maxDetCandidates>0 时按 det 得分降序保留前 N 个候选，
+    //   再按原序号升序恢复（保持"从上到下"的阅读序）；正常票据（通常
+    //   ≤20 行）不受影响，误检风暴的识别开销被硬性封顶。封顶放在
+    //   drawTextBoxes 与 detStageCallback 之前——虚线框阶段同步受益
+    if (maxDetCandidates > 0 && textBoxes.size() > (size_t) maxDetCandidates) {
+        std::vector<size_t> idx(textBoxes.size());
+        for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+        std::sort(idx.begin(), idx.end(), [&textBoxes](size_t a, size_t b) {
+            return textBoxes[a].score > textBoxes[b].score;
+        });
+        idx.resize((size_t) maxDetCandidates);
+        std::sort(idx.begin(), idx.end());
+        std::vector<TextBox> kept;
+        kept.reserve(idx.size());
+        for (size_t i = 0; i < idx.size(); ++i) kept.push_back(textBoxes[idx[i]]);
+        textBoxes = std::move(kept);
     }
 
     // ---------- 第②步：结果图绘制 + det 阶段先出框（HmFish 定制） ----------
