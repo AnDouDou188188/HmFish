@@ -57,6 +57,7 @@ struct DetectItem { float x, y, w, h, score; int label; };
 
 // ★ 人脸识别结果快照（face 工作线程写入，绘制线程/napi 读取）
 struct FaceDrawInfo {
+    int trackId;         // 跨帧跟踪 id（libocr g_tracks 分配，同一张脸持续存在时不变；配色/详情按它认脸）
     float box[4];       // x1,y1,x2,y2（图像坐标）
     float score;        // 检测分
     int gender;         // 0=女 1=男 -1=未知
@@ -379,7 +380,7 @@ private:
     std::vector<uint8_t> faceInPending_;   // 相机线程 → 工作线程
     int faceInW_ = 0, faceInH_ = 0;
     std::vector<uint8_t> faceWork_;        // 工作线程私有
-    std::vector<float> faceOutBuf_;        // 工作线程私有（face_detect_rgba 输出，每脸 223 float）
+    std::vector<float> faceOutBuf_;        // 工作线程私有（face_detect_rgba 输出，每脸 228 float：[0..7]信息 [8..219]106点 [220..226]分项 [227]trackId）
     // 结果快照（faceInfoMutex_ 保护）
     std::mutex faceInfoMutex_;
     std::vector<FaceDrawInfo> faceResults_;

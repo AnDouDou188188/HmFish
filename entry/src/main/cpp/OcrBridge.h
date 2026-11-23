@@ -117,7 +117,7 @@ namespace ocr_bridge {
     // ★ faceRelease：释放人脸模型组
     void faceRelease();
     // 同步检测一帧：facesOut 每脸 223 float（布局见 ocr_c_api.h），返回脸数
-    // ★ faceDetect：一帧同步检测（face 工作线程调用），223 float 布局见 ocr_c_api.h
+    // ★ faceDetect：一帧同步检测（face 工作线程调用），228 float 布局见 ocr_c_api.h
     int faceDetect(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces);
 
 }  // namespace ocr_bridge

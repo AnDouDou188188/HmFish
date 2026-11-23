@@ -28,8 +28,11 @@ export interface DepthRecord {
 }
 
 // ★ 人脸 HUD 行：每张人脸一行（彩色圆点 + 摘要 + "详细"胶囊，点详细弹详情面板）
+//   tid：跨帧跟踪 id（libocr 稳定身份，同脸不变）——"详细"按它找人，
+//   不随检测置信度排序导致的数组下标跳变而弹错人
 export interface FaceHudRow {
   idx: number;
+  tid: number;
   text: string;
   color: string;
 }
@@ -343,9 +346,9 @@ export struct TopHudView {
                   .borderRadius(12)
                   .backgroundColor(faceRowBg(r.color))
                   .border({ width: 1, color: r.color })
-                  .onClick(() => this.onFaceDetail?.(r.idx))
+                  .onClick(() => this.onFaceDetail?.(r.tid > 0 ? r.tid : r.idx))
               }.width('100%').alignItems(VerticalAlign.Center)
-            }, (r: FaceHudRow) => `${r.idx}_${r.text}_${r.color}`)
+            }, (r: FaceHudRow) => `${r.idx}_${r.tid}_${r.text}_${r.color}`)
           }.width('100%').margin({ top: 5 })
         }
 

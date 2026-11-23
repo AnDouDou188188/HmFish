@@ -101,8 +101,12 @@ interface CellParsed {
 
 // ★ 人脸识别 HUD 信息（native getFaceInfo 返回 JSON 的结构）
 interface FaceHudItem {
-  // 人脸序号（=数组位置=连线框配色索引），详情面板/箭头按它取色
+  // 人脸序号（=数组位置，兼容保留）
   i?: number;
+  // ★ 跨帧跟踪 id（libocr g_tracks 分配：同一张脸持续存在时不变，离场 3s 回收
+  //   再入为新 id）。配色/详情面板/箭头跟随一律按 tid 认脸——数组下标随
+  //   检测置信度排序跳变，不能作为身份
+  tid?: number;
   gender: number;
   age: number;
   beauty: number;
@@ -140,8 +144,12 @@ interface FaceScreenRect {
 //   连线框/外框/标注/HUD 圆点/详情箭头/详情面板描边同色
 const FACE_PALETTE: string[] = ['#00EBB2', '#FF9F40', '#50AAFF', '#FF64AA', '#BC8CFF', '#FFD750'];
 
-function faceColorOf(idx: number): string {
-  const i = idx % 6;
+// ★ 按跨帧跟踪 id 取色：key=(tid-1)%6 与 C++ DrawFaceOverlay 的 (trackId-1)%6
+//   完全一致——tid 是稳定身份，配色/箭头/详情不随置信度排序跳变；
+//   tid 无效（<=0，旧数据兜底）时退回数组序号 fallbackIdx
+function faceColorOfTid(tid: number, fallbackIdx: number): string {
+  const key = tid > 0 ? tid - 1 : fallbackIdx;
+  const i = key % 6;
   return FACE_PALETTE[i < 0 ? i + 6 : i];
 }
 
@@ -463,7 +471,9 @@ struct Index {
   private faceHudDh: number = 0;
   // ★ 人脸详情面板：点某脸"详细"弹出，箭头从面板指向该脸连线框顶中心
   @State faceDetailVisible: boolean = false;
-  @State faceDetailIdx: number = -1;
+  // ★ 详情面板锁定的跨帧跟踪 id（libocr tid，同脸不变）：
+  //   按 tid 而非数组下标跟人——下标随置信度排序跳变，会跟错人/弹错详情
+  @State faceDetailTid: number = -1;
   // 面板实测高度（onAreaChange 回填，箭头起点=面板底部中心才准）
   @State faceDetailPanelH: number = 0;
   // ★ 人脸头像：从最新显示帧（含连线框的 rgbaBuf_）按人脸框裁出小图，面板头部展示
@@ -714,10 +724,14 @@ struct Index {
       this.aiClarity = s.aiClarity;
       this.aiColorRestore = s.aiColorRestore;
       this.faceEnabled = s.faceEnabled;
-      // ★ 旧版迁移：仅存增强参数但模式为关 → 升级为非AI增强模式
-      if ((this.usbBrightness !== 0 || this.usbSharpness !== 0 ||
-        this.usbContrast !== 0 || this.usbSaturation !== 0) && this.usbEnhanceMode === 0) {
-        this.usbEnhanceMode = 1;
+      // ★ 旧版迁移（一次性）：仅存增强参数但模式为关 → 升级为非AI增强模式；
+      //   之前每次启动都执行，用户选"关闭"重启后被强行改回——加迁移标记只跑一次
+      if (!s.usbParamModeMigrated) {
+        if ((this.usbBrightness !== 0 || this.usbSharpness !== 0 ||
+          this.usbContrast !== 0 || this.usbSaturation !== 0) && this.usbEnhanceMode === 0) {
+          this.usbEnhanceMode = 1;
+        }
+        SettingsStore.save({ usbParamModeMigrated: true });
       }
       this.speech.enabled = this.speechOn;
       this.speech.volumePct = this.speechVolume;
@@ -774,9 +788,18 @@ struct Index {
       // ★ 识别框显示开关 + USB 画质增强恢复（native 原子热更新）
       try { entry.setDrawBoxesEnabled(this.drawBoxesOn); } catch (_) {}
       this.applyUsbEnhanceSettings();
-      // ★ AI 超分模式恢复：rawfile 提取模型 + initSr（就绪前自动走普通路径兜底）
+      // ★ AI 超分模式恢复：rawfile 提取模型 + initSr（就绪前自动走普通路径兜底）；
+      //   失败降级非AI增强并落盘，避免 AI 模式重启后静默失效被误认为设置没保存
       if (this.usbEnhanceMode >= 2) {
-        this.initSrModel(this.usbEnhanceMode);
+        this.initSrModel(this.usbEnhanceMode).then((ok: boolean): void => {
+          if (!ok && this.usbEnhanceMode >= 2) {
+            this.usbEnhanceMode = 1;
+            this.applyUsbEnhanceSettings();
+            this.persistSettings();
+            this.showToast('超分模型恢复失败，已切换为非AI增强');
+            this.speak('超分模型恢复失败');
+          }
+        });
       }
       // ★ 人脸识别恢复：rawfile 提取三模型 + initFace + native 开关 + HUD 轮询
       if (this.faceEnabled) {
@@ -1451,12 +1474,16 @@ struct Index {
     if (text.length === 0) {
       text = '检测到人脸';
     }
-    return { idx: idx, text: text, color: faceColorOf(idx) };
+    // ★ 配色与"详细"定位都按 tid（跨帧稳定身份）：tid>0 用 tid，旧数据退回序号
+    const ftid = f.tid !== undefined && f.tid !== null ? f.tid : 0;
+    return { idx: idx, tid: ftid, text: text, color: faceColorOfTid(ftid, idx) };
   }
 
-  // ★ 打开某张人脸的详情面板（HUD 行"详细"胶囊 / 点击预览识别框）
-  private openFaceDetail(idx: number): void {
-    this.faceDetailIdx = idx;
+  // ★ 打开某张人脸的详情面板（HUD 行"详细"胶囊 / 点击预览识别框）：
+  //   入参为跨帧跟踪 id（tid）——详情面板按它跨轮询跟踪同一张脸
+  private openFaceDetail(tid: number): void {
+    if (tid <= 0) return;
+    this.faceDetailTid = tid;
     this.faceDetailVisible = true;
     this.lastAvatarMs = 0;
     this.refreshFaceDetailAvatar();
@@ -1530,9 +1557,9 @@ struct Index {
           firstRect = `(${rect.x1.toFixed(0)},${rect.y1.toFixed(0)})-(${rect.x2.toFixed(0)},${rect.y2.toFixed(0)})`;
         }
         if (x >= rect.x1 - tol && x <= rect.x2 + tol && y >= rect.y1 - tol && y <= rect.y2 + tol) {
-          const fi = f.i !== undefined && f.i !== null ? f.i : i;
-          this.appendUvcLog(`[tap] HIT face=${fi} tap=(${x.toFixed(0)},${y.toFixed(0)})`);
-          this.openFaceDetail(fi);
+          const ftid = f.tid !== undefined && f.tid !== null ? f.tid : 0;
+          this.appendUvcLog(`[tap] HIT face tid=${ftid} tap=(${x.toFixed(0)},${y.toFixed(0)})`);
+          this.openFaceDetail(ftid);
           return;
         }
       }
@@ -1607,12 +1634,16 @@ struct Index {
     } catch (_) {}
   }
 
-  // ★ 当前详情面板对应的人脸（按 i 序号匹配；人脸离开画面返回 null）
+  // ★ 当前详情面板对应的人脸（按跨帧跟踪 tid 匹配；人脸离开画面返回 null）：
+  //   tid 不随置信度排序/数组重排变化，面板锁定的是"这张脸"而不是"这个下标"
   private detailFace(): FaceHudItem | null {
+    if (this.faceDetailTid <= 0) {
+      return null;
+    }
     for (let i = 0; i < this.faceHudFaces.length; ++i) {
       const f = this.faceHudFaces[i];
-      const fi = f.i !== undefined && f.i !== null ? f.i : i;
-      if (fi === this.faceDetailIdx) {
+      const ftid = f.tid !== undefined && f.tid !== null ? f.tid : 0;
+      if (ftid === this.faceDetailTid) {
         return f;
       }
     }
@@ -1693,7 +1724,7 @@ struct Index {
   // ★ 详情箭头：面板底部中心 → 人脸连线框顶中心，颜色与人脸框一致；
   //   每次 250ms 轮询重画，人脸移动箭头实时跟随
   private drawFaceArrow(): void {
-    if (!this.faceDetailVisible || this.faceDetailIdx < 0) {
+    if (!this.faceDetailVisible || this.faceDetailTid <= 0) {
       return;
     }
     try {
@@ -1717,7 +1748,7 @@ struct Index {
       const sx = vpw / 2;
       const sy = this.faceDetailPanelY() +
         (this.faceDetailPanelH > 0 ? this.faceDetailPanelH : 220);
-      const color = faceColorOf(this.faceDetailIdx);
+      const color = faceColorOfTid(this.faceDetailTid, 0);
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
       ctx.beginPath();
@@ -3123,7 +3154,7 @@ struct Index {
         faceHudRows: this.faceHudRows,
         // ★ 画面徽标按增强模式变色区分（0关/1非AI/2 AI）
         usbEnhanceMode: this.usbEnhanceMode,
-        onFaceDetail: (idx: number): void => { this.openFaceDetail(idx); },
+        onFaceDetail: (tid: number): void => { this.openFaceDetail(tid); },
         onCameraSelect: (pos: number): void => { this.selectCamera(pos); },
         // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口
         onShowPictureSheet: (): void => { this.pictureSheetVisible = true; },
@@ -3163,27 +3194,27 @@ struct Index {
                 .width(88).height(88)
                 .borderRadius(12)
                 .objectFit(ImageFit.Cover)
-                .border({ width: 1.5, color: faceColorOf(this.faceDetailIdx) })
+                .border({ width: 1.5, color: faceColorOfTid(this.faceDetailTid, 0) })
                 .backgroundColor('#0B0E12')
             } else {
               Column() {
-                Text('☺').fontSize(30).fontColor(faceColorOf(this.faceDetailIdx))
+                Text('☺').fontSize(30).fontColor(faceColorOfTid(this.faceDetailTid, 0))
               }
               .width(88).height(88)
               .borderRadius(12)
               .justifyContent(FlexAlign.Center)
               .backgroundColor('#0B0E12')
-              .border({ width: 1.5, color: faceColorOf(this.faceDetailIdx) })
+              .border({ width: 1.5, color: faceColorOfTid(this.faceDetailTid, 0) })
             }
             Column({ space: 4 }) {
-              Text(this.faceDetailIdx > 0 ? `人脸详情 · ${this.faceDetailIdx + 1}` : '人脸详情')
+              Text(this.faceDetailTid > 0 ? `人脸详情 · ${this.faceDetailTid}` : '人脸详情')
                 .fontSize(12).fontColor('#8E97A3').fontWeight(FontWeight.Bold)
               if (this.detailFace() === null) {
                 Text('人脸已离开画面')
                   .fontSize(14).fontColor('#8E97A3').fontWeight(FontWeight.Bold)
               } else {
                 Text(this.detailSummary())
-                  .fontSize(17).fontColor(faceColorOf(this.faceDetailIdx))
+                  .fontSize(17).fontColor(faceColorOfTid(this.faceDetailTid, 0))
                   .fontWeight(FontWeight.Bold)
                 Row({ space: 8 }) {
                   if (this.detailBeautyText().length > 0) {
@@ -3222,7 +3253,7 @@ struct Index {
             Row({ space: 10 }) {
               Button('复制信息')
                 .fontSize(13).fontColor('#003B44')
-                .backgroundColor(faceColorOf(this.faceDetailIdx))
+                .backgroundColor(faceColorOfTid(this.faceDetailTid, 0))
                 .borderRadius(17).height(34).layoutWeight(1)
                 .onClick((): void => { this.copyFaceInfo(); })
               Button('关闭')
@@ -3236,7 +3267,7 @@ struct Index {
         .padding({ left: 14, right: 14, top: 12, bottom: 12 })
         .backgroundColor('#16191F')
         .borderRadius(16)
-        .border({ width: 1, color: faceColorOf(this.faceDetailIdx) })
+        .border({ width: 1, color: faceColorOfTid(this.faceDetailTid, 0) })
         .position({ x: '50%', y: this.faceDetailPanelY() })
         .translate({ x: '-50%' })
         .onAreaChange((_old: Area, newArea: Area): void => {

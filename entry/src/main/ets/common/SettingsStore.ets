@@ -75,6 +75,9 @@ export interface AppSettings {
   // ★ mode 枚举 v3 迁移标记：v1/v2 的 2/3/4/5（旧多模型）→ v3 的 2（AI超分）
   usbEnhanceV2: boolean;
   usbEnhanceV3: boolean;
+  // ★ "参数非零但模式为关→升为非AI"迁移的一次性标记：此前该迁移每次启动都跑，
+  //   用户明明选了"关闭"重启却被强行改回非AI——加标记保证只迁移一次
+  usbParamModeMigrated: boolean;
 }
 
 // ★ preferences 文件名：带版本号——跨大版本结构不兼容时换文件名即可整体重置
@@ -143,7 +146,8 @@ export class SettingsStore {
       aiColorRestore: 60,
       faceEnabled: false,
       usbEnhanceV2: false,
-      usbEnhanceV3: false
+      usbEnhanceV3: false,
+      usbParamModeMigrated: false
     };
     if (!SettingsStore.pref) return r;
     const p = SettingsStore.pref;
@@ -216,6 +220,7 @@ export class SettingsStore {
     // ★ mode 枚举 v3 一次性迁移：v1/v2 的 2/3/4/5（旧多模型枚举）→ v3 的 2（AI超分）
     r.usbEnhanceV2 = await p.get('usbEnhanceV2', false) as boolean;
     r.usbEnhanceV3 = await p.get('usbEnhanceV3', false) as boolean;
+    r.usbParamModeMigrated = await p.get('usbParamModeMigrated', false) as boolean;
     if (!r.usbEnhanceV3) {
       if (r.usbEnhanceMode >= 2 && r.usbEnhanceMode <= 5) {
         r.usbEnhanceMode = 2;
@@ -284,6 +289,7 @@ export class SettingsStore {
     if (s.faceEnabled !== undefined) await p.put('faceEnabled', s.faceEnabled);
     if (s.usbEnhanceV2 !== undefined) await p.put('usbEnhanceV2', s.usbEnhanceV2);
     if (s.usbEnhanceV3 !== undefined) await p.put('usbEnhanceV3', s.usbEnhanceV3);
+    if (s.usbParamModeMigrated !== undefined) await p.put('usbParamModeMigrated', s.usbParamModeMigrated);
     if (s.enabledLabels !== undefined) await p.put('enabledLabels', s.enabledLabels.join(','));
     if (s.alertLabels !== undefined) await p.put('alertLabels', s.alertLabels.join(','));
     await p.flush();

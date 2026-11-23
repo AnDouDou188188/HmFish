@@ -1,8 +1,8 @@
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║ FaceNet —— 人脸检测/关键点/属性引擎（libocr.so 内部实现，FaceNet.cpp）        ║
 // ╠═══════════════════════════════════════════════════════════════════════════╣
-// ║ 【职责】一帧 RGBA 进 → 最多 4 张脸出（face_detect_rgba，每脸 227 float：    ║
-// ║   框/检测分/性别/年龄/颜值 + 106 关键点 + 7 颜值分项）。                     ║
+// ║ 【职责】一帧 RGBA 进 → 最多 4 张脸出（face_detect_rgba，每脸 228 float：    ║
+// ║   框/检测分/性别/年龄/颜值 + 106 关键点 + 7 颜值分项 + trackId）。           ║
 // ║                                                                              ║
 // ║ 【模型组合】insightface buffalo_s 系（离线 Python 实证解码）：                ║
 // ║   det_500m.onnx（SCRFD 检测，letterbox 640）+ 2d106det.onnx（106 关键点）    ║
@@ -12,8 +12,13 @@
 // ║   g_face_mutex 串行化整个 detect 流程；跨帧状态（track 的性别投票/年龄       ║
 // ║   中值/颜值环形缓冲）全在锁内访问，与渲染线程无共享。                        ║
 // ║                                                                              ║
-// ║ 【输出布局】facesOut 每脸 kFaceFloats=227：[0..7] 框/分/性别/年龄/颜值，      ║
-// ║   [8..219] 106 关键点 x,y，[220..226] 颜值 7 分项（详见函数注释）。          ║
+// ║ 【输出布局】facesOut 每脸 kFaceFloats=228：[0..7] 框/分/性别/年龄/颜值，      ║
+// ║   [8..219] 106 关键点 x,y，[220..226] 颜值 7 分项，[227] 跨帧跟踪 id。       ║
+// ║                                                                              ║
+// ║ 【人脸跟踪】g_tracks 内部早有跨帧关联（IoU≥0.3、3s GC），本版把 track 的     ║
+// ║   身份 id（g_next_track_id 递增分配）随输出下发（[227]）——上层连线框        ║
+// ║   配色/HUD 行/详情面板/箭头跟随按 id 而非数组下标认脸，同一人跨帧颜色        ║
+// ║   与身份不再跳变；脸离场超 3s 后 track 回收，再入场分配新 id                ║
 // ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 人脸识别引擎（libocr.so）：onnxruntime CPU 推理
 //   模型组合（insightface buffalo_s 系，离线 Python 实证解码）：
@@ -83,7 +88,7 @@ namespace {
     constexpr int64_t kGaRefreshMs = 1200;   // 性别年龄复检间隔（track 内节流）
     constexpr size_t kMaxTracks = 8;
     constexpr size_t kMaxFacesOut = 4;    // 最多输出脸数（关键点全部推理）
-    constexpr int kFaceFloats = 227;      // 每脸输出 float 数：[0..7]基本信息 + [8..219]106点 + [220..226]颜值分项
+    constexpr int kFaceFloats = 228;      // 每脸输出 float 数：[0..7]基本信息 + [8..219]106点 + [220..226]颜值分项 + [227]trackId
     constexpr float kGaVoteMargin = 0.25f;  // 性别投票置信度门槛（|logit 差|）
 
     // ───────── 复用缓冲（仅人脸工作线程在锁内使用）─────────
@@ -115,7 +120,11 @@ namespace {
     //   抖动大（光线/角度敏感），把"每帧都信"改成"跨帧多帧表决/中值"——
     //   性别 5 票多数表决（低置信样本不投票）、年龄 7 样本中值滤波、
     //   颜值与分项同理；全部按 IoU≥0.3 与当前脸关联
+    // ★ id：跨帧跟踪身份——新建 track 时由 g_next_track_id 分配（从 1 递增），
+    //   输出到 facesOut[227]；上层按 id 认脸（配色/详情/箭头），不随检测
+    //   置信度排序变化跳变。面积剧变只清属性缓冲，id 不变（还是同一 track）
     struct FaceTrack {
+        int id = 0;
         float x1, y1, x2, y2;
         std::chrono::steady_clock::time_point lastSeen;
         std::chrono::steady_clock::time_point lastGa;
@@ -135,6 +144,10 @@ namespace {
         int compCnt = 0;
     };
     std::vector<FaceTrack> g_tracks;
+    // ★ g_next_track_id：全局跟踪 id 计数器（从 1 起，0 保留为"无效/无 track"）。
+    //   新 track 分配后自增；不随 track 回收回退——历史 id 不复用，上层
+    //   缓存（详情面板/HUD 行）不会把"新人"误认成"离场的旧人"
+    int g_next_track_id = 1;
 
     // ───────── 数值工具 ─────────
 
@@ -577,11 +590,12 @@ void face_release(void) {
     LOGI("face released");
 }
 
-/* 同步检测一帧 RGBA。facesOut 每脸 kFaceFloats=227 个 float：
+/* 同步检测一帧 RGBA。facesOut 每脸 kFaceFloats=228 个 float：
  * [0..3] box x1,y1,x2,y2（图像坐标） [4] 检测分
  * [5] 性别(0女1男,-1未知) [6] 年龄(-1未知) [7] 颜值 0~100(-1未知)
  * [8..219] 106 关键点 x,y（图像坐标）
  * [220..226] 颜值分项 0~100(-1未知)：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+ * [227] 跨帧跟踪 id（≥1；同一张脸持续存在时 id 不变，离场 3s 后再入为新 id）
  * 返回脸数（<=min(maxFaces,4)），未就绪返回 0 */
 // ★ face_detect_rgba：全流程主函数，六步（全程持 g_face_mutex）：
 //   ① RGBA→RGB→letterbox 640（长边贴合等比缩放、短边 pad 114，
@@ -772,9 +786,11 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         if (bestIoU < 0.3f) tr = nullptr;
         bool needGa = false;
         if (!tr) {
-            // 新 track：容量满时删最旧的（先进先出），再压入新轨迹
+            // 新 track：容量满时删最旧的（先进先出），再压入新轨迹；
+            //   同步分配跨帧跟踪 id（g_next_track_id 递增，随输出 [227] 下发）
             if (g_tracks.size() >= kMaxTracks) g_tracks.erase(g_tracks.begin());
             FaceTrack nt;
+            nt.id = g_next_track_id++;
             nt.x1 = b.x1; nt.y1 = b.y1; nt.x2 = b.x2; nt.y2 = b.y2;
             nt.lastSeen = now;
             nt.lastGa = {};
@@ -841,6 +857,9 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         }
         o[5] = (float)tr->gender;
         o[6] = tr->age;
+        // ★ 跨帧跟踪 id 写 [227]：上层（连线框配色/HUD 行/详情面板/箭头）按
+        //   id 认脸——检测框按置信度排序导致数组下标跨帧跳变，id 才是稳定身份
+        o[227] = (float)tr->id;
 
         // 106 关键点 + 颜值（含 7 分项：对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
         // pts 指向输出 [8..219]；颜值总分与 7 分项写入 [7]/[220..226]，

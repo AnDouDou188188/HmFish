@@ -379,8 +379,8 @@ namespace ocr_bridge {
         g_api.face_release();
     }
 
-    // ★ faceDetect：一帧同步检测（face 工作线程调用）——facesOut 每脸 223 float，
-    //   布局见 ocr_c_api.h（box/分数/性别年龄颜值/106 点/颜值分项），返回脸数
+    // ★ faceDetect：一帧同步检测（face 工作线程调用）——facesOut 每脸 228 float，
+    //   布局见 ocr_c_api.h（box/分数/性别年龄颜值/106 点/颜值分项/trackId），返回脸数
     int faceDetect(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces) {
         if (!isLoaded()) return 0;
         return g_api.face_detect_rgba(rgba, w, h, facesOut, maxFaces);

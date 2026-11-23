@@ -150,16 +150,18 @@ int face_is_ready(void);
 // ★ face_release：释放人脸模型组
 void face_release(void);
 
-/* 同步检测一帧 RGBA。facesOut 每脸 223 个 float：
+/* 同步检测一帧 RGBA。facesOut 每脸 228 个 float：
  *   [0..3] box x1,y1,x2,y2（图像坐标）
  *   [4]    检测分
  *   [5]    性别（0=女 1=男，-1=未知）
  *   [6]    年龄（-1=未知）
  *   [7]    颜值 0~100（-1=未知）
- *   [8..215] 106 关键点 x,y（图像坐标）
- *   [216..222] 颜值分项 0~100（-1=未知）：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+ *   [8..219] 106 关键点 x,y（图像坐标）
+ *   [220..226] 颜值分项 0~100（-1=未知）：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
+ *   [227]  跨帧跟踪 id（libocr g_tracks 分配：同一张脸持续存在时不变，
+ *          离场 3s 回收，再入场为新 id；上层配色/详情按它认脸）
  * 返回脸数（<=min(maxFaces,4)），未就绪返回 0 */
-// ★ face_detect_rgba：一帧同步完成"检测 + 106 点 + 性别年龄 + 几何颜值"；
+// ★ face_detect_rgba：一帧同步完成"检测 + 106 点 + 性别年龄 + 几何颜值 + 跟踪 id"；
 //   固定布局的单块 float 输出避免跨 .so 传复杂结构，上层 FaceDrawInfo 再解包
 int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces);
 

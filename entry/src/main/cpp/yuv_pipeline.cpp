@@ -2343,9 +2343,10 @@ void YuvPipeline::ClearSurface() {
 // ═══════════ 人脸识别：SCRFD 检测 + 106 关键点连线框 ═══════════
 
 // face_detect_rgba 每脸输出 float 数：
-//   [0..3]box + [4]score + [5]gender + [6]age + [7]beauty + [8..215]106点xy
+//   [0..3]box + [4]score + [5]gender + [6]age + [7]beauty + [8..219]106点xy
 //   + [220..226]颜值分项（对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
-static constexpr int kFaceFloats = 227;
+//   + [227]trackId（libocr 跨帧跟踪 id，同一张脸持续存在时不变）
+static constexpr int kFaceFloats = 228;
 static constexpr int kMaxFaceDraw = 4;      // 最多绘制/上报的人脸数
 static constexpr int kFaceStaleMs = 600;    // 结果过期阈值（超时不画不报，自动消失；
                                             // 过长会滞留旧坐标，与移动中的人脸错位）
@@ -2514,6 +2515,7 @@ void YuvPipeline::FaceWorkerLoop() {
             for (int i = 0; i < n; ++i) {
                 const float *fl = faceOutBuf_.data() + (size_t)i * kFaceFloats;
                 FaceDrawInfo d = {};
+                d.trackId = (int)fl[227];   // 跨帧跟踪 id（libocr g_tracks 分配）
                 d.box[0] = fl[0]; d.box[1] = fl[1]; d.box[2] = fl[2]; d.box[3] = fl[3];
                 d.score = fl[4];
                 d.gender = (int)fl[5];
@@ -2576,9 +2578,14 @@ void YuvPipeline::DrawFaceOverlay() {
     };
 
     for (size_t fi = 0; fi < snap.size(); ++fi) {
-        const uint8_t R1 = kFacePalette[fi % 6][0];
-        const uint8_t G1 = kFacePalette[fi % 6][1];
-        const uint8_t B1 = kFacePalette[fi % 6][2];
+        // ★ 按跨帧跟踪 id 取色（(tid-1)%6），不再用数组下标：检测按置信度排序，
+        //   下标随脸间分值波动跳变 → 同一张脸颜色/标注跨帧闪烁；
+        //   trackId 是 libocr 按框 IoU 关联出的稳定身份（离场 3s 回收）。
+        //   兜底：trackId 无效（<=0，理论不出现）时退回数组下标
+        const int cIdx = (snap[fi].trackId > 0 ? snap[fi].trackId - 1 : (int)fi) % 6;
+        const uint8_t R1 = kFacePalette[cIdx][0];
+        const uint8_t G1 = kFacePalette[cIdx][1];
+        const uint8_t B1 = kFacePalette[cIdx][2];
         const uint8_t R2 = (uint8_t)std::min(255, (int)R1 + 55);
         const uint8_t G2 = (uint8_t)std::min(255, (int)G1 + 55);
         const uint8_t B2 = (uint8_t)std::min(255, (int)B1 + 55);
@@ -2673,8 +2680,8 @@ void YuvPipeline::DrawFaceOverlay() {
     }
 }
 
-// ★ HUD 人脸信息 JSON：{count, faces:[{gender,age,beauty,x,y,w,h}]}
-//   过期结果自动剔除；坐标缩放到当前显示尺寸
+// ★ HUD 人脸信息 JSON：{count, faces:[{i,tid,gender,age,beauty,comps,x,y,w,h}]}
+//   tid=跨帧跟踪 id（同脸不变）；过期结果自动剔除；坐标缩放到当前显示尺寸
 std::string YuvPipeline::GetFaceInfoJson() {
     std::vector<FaceDrawInfo> snap;
     int fw = 0, fh = 0;
@@ -2711,8 +2718,11 @@ std::string YuvPipeline::GetFaceInfoJson() {
             const float h = (f.box[3] - f.box[1]) * sy;
             if (!first) json += ",";
             first = false;
-            // ★ i：人脸序号（=数组位置=连线框配色索引），ETS 按它取同色调箭头/面板
+            // ★ i：数组序号（兼容保留）；tid：跨帧跟踪 id（libocr 稳定身份，
+            //   同脸不变）——ETS 配色/详情面板/箭头跟随一律按 tid 认脸，
+            //   不再用会随置信度排序跳变的数组下标
             json += "{\"i\":" + std::to_string(fi) +
+                    ",\"tid\":" + std::to_string(f.trackId) +
                     ",\"gender\":" + std::to_string(f.gender) +
                     ",\"age\":" + std::to_string(f.age >= 0 ? (int)(f.age + 0.5f) : -1) +
                     ",\"beauty\":" + std::to_string(f.beauty >= 0 ? (int)(f.beauty + 0.5f) : -1) +
