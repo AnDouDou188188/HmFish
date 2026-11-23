@@ -138,6 +138,24 @@ int sr_upscale_rgba(const uint8_t *in, int inW, int inH, uint8_t *out, int outW,
 // ★ sr_scale：探测当前模型的放大倍数（决定输出缓冲尺寸）
 int sr_scale(void);
 
+/* ★ AI 黑白照片上色（DDColor-L，onnxruntime CPU fp32；黑白/棕褐色老照片 → 自然彩色） */
+
+/* 加载上色 ONNX 模型（约 241MB，耗时数秒，napi 层已异步化）；成功返回 1 */
+// ★ color_init：加载 DDColor-L 模型并探测 I/O 名与输入边长（推理在调用线程同步执行）
+int color_init(const char *onnxPath, int numThreads);
+
+// ★ color_is_ready：上色模型是否已加载就绪
+int color_is_ready(void);
+
+// ★ color_release：释放上色模型（回收 241MB 级模型内存）
+void color_release(void);
+
+/* RGBA → AI 上色 → RGBA（分辨率不变；in/out 等尺寸，允许同缓冲原地）。
+ * 黑白/棕褐色照片输入时模型预测 Lab a/b 色度并与原图亮度合成自然彩色；
+ * 成功返回 1，失败 0（调用方保留原图继续后续修复步骤） */
+// ★ colorize_rgba：单张同步上色（restorePhoto 修复流水线在 napi 异步线程调用）
+int colorize_rgba(const uint8_t *in, int inW, int inH, uint8_t *out, int outW, int outH);
+
 /* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage 性别年龄 + 几何颜值分） */
 
 /* 加载三个人脸模型（det/lm 必需，ga 可为 NULL）；numThreads<=0 用 3；成功返回 1 */

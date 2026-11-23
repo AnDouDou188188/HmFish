@@ -1250,6 +1250,32 @@ struct Index {
   //   加载成功后置 true，USB 增强（mode 2）与相册 AI 修复共用同一会话不再重载
   private srModelReady: boolean = false;
 
+  // ★ 上色模型（DDColor-L，约 241MB）会话已加载标志：colorInit 加载耗时数秒，
+  //   成功后常驻（黑白照片上色与相册 AI 修复共用），不重复加载
+  private colorModelReady: boolean = false;
+
+  // ★ AI 上色模型确保加载：rawfile 提取 ddcolor.onnx（241MB 一次性拷贝）到沙箱
+  //   + native 异步建会话（DDColor-L：黑白/棕褐照片 → 自然彩色，端侧推理）
+  private async ensureColorModel(): Promise<boolean> {
+    if (this.colorModelReady) return true;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const name = 'ddcolor.onnx';
+      const dest = `${ctx.filesDir}/${name}`;
+      if (!fs.accessSync(dest)) {
+        const data = await ctx.resourceManager.getRawFileContent(`models/${name}`);
+        const file = fs.openSync(dest, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE | fs.OpenMode.TRUNC);
+        fs.writeSync(file.fd, data.buffer);
+        fs.closeSync(file);
+      }
+      const ok = await entry.initColor(dest, this.powerThreads);
+      this.colorModelReady = ok;
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
   // ★ AI 超分模型确保加载：rawfile 提取到沙箱 + native 加载（QuickSRNetMedium x4）
   private async ensureSrModel(): Promise<boolean> {
     if (this.srModelReady) return true;
@@ -2170,10 +2196,14 @@ struct Index {
   }
 
   // ★ 解码所选照片：等比缩放至长边 ≤720（SR 全帧 onnxruntime 推理的输入上限，
-  //   同时控制 readPixelsToBuffer 内存），输出像素图供预览与修复共用
+  //   同时控制 readPixelsToBuffer 内存），输出像素图供预览与修复共用。
+  //   PhotoViewPicker 返回 file://media/ 相册 URI：须经 fs.openSync 换 fd 解码，
+  //   直接 createImageSource(uri) 在部分系统版本会抛异常（"图片解码失败"根因）
   private async decodeForRestore(uri: string): Promise<image.PixelMap | undefined> {
+    let file: fs.File | undefined = undefined;
     try {
-      const source = image.createImageSource(uri);
+      file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
+      const source = image.createImageSource(file.fd);
       const info = await source.getImageInfo();
       const ow = info.size.width;
       const oh = info.size.height;
@@ -2192,6 +2222,8 @@ struct Index {
       return pm;
     } catch (e) {
       return undefined;
+    } finally {
+      if (file) { try { fs.closeSync(file); } catch (_) {} }
     }
   }
 
@@ -2244,8 +2276,9 @@ struct Index {
     }
   }
 
-  // ★ AI 高清彩色修复入口：SR 模型懒加载 → 逐张修复入相册 → 汇总提示。
-  //   修复 = 边缘保持去噪 + AI 超分×4 高清 + 褪色修复（白平衡/对比度/饱和度）
+  // ★ AI 高清彩色修复入口：SR/上色模型懒加载 → 逐张修复入相册 → 汇总提示。
+  //   修复 = 边缘保持去噪 + 黑白/棕褐照片 AI 上色（DDColor-L 真黑白上色）
+  //   + AI 超分×4 高清 + 褪色修复（白平衡/对比度/饱和度），全部端侧本地推理
   private async startPhotoRestore(): Promise<void> {
     if (this.restoring) return;
     const uris = this.pendingRestoreUris;
@@ -2254,11 +2287,19 @@ struct Index {
     this.loading = true;
     let okCount = 0;
     try {
+      // ① SR 超分模型懒加载（首次数秒；后续复用）
       this.loadingMsg = 'AI 修复模型加载中…';
       const srOk = await this.ensureSrModel();
       if (!srOk) {
-        // 模型加载失败：仍继续（native 端跳过超分，仅去噪+褪色修复）
+        // 模型加载失败：仍继续（native 端跳过超分，仅去噪+上色+褪色修复）
         this.showToast('超分模型加载失败，本次仅去噪与色彩修复');
+      }
+      // ② 上色模型懒加载（DDColor-L 241MB，首次加载数秒；黑白/棕褐照片上色）
+      this.loadingMsg = 'AI 上色模型加载中…';
+      const colorOk = await this.ensureColorModel();
+      if (!colorOk) {
+        // 上色模型加载失败：仍继续（黑白照片本次仅去噪+超分+褪色修复）
+        this.showToast('上色模型加载失败，黑白照片本次仅高清修复');
       }
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       for (let i = 0; i < uris.length; i++) {

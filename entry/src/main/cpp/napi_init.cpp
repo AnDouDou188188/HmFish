@@ -1304,6 +1304,9 @@ static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
 // 处理流水线（全部端侧本地，无云端上传）：
 //   ① 字节序统一：部分设备 readPixelsToBuffer 输出 BGRA_8888，按调用方标志转 RGBA
 //   ② 边缘保持去噪：cv::bilateralFilter（5 邻域 / sigma 40）抑制老照片颗粒与扫描噪点
+//   ②.5 AI 上色（DDColor-L 约 241MB）：Lab 色度离散度检测近单色（黑白/棕褐/泛黄）
+//       且模型就绪时才调上色——模型预测 Lab a/b 色度与原图亮度 L 合成自然彩色
+//       （真黑白上色）；彩色照片绝不被模型颜色覆盖，模型未就绪/失败优雅跳过
 //   ③ AI 超分 ×N：quicksrnetmedium.onnx（libocr.so 内 onnxruntime CPU 推理），
 //      模型未就绪或推理失败时优雅回退原尺寸（修复流程不中断）
 //   ④ 褪色修复（纯手写两遍像素循环，无额外依赖）：
@@ -1353,6 +1356,29 @@ static void RestorePhotoExecute(napi_env env, void *data) {
     cv::Mat bgrDenoised;
     cv::bilateralFilter(bgr, bgrDenoised, 5, 40.0, 40.0);
     cv::cvtColor(bgrDenoised, rgbaIn, cv::COLOR_BGR2RGBA);
+
+    // ②.5 黑白/棕褐老照片 AI 上色（DDColor-L）：
+    //     降采样 256px 计算 Lab a/b 通道标准差（色度离散度）判定近单色——
+    //     黑白照片 ≈0、棕褐色调 3~6、真实彩色 15 以上，阈值 8 只放过彩色；
+    //     判定命中且上色模型就绪时原地调用（rgbaIn 同输入输出缓冲），
+    //     上色失败静默跳过（后续去噪/超分/褪色修复照常，修复链不中断）
+    if (ocr_bridge::colorIsReady()) {
+        cv::Mat small;
+        cv::resize(bgrDenoised, small, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
+        cv::Mat smallLab;
+        cv::cvtColor(small, smallLab, cv::COLOR_BGR2Lab);  // 8U Lab：a/b +128 偏移，标准差不变
+        cv::Mat labChans[3];
+        cv::split(smallLab, labChans);
+        cv::Scalar meanA, stdA, meanB, stdB;
+        cv::meanStdDev(labChans[1], meanA, stdA);
+        cv::meanStdDev(labChans[2], meanB, stdB);
+        const double chromaSpread = std::sqrt(stdA[0] * stdA[0] + stdB[0] * stdB[0]);
+        if (chromaSpread < 8.0 &&
+            ocr_bridge::colorize(rgbaIn.data, w, h, rgbaIn.data, w, h)) {
+            OH_LOG_INFO(LOG_APP, "restorePhoto: colorized (chromaSpread=%{public}.1f)",
+                        chromaSpread);
+        }
+    }
 
     // ③ AI 超分 ×N：模型就绪时放大，失败/未就绪回退原尺寸
     const int scale = ocr_bridge::srIsReady() ? ocr_bridge::srScale() : 0;
@@ -1516,6 +1542,71 @@ static napi_value RestorePhoto(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ═══════════ AI 黑白照片上色模型加载（DDColor-L）═══════════
+
+// 异步加载 241MB 上色模型（对齐 InitFace 模式：同步加载会阻塞 UI 线程数秒致卡死）
+// ★ ColorInitCtx：异步工作上下文——模型路径 + 推理线程数 + 结果标志；
+//   JS 入口 new、Complete 回调 delete（napi_async_work 固定资源生命周期，防泄漏）
+struct ColorInitCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::string path;
+    int threads = 4;
+    bool ok = false;
+};
+
+// ★ ColorInitExecute：异步加载执行体（napi 工作线程）——先确保 libocr.so
+//   已加载（内部 dlopen+dlsym），再 colorInit 建 DDColor-L 会话（241MB 级耗时数秒）
+static void ColorInitExecute(napi_env env, void *data) {
+    auto *ctx = static_cast<ColorInitCtx *>(data);
+    if (!ocr_bridge::load()) {
+        OH_LOG_ERROR(LOG_APP, "color init: ocr bridge load failed");
+        ctx->ok = false;
+        return;
+    }
+    ctx->ok = ocr_bridge::colorInit(ctx->path, ctx->threads);
+}
+
+// ★ ColorInitComplete：加载完成回调（JS 线程）——resolve Promise<boolean>，
+//   按序清理 async work 与上下文（napi_delete_async_work → delete ctx）
+static void ColorInitComplete(napi_env env, napi_status status, void *data) {
+    auto *ctx = static_cast<ColorInitCtx *>(data);
+    napi_value result = nullptr;
+    napi_get_boolean(env, ctx->ok, &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+// ★ InitColor（ArkTS 调用名：initColor）：异步加载 AI 上色模型，返回 Promise<boolean>。
+//   参数：args[0]=ONNX 模型路径，args[1]=推理线程数（默认 4）。上色实现在
+//   libocr.so（ColorizeNet.cpp），经 ocr_bridge 桥接；restorePhoto 流水线内按
+//   Lab 色度离散度自动判定黑白/棕褐照片并调用
+static napi_value InitColor(napi_env env, napi_callback_info info) {
+    size_t argc = 2;
+    napi_value args[2];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    char path[1024] = {0};
+    size_t len = 0;
+    int32_t threads = 4;
+    if (argc > 0) napi_get_value_string_utf8(env, args[0], path, sizeof(path), &len);
+    if (argc > 1) napi_get_value_int32(env, args[1], &threads);
+
+    auto *ctx = new ColorInitCtx();
+    ctx->path = std::string(path);
+    ctx->threads = (int)threads;
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "initColor", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName,
+                           ColorInitExecute, ColorInitComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
 // ★ Init：entry 模块初始化回调——把全部导出函数经 napi_property_descriptor
 //   挂载到 exports 对象。每项第一个字符串即 ArkTS 侧 import 'libentry.so' 后
 //   直接调用的方法名（下表为全部 native 能力的唯一权威清单，按功能分组）
@@ -1576,6 +1667,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"setOcrNumThreads",     nullptr, SetOcrNumThreadsNapi, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initTable",            nullptr, InitTable,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initSr",               nullptr, InitSrNapi,           nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"initColor",            nullptr, InitColor,            nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseSr",            nullptr, ReleaseSrNapi,        nullptr, nullptr, nullptr, napi_default, nullptr},
         {"initFace",             nullptr, InitFace,             nullptr, nullptr, nullptr, napi_default, nullptr},
         {"releaseFace",          nullptr, ReleaseFace,          nullptr, nullptr, nullptr, napi_default, nullptr},

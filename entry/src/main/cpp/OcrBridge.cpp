@@ -61,6 +61,10 @@ namespace ocr_bridge {
         void (*sr_release)(void);
         int (*sr_upscale_rgba)(const uint8_t *, int, int, uint8_t *, int, int);
         int (*sr_scale)(void);
+        int (*color_init)(const char *, int);
+        int (*color_is_ready)(void);
+        void (*color_release)(void);
+        int (*colorize_rgba)(const uint8_t *, int, int, uint8_t *, int, int);
         int (*face_init)(const char *, const char *, const char *, int);
         int (*face_is_ready)(void);
         void (*face_release)(void);
@@ -136,6 +140,11 @@ namespace ocr_bridge {
             api.sr_upscale_rgba = (int (*)(const uint8_t *, int, int, uint8_t *, int, int))
                     dlsym(h, "sr_upscale_rgba");
             api.sr_scale = (int (*)(void)) dlsym(h, "sr_scale");
+            api.color_init = (int (*)(const char *, int)) dlsym(h, "color_init");
+            api.color_is_ready = (int (*)(void)) dlsym(h, "color_is_ready");
+            api.color_release = (void (*)(void)) dlsym(h, "color_release");
+            api.colorize_rgba = (int (*)(const uint8_t *, int, int, uint8_t *, int, int))
+                    dlsym(h, "colorize_rgba");
             api.face_init = (int (*)(const char *, const char *, const char *, int))
                     dlsym(h, "face_init");
             api.face_is_ready = (int (*)(void)) dlsym(h, "face_is_ready");
@@ -152,6 +161,8 @@ namespace ocr_bridge {
                 !api.table_init || !api.table_is_ready || !api.recognize_table_ex ||
                 !api.sr_init || !api.sr_is_ready || !api.sr_release ||
                 !api.sr_upscale_rgba || !api.sr_scale ||
+                !api.color_init || !api.color_is_ready || !api.color_release ||
+                !api.colorize_rgba ||
                 !api.face_init || !api.face_is_ready || !api.face_release ||
                 !api.face_detect_rgba) {
                 LOGE("dlsym incomplete for %{public}s", name);
@@ -356,6 +367,33 @@ namespace ocr_bridge {
     int srScale() {
         if (!isLoaded()) return 0;
         return g_api.sr_scale();
+    }
+
+    /* ★ AI 黑白照片上色（DDColor-L 约 241MB，黑白/棕褐色老照片 → 自然彩色） */
+
+    // ★ colorInit：加载上色 ONNX 模型（耗时数秒，napi 层已放入异步线程执行）
+    bool colorInit(const std::string &onnxPath, int numThreads) {
+        if (!load()) return false;
+        return g_api.color_init(onnxPath.c_str(), numThreads) != 0;
+    }
+
+    // ★ colorIsReady：上色模型是否就绪
+    bool colorIsReady() {
+        if (!isLoaded()) return false;
+        return g_api.color_is_ready() != 0;
+    }
+
+    // ★ colorRelease：释放上色模型（回收 241MB 级模型内存）
+    void colorRelease() {
+        if (!isLoaded()) return;
+        g_api.color_release();
+    }
+
+    // ★ colorize：单张同步上色（黑白/棕褐色 → 自然彩色，分辨率不变；
+    //   失败返回 false 由上层保留原图继续修复链）
+    bool colorize(const uint8_t *in, int inW, int inH, uint8_t *out, int outW, int outH) {
+        if (!isLoaded()) return false;
+        return g_api.colorize_rgba(in, inW, inH, out, outW, outH) != 0;
     }
 
     /* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage） */

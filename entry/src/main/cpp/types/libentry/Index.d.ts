@@ -27,6 +27,9 @@ export const setFaceEnabled: (b: boolean) => void;
 export const getFaceInfo: () => string;
 // ★ AI 超分模型加载（rawfile 提取到沙箱后的 onnx 路径 + 推理线程数）
 export const initSr: (onnxPath: string, threads: number) => boolean;
+// ★ AI 黑白照片上色模型加载（DDColor-L 约 241MB，黑白/棕褐老照片 → 自然彩色；
+//   restorePhoto 流水线按 Lab 色度离散度自动判定并调用，加载耗时数秒已异步化）
+export const initColor: (onnxPath: string, threads: number) => Promise<boolean>;
 export const releaseSr: () => void;
 export const setMotionEnabled: (b: boolean) => void;
 export const getMotionLevel: () => number;

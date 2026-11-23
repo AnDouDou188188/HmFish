@@ -108,6 +108,18 @@ namespace ocr_bridge {
     // ★ srScale：探测放大倍数（决定输出缓冲分配尺寸）
     int srScale();
 
+    /* ★ AI 黑白照片上色（DDColor-L 约 241MB，黑白/棕褐色老照片 → 自然彩色） */
+    // ★ colorInit：加载上色 ONNX 模型（napi 层 initColor 入口，耗时数秒须异步化）
+    bool colorInit(const std::string &onnxPath, int numThreads);
+    // ★ colorIsReady：上色模型是否就绪
+    bool colorIsReady();
+    // ★ colorRelease：释放上色模型（回收 241MB 级模型内存）
+    void colorRelease();
+    // RGBA → AI 上色 → RGBA（分辨率不变；黑白/棕褐色输入得自然彩色，
+    // 失败返回 false 由上层保留原图继续修复链）
+    // ★ colorize：单张同步上色（restorePhoto napi 异步线程调用）
+    bool colorize(const uint8_t *in, int inW, int inH, uint8_t *out, int outW, int outH);
+
     /* ★ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage 性别年龄 + 几何颜值） */
     // ★ faceInit：加载检测/关键点/性别年龄三个模型（napi 层 initFace 入口）
     bool faceInit(const std::string &detPath, const std::string &lmPath,

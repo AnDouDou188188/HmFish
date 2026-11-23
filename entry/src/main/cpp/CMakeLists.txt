@@ -149,6 +149,7 @@ add_library(ocr SHARED
     RapidOCR.cpp
     TableNet.cpp
     SrNet.cpp
+    ColorizeNet.cpp
     FaceNet.cpp
 )
 target_include_directories(ocr PRIVATE
