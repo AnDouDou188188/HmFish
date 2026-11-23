@@ -1,3 +1,18 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ ModelSheet（ModelSheet.ets）—— 识别设置半模态弹窗                             ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  长按底部"识别"或顶部 YOLO 徽标弹出。集中管理 YOLO 识别相关配置：             ║
+// ║   1. YOLO 识别总开关 + 置信度阈值滑条（5%~95% step5）                        ║
+// ║   2. 语音播报开关/音量滑条 + 识别结果朗读独立开关（默认关）                   ║
+// ║   3. 触发音效：自动录像触发提示音（默认内置/可选自定义 MP3/可试听/可恢复默认） ║
+// ║   4. 识别模型横向卡片列表：点击切换（Index 负责热加载）                       ║
+// ║   5. 自动录像类别勾选（LabelChip 流式布局，勾选即触发自动录像）               ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  models/labels 由 Index 从 ModelManager 取出下发；所有修改经 onXxx 回调      ║
+// ║  上抛（Index 落盘 + 热更新）；置信度/音量滑条本地缓冲，松手才提交             ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 识别设置弹窗：YOLO 模型选择、自动录像类别、置信度阈值、
 //   语音播报/识别朗读/触发音效（画面增强/识别框/人脸已迁至画面设置弹窗）
 import { ModelInfo } from '../common/ModelManager';
@@ -5,8 +20,11 @@ import { ModelInfo } from '../common/ModelManager';
 /**
  * 识别设置弹窗：模型切换、自动录像类别勾选、置信度阈值
  */
+// ★ ModelSheet：识别设置弹窗主体（开关/阈值/语音/音效/模型/类别六段）
 @Component
 export struct ModelSheet {
+  // ★ 模型与类别数据（Index 下发）：可选模型列表/当前模型 id/当前模型类别名列表/
+  //   已勾选类别下标集合/置信度阈值（0~1，滑条按百分比展示与缓冲）
   @Prop models: ModelInfo[] = [];
   @Prop currentModelId: string = '';
   @Prop labels: string[] = [];
@@ -22,6 +40,7 @@ export struct ModelSheet {
   @Prop recordSoundOn: boolean = true;
   @Prop recordSoundName: string = '';
 
+  // ── 交互回调：关闭/选模型/勾类别/阈值提交/各开关切换/音效选择·试听·恢复 ──
   onClose?: () => void;
   onSelectModel?: (id: string) => void;
   onToggleLabel?: (idx: number) => void;
@@ -40,16 +59,19 @@ export struct ModelSheet {
   @State localConfPct: number = 25;
   @State localVolume: number = 30;
 
+  // ★ 入场：百分比/音量本地缓冲对齐父状态；延时 30ms 置 appear 触发上滑动画
   aboutToAppear(): void {
     this.localConfPct = this.confThresh * 100;
     this.localVolume = this.speechVolume;
     setTimeout(() => { this.appear = true; }, 30);
   }
 
+  // ★ 类别是否勾选：checkedLabels 存的是类别在 labels 中的下标
   private isChecked(idx: number): boolean {
     return this.checkedLabels.indexOf(idx) >= 0;
   }
 
+  // ★ 分区标题行：图标 + 标题 + 右侧补充说明（extra 为空不渲染占位）
   @Builder
   SectionTitle(icon: string, title: string, extra: string) {
     Row({ space: 6 }) {
@@ -64,6 +86,7 @@ export struct ModelSheet {
     .margin({ top: 20, bottom: 10 })
   }
 
+  // ★ 模型卡片：名称 + "模型id · 输入尺寸px"；当前模型青色高亮底 + ✓ 前缀
   @Builder
   ModelCard(m: ModelInfo) {
     Column({ space: 5 }) {
@@ -89,6 +112,7 @@ export struct ModelSheet {
     .onClick(() => this.onSelectModel?.(m.id))
   }
 
+  // ★ 类别勾选芯片：勾选显示 ✓ + 青色实底；外层 Flex 流式布局自动换行排布
   @Builder
   LabelChip(name: string, idx: number) {
     Row({ space: 4 }) {
@@ -111,12 +135,14 @@ export struct ModelSheet {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // ── 全屏半透明遮罩：appear 驱动 220ms 淡入，点击任意处关闭 ──
       Column()
         .width('100%').height('100%')
         .backgroundColor(this.appear ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)')
         .animation({ duration: 220, curve: Curve.EaseOut })
         .onClick(() => this.onClose?.())
 
+      // ── 底部面板容器：translate 620→0 上滑入场，限高 82%，滚动区自适应 ──
       Column() {
         Row()
           .width(42).height(4).borderRadius(2)
@@ -147,8 +173,10 @@ export struct ModelSheet {
           .borderRadius(20)
           .onClick(() => this.onClose?.())
 
+        // ── 滚动配置区：内容超一屏时纵向滚动，条目多也不撑爆面板 ──
         Scroll() {
           Column() {
+            // ── YOLO 识别总开关行 ──
             Row({ space: 8 }) {
               Text('YOLO 识别').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Medium)
               Text(this.yoloEnabled ? '已开启' : '已关闭').fontSize(11)
@@ -163,6 +191,7 @@ export struct ModelSheet {
             .width('100%')
             .margin({ top: 12 })
 
+            // ── 置信度阈值滑条：5%~95% step5，松手才按 0~1 提交父组件 ──
             Row({ space: 6 }) {
               Text('◐').fontSize(13).fontColor('#00E5FF')
               Text('置信度阈值').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
@@ -310,6 +339,7 @@ export struct ModelSheet {
                 .width('100%').margin({ top: 6 })
             }
 
+            // ── 识别模型横向列表：点卡片切换模型（Index 负责卸载/热加载） ──
             this.SectionTitle('◆', '识别模型', '点击切换')
 
             Scroll() {
@@ -324,6 +354,7 @@ export struct ModelSheet {
             .scrollBar(BarState.Off)
             .width('100%')
 
+            // ── 自动录像类别勾选：勾选后画面出现所选类别即自动录像并保存相册 ──
             Row({ space: 6 }) {
               Text('◉').fontSize(13).fontColor('#00E5FF')
               Text('自动录像类别').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)

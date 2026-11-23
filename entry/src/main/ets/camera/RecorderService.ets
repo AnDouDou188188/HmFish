@@ -1,18 +1,26 @@
-// ★ AVRecorder 录像封装：prepare(fd)→start/stop、自动停录定时器、
-//   最近录像产物路径保留（自动录像完成后存相册用）
+// ★ AVRecorder 录像封装：prepare 拿 getInputSurface 交给 native
+//   （libentry.so attachRecordSurface）直供视频帧——ArkTS 不接触帧数据，
+//   native 把渲染合成帧写入 surface 完成编码；音频走系统 MIC 采集。
+//   生命周期 prepare(fd)→start/stop；自动停录定时器从 start 成功起算，
+//   最近产物路径保留（自动录像完成后 MediaController 存相册用）
 import { media } from '@kit.MediaKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 
+// ★ RecorderService：一路录像的完整生命周期（同一时刻只支持一段录像）
 export class RecorderService {
   private recorder: media.AVRecorder | null = null;
+  // ★ 产物文件 fd：prepare 打开、cleanup 关闭（fd 泄漏会堆积文件句柄）
   private outputFd: number = -1;
+  // ★ 本段录像的沙箱绝对路径（stop 返回给调用方）
   private outputPath: string = '';
   // ★ 最近一段录像产物路径：stop/cleanup 后保留（下次 prepare 覆盖），
   //   供自动录像完成后保存到相册使用
   private videoPath: string = '';
+  // ★ 录制中标记：UI 录制红点/计时显示的依据
   private isRecording: boolean = false;
+  // ★ 自动停录定时器句柄：start 成功后启动，stop 时先清
   private autoStopTimer: number = -1;
   // ★ 自动停录时长：prepare 记下，start() 成功后再起定时器——
   //   从真正开始录像计时（编码器 flush 耗时不再计入），设 5s 录 5s
@@ -21,6 +29,9 @@ export class RecorderService {
   // ★ 自动停录前回调：native 先摘掉录像直供 surface、UI 立即停表，再停编码器
   onBeforeAutoStop?: () => void;
 
+  // ★ prepare：建产物文件 + 配置编码参数（H.264 2Mbps / AAC）+ 初始化器，
+  //   返回 getInputSurface 的 surfaceId（null=失败）；调用方把它传给 native
+  //   attachRecordSurface 挂好帧直供后再调 start
   async prepare(context: common.UIAbilityContext,
     durationMs: number,
     withAudio: boolean,
@@ -71,6 +82,7 @@ export class RecorderService {
     }
   }
 
+  // ★ start：真正开始录制；自动停录定时器在此刻才启动（时长从首帧起算）
   async start(): Promise<boolean> {
     if (!this.recorder) return false;
     try {
@@ -93,6 +105,8 @@ export class RecorderService {
     }
   }
 
+  // ★ stop：清定时器 → 停录制 → 释放编码器，返回产物路径；
+  //   无论成败都走 cleanup，保证 fd/状态归零、可立即开始下一段
   async stop(): Promise<string> {
     if (this.autoStopTimer >= 0) {
       clearTimeout(this.autoStopTimer);
@@ -107,6 +121,7 @@ export class RecorderService {
     return saved;
   }
 
+  // ★ cleanup：仅重置内存状态并关闭 fd（不删文件）；prepare 失败/stop 后都会走
   private cleanup(): void {
     this.recorder = null;
     this.isRecording = false;
@@ -116,6 +131,7 @@ export class RecorderService {
     }
   }
 
+  // ★ 录制中状态只读透出
   get recording(): boolean { return this.isRecording; }
 
   /** 最近一段录像的沙箱路径（stop 后仍有效，直到下一次 prepare） */

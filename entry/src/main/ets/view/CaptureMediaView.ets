@@ -1,15 +1,36 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ CaptureMediaView（CaptureMediaView.ets）—— 快门按钮（Canvas 自绘）           ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  底部面板中央的快门按钮，原生相机风格，用 Canvas 手绘而非组合容器：           ║
+// ║   待机 = 白色外环 + 白色实心内圆（拍照快门）；录像中 = 白环 + 红色圆角        ║
+// ║   方块（停止键）；按下内圆/方块 0.9 缩放回弹。录像计时由 RecTimerPopup        ║
+// ║   单独展示，此处保持干净                                                     ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  currentMode/isRecording 由 BottomPanel 从 Index 透传（@Prop + @Watch        ║
+// ║  触发重绘）；组件自身不响应点击——点击事件由外层 BottomPanel 的 Stack          ║
+// ║  接管（调 onToggleRecord），本组件只负责"画得像"                             ║
+// ║                                                                              ║
+// ║ 【关键状态】                                                                 ║
+// ║  innerScale：按压缩放系数（1.0 常态 / 0.9 按下），驱动 draw() 缩放；          ║
+// ║  16ms 定时器仅在按压回弹动画期间触发重绘，平时空转开销极小                    ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 原生相机风格快门按钮（重设计）：
 //   待机：白色外环 + 白色实心内圆（原生拍照快门）
 //   录像中：白色外环 + 红色圆角方块（原生停止键）
 //   按下：内圆/方块 0.9 缩放回弹；计时由 RecTimerPopup 展示，此处保持干净
 @Component
 export struct CaptureMediaView {
+  // ★ 外部状态（@Watch 变化即重绘）：当前拍摄模式/是否录像中/录像秒数（仅透传）
   @Prop @Watch('onModeChange') currentMode: string;
   @Prop @Watch('onStateChange') isRecording: boolean;
   @Prop recordSec: number = -1;
 
+  // ★ 按压缩放系数：1.0 常态 / 0.9 按下（animateTo 过渡），draw() 据此缩放内圆/方块
   @State innerScale: number = 1.0;
 
+  // ★ Canvas 上下文与就绪标志：onReady 前宽高为 0，画了也白画，故先判 ctxReady
   private timer: number = -1;
   private canvasCtx: CanvasRenderingContext2D = new CanvasRenderingContext2D(new RenderingContextSettings(true));
   private ctxReady: boolean = false;
@@ -21,13 +42,16 @@ export struct CaptureMediaView {
     }, 16);
   }
 
+  // ★ 生命周期清理：销毁时必须清掉重绘定时器，防止组件销毁后定时器空转泄漏
   aboutToDisappear() {
     if (this.timer !== -1) { clearInterval(this.timer); this.timer = -1; }
   }
 
+  // ★ @Watch 回调：模式/录像状态一变立即重绘外观（白圆 ↔ 红方块切换）
   private onModeChange() { this.draw(); }
   private onStateChange() { this.draw(); }
 
+  // ★ 全量重绘：清屏 → 白色外环 →（录像中 ? 红色圆角停止方块 : 白色拍照内圆）
   private draw() {
     if (!this.ctxReady) return;
     const ctx = this.canvasCtx;
@@ -63,6 +87,7 @@ export struct CaptureMediaView {
 
   build() {
     Stack() {
+      // ── 画布：尺寸由外部容器（BottomPanel 的 SHUTTER_SIZE）撑满，onReady 首绘 ──
       Canvas(this.canvasCtx)
         .width('100%').height('100%')
         .onReady(() => { this.ctxReady = true; this.draw(); })

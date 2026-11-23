@@ -1,13 +1,18 @@
-// ★ 应用入口 Ability：相机/麦克风权限申请、窗口创建与主页面加载
+// ★ 应用入口 Ability：启动即申请相机/麦克风权限（探鱼相机两者缺一不可），
+//   创建窗口加载 pages/Index，并设置全屏沉浸布局。
+//   权限在 loadContent 之前串行申请：首页一进来即可直接开相机，
+//   避免 Index 初始化中途再弹权限框打断流程
 import { AbilityConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { window } from '@kit.ArkUI';
 import { abilityAccessCtrl, common, Permissions } from '@kit.AbilityKit';
 
+// ★ hilog 日志域与标签（hdc 过滤本应用日志用）
 const DOMAIN = 0x0000;
 const TAG = 'EntryAbility';
 
 export default class EntryAbility extends UIAbility {
+  // ★ onCreate：进程/Ability 创建（当前无额外初始化，仅生命周期打点）
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
   }
@@ -16,6 +21,7 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, 'onDestroy');
   }
 
+  // ★ onWindowStageCreate：权限申请 → 加载首页 → 全屏化，顺序不可颠倒
   async onWindowStageCreate(windowStage: window.WindowStage): Promise<void> {
     hilog.info(DOMAIN, TAG, 'onWindowStageCreate');
 
@@ -52,6 +58,7 @@ export default class EntryAbility extends UIAbility {
     hilog.info(DOMAIN, TAG, 'onWindowStageDestroy');
   }
 
+  // ★ 前后台切换回调：当前仅打点（相机释放/恢复由 Index 页面生命周期负责）
   onForeground(): void {
     hilog.info(DOMAIN, TAG, 'onForeground');
   }

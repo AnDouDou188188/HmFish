@@ -1,3 +1,20 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ FaceNet —— 人脸检测/关键点/属性引擎（libocr.so 内部实现，FaceNet.cpp）        ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【职责】一帧 RGBA 进 → 最多 4 张脸出（face_detect_rgba，每脸 227 float：    ║
+// ║   框/检测分/性别/年龄/颜值 + 106 关键点 + 7 颜值分项）。                     ║
+// ║                                                                              ║
+// ║ 【模型组合】insightface buffalo_s 系（离线 Python 实证解码）：                ║
+// ║   det_500m.onnx（SCRFD 检测，letterbox 640）+ 2d106det.onnx（106 关键点）    ║
+// ║   + genderage.onnx（性别年龄，可选）+ 纯几何颜值分（106 点几何量，无模型）    ║
+// ║                                                                              ║
+// ║ 【线程模型】由 YuvPipeline 的 FaceWorkerLoop 线程经 OcrBridge dlsym 调用；    ║
+// ║   g_face_mutex 串行化整个 detect 流程；跨帧状态（track 的性别投票/年龄       ║
+// ║   中值/颜值环形缓冲）全在锁内访问，与渲染线程无共享。                        ║
+// ║                                                                              ║
+// ║ 【输出布局】facesOut 每脸 kFaceFloats=227：[0..7] 框/分/性别/年龄/颜值，      ║
+// ║   [8..219] 106 关键点 x,y，[220..226] 颜值 7 分项（详见函数注释）。          ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 人脸识别引擎（libocr.so）：onnxruntime CPU 推理
 //   模型组合（insightface buffalo_s 系，离线 Python 实证解码）：
 //     det_500m.onnx   SCRFD 人脸检测（letterbox 640x640：长边等比贴合、短边 pad 114，
@@ -30,11 +47,18 @@
 
 namespace {
 
+    // ───────── 会话与环境 ─────────
+
+    // ★ faceEnv：进程级 Ort::Env 单例（生命周期覆盖全部人脸会话；
+    //   WARNING 级日志避免移动端刷屏）
     Ort::Env &faceEnv() {
         static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "facenet");
         return env;
     }
 
+    // ★ 全局会话与 I/O 名：det/lm/ga 三会话共享一个 Env；ga（性别年龄）
+    //   可选（g_ga_sess 为空时输出 -1 未知）；I/O 名在 init 时探测缓存，
+    //   推理热路径零字符串查询
     std::mutex g_face_mutex;
     std::unique_ptr<Ort::Session> g_det_sess;
     std::unique_ptr<Ort::Session> g_lm_sess;
@@ -50,6 +74,8 @@ namespace {
     int g_lm_size = 192;                  // 2d106det 输入边长
     int g_ga_size = 96;                   // genderage 输入边长
 
+    // ───────── 常量（阈值/尺寸/输出布局）─────────
+
     constexpr int kDetInput = 640;        // SCRFD 固定输入尺寸
     constexpr int kDetStrides[3] = {8, 16, 32};
     constexpr float kDetThresh = 0.40f;   // 检测阈值（insightface 默认 0.5，实机取宽）
@@ -60,6 +86,10 @@ namespace {
     constexpr int kFaceFloats = 227;      // 每脸输出 float 数：[0..7]基本信息 + [8..219]106点 + [220..226]颜值分项
     constexpr float kGaVoteMargin = 0.25f;  // 性别投票置信度门槛（|logit 差|）
 
+    // ───────── 复用缓冲（仅人脸工作线程在锁内使用）─────────
+
+    // ★ 复用 cv::Mat/vector：人脸检测每帧多次调用，堆分配是大头；
+    //   全部做成全局复用（锁内访问无竞争），把每帧开销压到纯计算
     // 复用缓冲（全部在 g_face_mutex 内访问，仅人脸工作线程实际使用）
     cv::Mat g_rgb;                        // 全分辨率 RGB
     cv::Mat g_det_small;                  // letterbox 等比缩放中间图
@@ -70,12 +100,21 @@ namespace {
     std::vector<float> g_ga_blob;
     int g_frame_w = 0, g_frame_h = 0;     // 当前帧尺寸（[ga] 日志切边诊断用）
 
+    // ───────── 数据结构 ─────────
+
+    // ★ FaceBox：SCRFD 检测结果（含 5 个辅助关键点：双眼/鼻尖/双嘴角，
+    //   本实现未用其推理但保留字段——对齐 insightface 数据结构，便于
+    //   后续接 5 点对齐或姿态估计）
     struct FaceBox {
         float x1, y1, x2, y2, score;
         float kps[10];
     };
 
     // 性别年龄 track：按 IoU 匹配跨帧关联，genderage 推理节流 + 性别 5 票多数表决（置信度门槛）+ 年龄环形中值
+    // ★ FaceTrack：跨帧属性缓冲。为什么需要 track：genderage 单帧输出
+    //   抖动大（光线/角度敏感），把"每帧都信"改成"跨帧多帧表决/中值"——
+    //   性别 5 票多数表决（低置信样本不投票）、年龄 7 样本中值滤波、
+    //   颜值与分项同理；全部按 IoU≥0.3 与当前脸关联
     struct FaceTrack {
         float x1, y1, x2, y2;
         std::chrono::steady_clock::time_point lastSeen;
@@ -97,6 +136,11 @@ namespace {
     };
     std::vector<FaceTrack> g_tracks;
 
+    // ───────── 数值工具 ─────────
+
+    // ★ medianOf：环形缓冲中值（n<=7 硬上限，栈上排序即可）；
+    //   偶数个样本取中间两值均值。用于年龄/颜值/分项的抗离群平滑——
+    //   光线突变或关键点抖动只产生少数离群样本，中值不受其拉偏
     float medianOf(const float *v, int n) {
         float tmp[7];
         for (int i = 0; i < n; ++i) tmp[i] = v[i];
@@ -104,6 +148,7 @@ namespace {
         return (n & 1) ? tmp[n / 2] : 0.5f * (tmp[n / 2 - 1] + tmp[n / 2]);
     }
 
+    // ★ boxIou：标准交并比，track 关联（≥0.3 认同脸）与 NMS 共用
     float boxIou(const FaceBox &a, const FaceBox &b) {
         const float xx1 = std::max(a.x1, b.x1), yy1 = std::max(a.y1, b.y1);
         const float xx2 = std::min(a.x2, b.x2), yy2 = std::min(a.y2, b.y2);
@@ -112,11 +157,17 @@ namespace {
         return ua > 0.0f ? inter / ua : 0.0f;
     }
 
+    // ───────── 颜值评分 ─────────
+
     // ★ 颜值分（0~100）：106 点几何量加权。全部以双眼中心距 d 归一化，
     //   高斯容差 gauss(r, ideal, tol) = 100*exp(-((r-ideal)/tol)^2)。
     //   comp[7] 输出分项（各 0~100）：[0]对称 [1]眼形 [2]眉形 [3]鼻形 [4]嘴形 [5]三庭 [6]眼型
     //   dbg 可为 null；非 null 时输出 8 个诊断比值：
     //   [0]d [1]眼宽比 [2]右眉眼距 [3]左眉眼距 [4]鼻宽比 [5]嘴宽比 [6]三庭 [7]眼开合
+    //   设计要点：① 以 d（双眼距）而非脸宽归一化——脸宽受姿态/表情影响更小但
+    //   需要额外点位对，d 最稳；② 高斯容差而非硬阈值——比值在理想值附近
+    //   平滑得分，避免"差 1% 就掉 20 分"的跳变；③ 全部 NaN 防护用
+    //   !(x>=min) 写法（NaN 与任何比较为假，普通 < 会放行 NaN）
     float faceBeautyScore(const float *p, float *comp, float *dbg) {
         auto X = [&](int i) { return p[2 * i]; };
         auto Y = [&](int i) { return p[2 * i + 1]; };
@@ -134,6 +185,8 @@ namespace {
         const float alen = std::hypot(ax, ay);
         if (!(alen >= 1.0f)) return -1.0f;
         ax /= alen; ay /= alen;
+        // 点到中轴线的有符号距离（叉积模长）——旋转不变，
+        // 脸歪头时对称性度量依然正确
         auto lineDist = [&](float px, float py) {
             const float dx = px - mx, dy = py - my;
             return std::fabs(dx * ay - dy * ax);
@@ -243,8 +296,12 @@ namespace {
         return score;
     }
 
-    // 裁剪推理辅助：bbox 中心 1.5 倍裁剪到 SxS（insightface 对齐变换），
-    // q = (p - c)*s + S/2 的逆映射 → warpAffine 矩阵
+    // ───────── 裁剪与推理辅助 ─────────
+
+    // ★ warpCrop：裁剪推理辅助：bbox 中心 1.5 倍裁剪到 SxS（insightface 对齐变换），
+    //   q = (p - c)*s + S/2 的逆映射 → warpAffine 矩阵
+    //   1.5 倍的原因：106 点含外轮廓/额头，紧贴 bbox 会把这些点裁掉；
+    //   1.5 倍留出关键点完整落图所需的边距（insightface 官方对齐参数）
     bool warpCrop(const FaceBox &b, int S) {
         const float w = b.x2 - b.x1, h = b.y2 - b.y1;
         if (w < 4.0f || h < 4.0f) return false;
@@ -264,12 +321,17 @@ namespace {
         return true;
     }
 
+    // ★ runLandmarks：106 关键点推理：raw RGB 0-255（图内自带 Sub127.5/Mul0.0078 归一化），输出逆映射回原图
+    //   输出 fc1[1,212] 即 106 对 (x,y)，模型坐标域 [-1,1]：
+    //   先 (v+1)*S/2 映射回裁剪图像素，再经 warpCrop 逆变换
+    //   ((q-S/2)/s + c) 还原到原图坐标
     // 106 关键点：raw RGB 0-255（图内自带 Sub127.5/Mul0.0078 归一化），输出逆映射回原图
     bool runLandmarks(const FaceBox &b, float *ptsOut) {
         const int S = g_lm_size;
         if (!warpCrop(b, S)) return false;
         const size_t px = (size_t)S * S;
         g_lm_blob.resize(px * 3);
+        // HWC uint8 → CHW float planar（0-255 原值：归一化已在模型图内）
         {
             const uint8_t *p = g_warp.data;
             float *rp = g_lm_blob.data();
@@ -313,6 +375,7 @@ namespace {
                     ptsOut[j * 2 + 1] = std::numeric_limits<float>::quiet_NaN();
                     continue;
                 }
+                // 裁剪图坐标 → 原图坐标（warpCrop 的逆映射）
                 ptsOut[j * 2] = (qx - half) / s + cx;
                 ptsOut[j * 2 + 1] = (qy - half) / s + cy;
             }
@@ -325,6 +388,10 @@ namespace {
         return false;
     }
 
+    // ★ runGenderAge：性别年龄推理：raw RGB 0-255，输出 [1,3]：gender=argmax(前2)，age=第3位×100；
+    //   margin=|前2位 logit 差|，低于门槛不参与性别投票（低置信样本剔除）
+    //   margin 机制：光照差/侧脸/遮挡时性别 logit 几乎持平，这类样本投票
+    //   只会污染表决；margin 门槛把"猜的"和"有把握的"分开
     // 性别年龄：raw RGB 0-255，输出 [1,3]：gender=argmax(前2)，age=第3位×100；
     //   margin=|前2位 logit 差|，低于门槛不参与性别投票（低置信样本剔除）
     bool runGenderAge(const FaceBox &b, int &gender, float &age, float &margin) {
@@ -333,6 +400,7 @@ namespace {
         if (!warpCrop(b, S)) return false;
         const size_t px = (size_t)S * S;
         g_ga_blob.resize(px * 3);
+        // HWC uint8 → CHW float planar（0-255 原值，模型图内自带归一化）
         {
             const uint8_t *p = g_warp.data;
             float *rp = g_ga_blob.data();
@@ -375,6 +443,7 @@ namespace {
             const size_t cnt = outputs[0].GetTensorTypeAndShapeInfo().GetElementCount();
             if (cnt < 3) return false;
             const float *o = outputs[0].GetTensorData<float>();
+            // insightface 约定：o[0]=女性 logit，o[1]=男性 logit，o[2]=归一化年龄
             gender = (o[1] >= o[0]) ? 1 : 0;
             age = o[2] * 100.0f;
             margin = std::fabs(o[0] - o[1]);
@@ -400,9 +469,14 @@ namespace {
 
 }  // namespace
 
+// ───────── C ABI 实现 ─────────
+
 extern "C" {
 
 /* 加载三个人脸模型（det/lm 必需，ga 可为 NULL），numThreads<=0 用 3 */
+// ★ face_init：三会话加载与 I/O 探测——det（校验必须恰 9 输出，SCRFD
+//   3 尺度 × 3 类输出）、lm（输入边长从 shape 读出，缺省 192）、
+//   ga（可选，边长缺省 96）；全部 I/O 名缓存；失败统一回滚三个会话
 int face_init(const char *detPath, const char *lmPath, const char *gaPath, int numThreads) {
     std::lock_guard<std::mutex> lk(g_face_mutex);
     g_det_sess.reset();
@@ -429,6 +503,8 @@ int face_init(const char *detPath, const char *lmPath, const char *gaPath, int n
             auto n = g_det_sess->GetInputNameAllocated(0, alloc);
             g_det_in = n.get();
         }
+        // SCRFD 必须恰 9 输出（3 尺度 × {scores,bbox,kps}），
+        // 数量对不上说明模型不对/版本不符，硬校验优于运行期错位
         if (g_det_sess->GetOutputCount() != 9) {
             LOGE("face_init: det outputs=%{public}d, expect 9",
                  (int)g_det_sess->GetOutputCount());
@@ -446,6 +522,7 @@ int face_init(const char *detPath, const char *lmPath, const char *gaPath, int n
             g_lm_in = n.get();
             auto o = g_lm_sess->GetOutputNameAllocated(0, alloc);
             g_lm_out = o.get();
+            // 输入边长从模型 shape 动态读取（不同导出版本可能 192/256）
             auto info = g_lm_sess->GetInputTypeInfo(0).GetTensorTypeAndShapeInfo();
             auto shape = info.GetShape();
             if (shape.size() == 4 && shape[2] > 0) g_lm_size = (int)shape[2];
@@ -477,10 +554,13 @@ int face_init(const char *detPath, const char *lmPath, const char *gaPath, int n
     return 0;
 }
 
+// ★ face_is_ready：无锁快查（渲染/工作线程每帧探测，atomic 读零开销）
 int face_is_ready(void) {
     return g_face_ready.load() ? 1 : 0;
 }
 
+// ★ face_release：三会话 + 全部复用缓冲（blob 清空并 shrink_to_fit 归还内存）
+//   + track 状态全量释放；由上层在关闭人脸功能/切模型时显式调用
 void face_release(void) {
     std::lock_guard<std::mutex> lk(g_face_mutex);
     g_det_sess.reset();
@@ -503,6 +583,16 @@ void face_release(void) {
  * [8..219] 106 关键点 x,y（图像坐标）
  * [220..226] 颜值分项 0~100(-1未知)：对称/眼形/眉形/鼻形/嘴形/三庭/眼型
  * 返回脸数（<=min(maxFaces,4)），未就绪返回 0 */
+// ★ face_detect_rgba：全流程主函数，六步（全程持 g_face_mutex）：
+//   ① RGBA→RGB→letterbox 640（长边贴合等比缩放、短边 pad 114，
+//      blob=(v-127.5)/128，insightface 官方预处理）
+//   ② SCRFD 推理（9 输出）
+//   ③ 三尺度解码（anchor 在整数 stride 网格点、每格 2 anchor、
+//      bbox/kps 增量 ×stride）
+//   ④ 按分排序 + NMS（IoU>0.4 抑制，最多 8 个）
+//   ⑤ letterbox 逆映射回原图坐标（减 pad 再除 scale）
+//   ⑥ 逐脸：track 关联（IoU≥0.3）→ 按需 genderage（5 票表决+7 中值年龄）
+//      → 106 关键点 → 颜值 7 分项 → 全部中值滤波后按 227 float 布局写出
 int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int maxFaces) {
     if (!g_face_ready.load() || !rgba || !facesOut || w <= 0 || h <= 0 || maxFaces <= 0) {
         return 0;
@@ -512,6 +602,7 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
 
     auto now = std::chrono::steady_clock::now();
     // track GC：3 秒未命中删除
+    // 先做过期回收再进入匹配，防止 track 列表被长期离场的脸占满
     g_tracks.erase(std::remove_if(g_tracks.begin(), g_tracks.end(),
                                   [&](const FaceTrack &t) {
                                       return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -538,6 +629,7 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
     g_det_mat.setTo(cv::Scalar(114, 114, 114));
     g_det_small.copyTo(g_det_mat(cv::Rect((kDetInput - detNw) / 2,
                                           (kDetInput - detNh) / 2, detNw, detNh)));
+    // 记录 letterbox 偏移：第 ⑤ 步逆映射要用（先减 pad 再除 scale）
     const float detPadX = (float)(kDetInput - detNw) * 0.5f;
     const float detPadY = (float)(kDetInput - detNh) * 0.5f;
     const size_t detPx = (size_t)kDetInput * kDetInput;
@@ -616,6 +708,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
     if (cands.empty()) return 0;
 
     // ④ NMS
+    // 按分降序贪心保留：与已保留框 IoU>0.4 的候选抑制（同一张脸的
+    // 相邻 anchor/多尺度重复框由此消除）；上限 8 个防极端场景开销失控
     std::sort(cands.begin(), cands.end(),
               [](const FaceBox &a, const FaceBox &b) { return a.score > b.score; });
     std::vector<FaceBox> keep;
@@ -654,6 +748,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
     }
 
     // ⑥ 每脸：106 关键点（必有）+ 性别年龄（track 节流）+ 颜值
+    // 输出容量 = min(调用方容量, 4)：关键点/性别年龄每脸都要推理，
+    // 限 4 脸控制单帧总时延（人脸场景极少同帧 5+ 张有效脸）
     const size_t outCap = std::min((size_t)maxFaces, kMaxFacesOut);
     int n = 0;
     for (const auto &b : keep) {
@@ -663,6 +759,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         o[4] = b.score;
 
         // track 匹配（IoU≥0.3）
+        // 在既有 track 里找 IoU 最大的：命中则延续该脸的投票/中值状态，
+        // 未命中则新建 track（并立刻触发一次 genderage）
         FaceTrack *tr = nullptr;
         float bestIoU = 0.0f;
         for (auto &t : g_tracks) {
@@ -674,6 +772,7 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         if (bestIoU < 0.3f) tr = nullptr;
         bool needGa = false;
         if (!tr) {
+            // 新 track：容量满时删最旧的（先进先出），再压入新轨迹
             if (g_tracks.size() >= kMaxTracks) g_tracks.erase(g_tracks.begin());
             FaceTrack nt;
             nt.x1 = b.x1; nt.y1 = b.y1; nt.x2 = b.x2; nt.y2 = b.y2;
@@ -702,6 +801,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
             }
             tr->x1 = b.x1; tr->y1 = b.y1; tr->x2 = b.x2; tr->y2 = b.y2;
             tr->lastSeen = now;
+            // genderage 推理节流：同一 track 1.2s 内不重复推理
+            // （96x96 推理虽快，但每脸每帧跑纯属浪费——属性不会秒变）
             if (std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - tr->lastGa).count() >= kGaRefreshMs) {
                 needGa = true;
@@ -713,6 +814,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
             float a = -1.0f;
             float m = 0.0f;
             if (runGenderAge(b, g, a, m)) {
+                // 低置信（margin<0.25）样本不投票：光线差/侧脸的性别 logit
+                // 几乎持平，硬投票只会污染表决结果
                 if (m >= kGaVoteMargin) {
                     tr->votes[tr->voteIdx] = g;
                     tr->voteIdx = (tr->voteIdx + 1) % 5;
@@ -740,6 +843,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
         o[6] = tr->age;
 
         // 106 关键点 + 颜值（含 7 分项：对称/眼形/眉形/鼻形/嘴形/三庭/眼型）
+        // pts 指向输出 [8..219]；颜值总分与 7 分项写入 [7]/[220..226]，
+        // 全部经 track 环形中值滤波后输出（UI 稳定不闪跳）
         float *pts = o + 8;
         if (runLandmarks(b, pts)) {
             float comp[7] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
@@ -787,6 +892,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
                 }
             }
         } else {
+            // 关键点推理失败：清零点位（防上层读到脏数据画乱线），
+            // 属性沿用 track 最近中值，保证 UI 不闪跳
             std::memset(pts, 0, sizeof(float) * 212);
             if (tr->beautyCnt > 0) {
                 // 裁剪失败帧：沿用最近中值，避免 UI 数值闪跳

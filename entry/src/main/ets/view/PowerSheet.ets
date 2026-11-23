@@ -1,3 +1,20 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ PowerSheet（PowerSheet.ets）—— 能耗设置半模态弹窗                             ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  点顶部"能耗"徽标弹出。平衡流畅度与耗电：                                     ║
+// ║   1. 四档模式：省电/标准/性能（POWER_PRESETS 预设）+ 自定义（恢复上次微调）    ║
+// ║   2. 三档参数对照表：直观展示各档默认参数差异（各档参数不同）                  ║
+// ║   3. 六项节奏滑条微调：预览帧间隔 20~100ms / 识别间隔·有目标 100~1000ms /     ║
+// ║      识别间隔·空闲 300~2000ms / 文字识别间隔 1000~10000ms step500 /           ║
+// ║      水深采样间隔 100~1000ms / 推理线程数 2~8；所有更改立即保存立即生效        ║
+// ║      （native 原子参数热更新，不重建管线）                                    ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  @Prop @Watch syncLocal：Index 选预设档改参数时同步本地缓冲，滑条跟着跳；      ║
+// ║  六滑条共用 localVals/localLabels 数组缓冲，松手才提交；                      ║
+// ║  ★ @Builder 按值传参不随状态刷新——数值/文案必须在体内直读 this.localXxx      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 能耗模式弹窗：三档预设 + 渲染/识别/传感节奏滑条微调
 import { POWER_PRESETS } from '../common/PowerPresets';
 
@@ -9,6 +26,7 @@ import { POWER_PRESETS } from '../common/PowerPresets';
  * ★ 关键：@Builder 按值传参不会随状态变化刷新 UI——
  *   滑条数值/文案必须在 @Builder 体内直接读 this.localVals/localLabels（状态直读才响应刷新）
  */
+// ★ PowerSheet：能耗设置弹窗主体（四档选择 + 参数对照 + 六滑条微调）
 @Component
 export struct PowerSheet {
   // ★ @Watch：父组件改参数（选预设档）时同步本地缓冲，弹窗内滑条跟着跳到预设值
@@ -17,9 +35,10 @@ export struct PowerSheet {
   @Prop @Watch('syncLocal') powerYoloMs: number = 300;
   @Prop @Watch('syncLocal') powerYoloIdleMs: number = 800;
   @Prop @Watch('syncLocal') powerSensorMs: number = 250;
-  @Prop @Watch('syncLocal') powerOcrMs: number = 4000;
+  @Prop @Watch('syncLocal') powerOcrMs: number = 1500;
   @Prop @Watch('syncLocal') powerThreads: number = 8;
 
+  // ── 交互回调：关闭/选预设档/自定义档/六滑条提交（松手才触发，立即生效） ──
   onClose?: () => void;
   onPresetSelect?: (mode: number) => void;
   onCustomSelect?: () => void;
@@ -32,7 +51,7 @@ export struct PowerSheet {
 
   @State appear: boolean = false;
   // ★ 六滑条本地缓冲（与滑条同单位）：拖动期间只更新本地值，松手才提交父组件
-  @State localVals: number[] = [40, 300, 800, 4000, 250, 8];
+  @State localVals: number[] = [40, 300, 800, 1500, 250, 8];
   // ★ 数值文案（@Builder 体内直读才刷新，不能按值传入）
   @State localLabels: string[] = ['40ms', '300ms', '800ms', '4.0s', '250ms', '8'];
 
@@ -59,12 +78,14 @@ export struct PowerSheet {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // ── 全屏半透明遮罩：appear 驱动 220ms 淡入，点击任意处关闭 ──
       Column()
         .width('100%').height('100%')
         .backgroundColor(this.appear ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)')
         .animation({ duration: 220, curve: Curve.EaseOut })
         .onClick(() => this.onClose?.())
 
+      // ── 底部面板容器：translate 620→0 上滑入场，限高 82% ──
       Column() {
         Row()
           .width(42).height(4).borderRadius(2)
@@ -95,6 +116,7 @@ export struct PowerSheet {
           .borderRadius(20)
           .onClick(() => this.onClose?.())
 
+        // ── 滚动配置区：四档 pill + 三档参数对照 + 六节奏滑条 ──
         Scroll() {
           Column() {
             // ───── 四档选择：省电/标准/性能 + 自定义 ─────
@@ -176,6 +198,7 @@ export struct PowerSheet {
     .width('100%').height('100%')
   }
 
+  // ★ 档位配色（省电绿/标准蓝/性能橙/自定义紫）：pill 与对照表共用
   private presetColor(mode: number): string {
     if (mode === 0) return '#34C759';
     if (mode === 1) return '#0A84FF';
@@ -183,6 +206,7 @@ export struct PowerSheet {
     return '#AF52DE';
   }
 
+  // ★ 模式 pill：选中用各档专属配色高亮，点击选档（自定义档走独立回调恢复上次微调）
   @Builder
   modePill(text: string, mode: number, activeColor: string, activeBg: string) {
     Text(text)

@@ -38,6 +38,19 @@
 *                                                                              *
 *******************************************************************************/
 
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ clipper.cpp —— Clipper 6.4.2 多边形裁剪/偏移库（Angus Johnson，三方原样移植） ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【职责】Vatti 裁剪算法的完整 C++ 实现：多边形布尔运算（Clipper 类）、         ║
+// ║   多边形偏移（ClipperOffset 类）、PolyTree 结果树与异常类型。                 ║
+// ║ 【在 OCR 流水线中的位置】唯一被 ocrlite 使用的地方是                          ║
+// ║   OcrUtils.cpp 的 unClip()——DB 文本检测后处理中调用                           ║
+// ║   ClipperOffset（jtRound 圆角模式）把二值化收缩的文本框向外扩边；             ║
+// ║   其余布尔裁剪功能（Clipper::Execute 等）不在 OCR 关键路径上。                ║
+// ║ 【使用说明】本文件为上游（RapidOcrOnnx 内置的 clipper 6.4.2）原样代码，       ║
+// ║   未做任何逻辑修改；下列中文注释仅作"分区导航"，函数级细节请参考              ║
+// ║   文件头部 Angus Johnson 的原文与 http://www.angusj.com 文档。                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 #include "clipper.hpp"
 #include <cmath>
 #include <vector>
@@ -1041,6 +1054,9 @@ namespace ClipperLib {
         return Result;
     }
 //------------------------------------------------------------------------------
+// ★ 分区：ClipperBase 路径注册——AddPath/AddPaths 把外部传入的多边形
+//   （Path=整型点列）转换为内部 TEdge 边结构并构建扫描线局部极小值列表
+//   （LocalMinimum），是后续一切裁剪/偏移计算的数据准备阶段。
 
     bool ClipperBase::AddPath(const Path &pg, PolyType PolyTyp, bool Closed)
     {
@@ -1493,6 +1509,9 @@ namespace ClipperLib {
 //------------------------------------------------------------------------------
 #endif
 
+// ★ 分区：Clipper 布尔裁剪执行——Execute 系列重载是 Vatti 算法的扫描线
+//   主循环入口（AEL 活动边表/交点处理/绕数填充），输出 Paths 或 PolyTree。
+//   OCR 流水线不直接使用本分区（仅 ClipperOffset 内部会复用 Clipper）。
     bool Clipper::Execute(ClipType clipType, Paths &solution, PolyFillType fillType)
     {
         return Execute(clipType, solution, fillType, fillType);
@@ -3884,6 +3903,10 @@ namespace ClipperLib {
     }
 //------------------------------------------------------------------------------
 
+// ★ 分区：ClipperOffset 多边形偏移——OCR 的 unClip() 唯一使用的分区：
+//   Execute(delta) 先 DoOffset 按距离 delta（DB 论文为 面积x系数/周长）
+//   沿法向外扩并加圆角（jtRound），再用 Clipper 做自交清理得到扩边后的
+//   外轮廓，最终由 minAreaRect 拟合成旋转矩形文本框。
     void ClipperOffset::Execute(Paths& solution, double delta)
     {
         solution.clear();

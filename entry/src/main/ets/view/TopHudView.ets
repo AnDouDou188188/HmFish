@@ -1,3 +1,23 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ TopHudView（TopHudView.ets）—— 顶部 HUD 状态条                                ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  屏幕顶部半透明状态条，集中展示运行状态并聚合功能入口：                        ║
+// ║   第 1 行（常显）：HUD 折叠徽标 + 模型名 + hud 透明度滑条 + 置信度 + 电池     ║
+// ║   折叠区（collapsed 控制显隐）：摄像头切换胶囊 / 五功能徽标                   ║
+// ║     （YOLO·OCR·能耗·画面·表格）/ 人脸行 / YOLO 合并结果 / 运动等级 /         ║
+// ║     水深读数与历史 / OCR 摘要（"x行共x字·点击查看"或"识别中 done/total"）      ║
+// ║   录像时另有红点"正在录像 m:ss"横幅（随 hudOpacity）                          ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  全部状态 @Prop 由 Index 下发（识别结果经 VisionController 节流合并）；        ║
+// ║  开关/弹窗入口/透明度经 onXxx 回调上抛；localOpacity 本地缓冲切断 @Prop        ║
+// ║  回写回路（否则拖动滑条会被父状态回写打断/回跳）；collapsed 为本地折叠态      ║
+// ║                                                                              ║
+// ║ 【关键契约】                                                                 ║
+// ║  根容器 hitTestBehavior(Transparent)：本容器 100%×100% 全屏，               ║
+// ║  Default 会响应全屏命中测试并阻塞所有低 z 兄弟节点（预览触摸层/捏合缩放）     ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 顶部 HUD：合并结果/计数/相机信息等顶部状态展示
 import { Merged } from '../common/Types';
 
@@ -22,8 +42,10 @@ function faceRowBg(hex: string): string {
   return `rgba(${r},${g},${b},0.18)`;
 }
 
+// ★ TopHudView：顶部 HUD 主体（第一行常显 + collapsed 控制折叠区显隐）
 @Component
 export struct TopHudView {
+  // ★ 基础状态：当前摄像头位（0后置/1前置/2USB）/USB 是否在连/各功能开关/HUD 整体透明度
   @Prop cameraPosition: number;
   @Prop usbConnected: boolean;
   @Prop yoloEnabled: boolean;
@@ -31,6 +53,8 @@ export struct TopHudView {
   @Prop hudOpacity: number;
   // ★ HUD 顶部偏移：状态栏安全区高度+小间距（父组件按窗口安全区计算传入）
   @Prop hudTopOffset: number = 44;
+  // ★ 识别与传感数据（Index 节流合并后下发）：YOLO 合并结果列表/
+  //   运动等级(0~1)/水深当前读数(cm)
   @Prop mergedList: Merged[];
   @Prop motionLevel: number;
   @Prop motionEnabled: boolean;
@@ -63,6 +87,8 @@ export struct TopHudView {
   // ★ 画面增强模式（画面徽标按设置变色区分）：0关/1非AI/2 AI增强
   @Prop usbEnhanceMode: number = 0;
 
+  // ── 与 Index 的交互回调：选摄像头/各功能开关（短按）与长按弹设置/
+  //    透明度实时提交/各弹窗入口/人脸详情/表格识别触发 ──
   onCameraSelect?: (pos: number) => void;
   // ★ 画面设置胶囊：USB 增强/识别框/人脸识别统一入口
   onShowPictureSheet?: () => void;
@@ -87,10 +113,12 @@ export struct TopHudView {
   // ★ HUD 折叠：点模型名前的 HUD 徽标切换；折叠时只显示第一行（模型名+透明度滑条）
   @State collapsed: boolean = false;
 
+  // ★ 入场：透明度滑条本地缓冲对齐父状态（拖动期间以本地值为准）
   aboutToAppear(): void {
     this.localOpacity = this.hudOpacity;
   }
 
+  // ★ 录像秒数格式化为 m:ss
   private fmtSec(): string {
     const s = Math.max(0, this.recordSec);
     const m = Math.floor(s / 60);
@@ -118,6 +146,7 @@ export struct TopHudView {
     Stack() {
       // ★ HUD 紧凑化：间距/内边距整体收紧，减少对画面的遮挡
         Column({ space: 7 }) {
+        // ── 录像横幅：红点闪烁 + "正在录像 m:ss"（仅录像时显示） ──
         if (this.isRecording) {
           Row({ space: 5 }) {
             Row().width(7).height(7).borderRadius(3.5)
@@ -133,6 +162,8 @@ export struct TopHudView {
           .opacity(this.hudOpacity)
         }
 
+        // ── 第一行（常显，折叠时也保留）：HUD 折叠徽标 / 模型名 /
+        //    hud 透明度滑条 / 置信度 / 电池 ──
         Row({ space: 5 }) {
           // ★ HUD 徽标（模型名前）：点击折叠/展开整个 HUD；折叠时只留第一行
           Row({ space: 3 }) {
@@ -318,6 +349,7 @@ export struct TopHudView {
           }.width('100%').margin({ top: 5 })
         }
 
+        // ── YOLO 合并结果（最多显示 4 类）：彩点 + 类名 + 数量 + 平均置信度 ──
         if (this.yoloEnabled && this.mergedList.length > 0) {
           Divider().color('rgba(255,255,255,0.1)').margin({ top: 1, bottom: 1 })
           Column({ space: 2 }) {
@@ -338,6 +370,7 @@ export struct TopHudView {
 
         Divider().color('rgba(255,255,255,0.1)').margin({ top: 1, bottom: 1 })
 
+        // ── 运动等级：数值行（越阈值变红点）+ 阈值刻度进度条（越线即触发） ──
         if (this.motionEnabled) {
           Row({ space: 5 }) {
             Row().width(5).height(5).borderRadius(2.5)
@@ -361,6 +394,7 @@ export struct TopHudView {
           }.width('100%')
         }
 
+        // ── 水深：当前读数行 + 最近 3 次历史记录（最新在上，可回看） ──
         if (this.depthEnabled) {
           Column() {
             Row({ space: 5 }) {
@@ -383,6 +417,8 @@ export struct TopHudView {
           }.width('100%')
         }
 
+        // ── 文字识别：摘要行（识别完成="x行共x字·点击查看" / 识别中="done/total"）
+        //    + 前 5 行文本预览；整块点击弹出全文弹窗 ──
         if (this.ocrEnabled) {
           Divider().color('rgba(255,255,255,0.1)').margin({ top: 1, bottom: 1 })
 
@@ -396,8 +432,13 @@ export struct TopHudView {
               }
               Blank()
               if (this.ocrText.length > 0) {
-                Text(`${this.ocrText.split('\n').length} 行 · 点击查看`)
+                // ★ 识别完成摘要："x行共x字"（行数=非空行，字数=去掉换行符后的字符总数），
+                //   "点击查看"作为尾巴提示可点开全文弹窗
+                Text(`${this.ocrText.split('\n').length}行共${this.ocrText.replace(/\n/g, '').length}字 · 点击查看`)
                   .fontSize(9).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .constraintSize({ maxWidth: '55%' })
               } else {
                 // ★ 识别中：旋转进度徽标；识别进度（done/total）只在这里显示，不画在画面上
                 Row({ space: 4 }) {
@@ -448,6 +489,8 @@ export struct TopHudView {
     .hitTestBehavior(HitTestMode.Transparent)
   }
 
+  // ★ 摄像头切换胶囊：选中半透明彩色底+彩边+彩字（每类专属配色）；
+  //   busy（切换/加载中）或 USB 未连接时半透明禁点，防止状态错乱
   @Builder
   camPill(text: string, pos: number, activeColor: string, activeBg: string) {
     Row({ space: 4 }) {

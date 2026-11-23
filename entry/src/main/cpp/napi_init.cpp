@@ -1,5 +1,20 @@
-// ★ NAPI 桥接层：ArkTS ↔ native(libentry.so) 全部导出函数注册与参数转换，
-//   含管线生命周期、设置下发、拍照/录像、UVC 连接取流等入口
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ napi_init.cpp —— ArkTS ↔ C++ NAPI 桥接层（entry 模块 native 实现）          ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【文件职责】ArkTS ↔ native(libentry.so) 全部导出函数注册与参数转换，          ║
+// ║   含管线生命周期、设置下发、拍照/录像、UVC 连接取流等入口。                    ║
+// ║   所有 JS 可调用的 native 能力都在 Init() 的 napi_property_descriptor 表中     ║
+// ║   声明并挂载到 exports 对象，ArkTS 侧 import 'libentry.so' 后直接调用。        ║
+// ║                                                                              ║
+// ║ 【核心数据流】ArkTS（页面/UI）→ NAPI 参数解包 → 全局单例（gPipeline 管线/    ║
+// ║   gDetector 检测器/ocr_bridge→libocr.so/UvcCamera）→ 各业务实现。             ║
+// ║   耗时操作（模型加载/引擎释放/表格识别）一律走 napi_async_work + Promise，     ║
+// ║   避免主线程卡顿触发 appfreeze。                                              ║
+// ║                                                                              ║
+// ║ 【线程安全】gPipelineMutex/gDetectorMutex 串行化全部单例访问；设置类状态       ║
+// ║   （水印/变焦/YOLO 开关/字体/类名）额外维护"会话级缓存"——管线销毁重建         ║
+// ║   （切换前后摄像头/USB 重连/退后台）后立即回灌，ArkTS 无需重复下发。           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 #include <napi/native_api.h>
 #include <cstring>
 #include <cstdlib>
@@ -23,12 +38,19 @@
 #include "OcrBridge.h"
 #include "uvc_camera.h"
 
+// ───────── 全局单例与会话级状态 ─────────
+// ★ gDetector：YOLO 检测器全局单例（initYolo/detect 与管线内部同步检测
+//   NativeDetectOnRgba 共用），全部访问经 gDetectorMutex 串行
 static std::unique_ptr<YoloDetector> gDetector;
 static std::mutex gDetectorMutex;
+// ★ gConfThresh：YOLO 置信度阈值（setConfThresh 入口），同步检测路径共用
 static float gConfThresh = 0.25f;
+// ★ gPipeline：渲染管线全局单例（相机会话级，切换/重连时销毁重建）
 static std::unique_ptr<YuvPipeline> gPipeline;
 static std::mutex gPipelineMutex;
 
+// ★ 字体/类名会话级缓存：管线实例销毁重建后这两项设置随实例丢失，
+//   而 ArkTS 不会重新下发 → 全局存一份，重建后立即回灌
 static std::string gPendingFontPath;
 static std::vector<std::string> gPendingClassNames;
 // ★ 位置水印全局缓存：管线切摄像头/退后台重连会销毁重建（locationText_/locBottomRatio_ 随实例丢失），
@@ -43,6 +65,9 @@ static std::atomic<bool> gYoloOn{true};
 // USB 摄像头数字变焦的会话级状态：管线重建（USB 重连）后需重新应用到新实例
 static std::atomic<float> gUvcZoom{1.0f};
 
+// ★ extern "C" 跨文件函数声明：实现在 yuv_pipeline.cpp，用 C 链接避免 C++ 名字修饰，
+//   此处直接声明即可调用（无需额外头文件）；涵盖管线内部开关/参数（识别框、画质增强、
+//   人脸、运动、水深）与能耗节奏参数的 setter/getter
 extern "C" {
     void SetYoloEnabled(bool enabled);
     // ★ 识别框/标签画面显示开关（yuv_pipeline.cpp 定义）
@@ -63,6 +88,9 @@ extern "C" {
     void SetPipelineTiming(int renderMs, int yoloActiveMs, int yoloIdleMs, int sensorMs);
 }
 
+// ★ NativeDetectOnRgba：同步 YOLO 检测入口（非 NAPI，供 yuv_pipeline.cpp 的
+//   推理线程回调）：try_lock 保证渲染线程永不阻塞——检测器被换（initYolo/
+//   releaseYolo 持锁中）时直接返回 false 跳过本帧；置信度取 gConfThresh，NMS 固定 0.25
 bool NativeDetectOnRgba(const uint8_t *rgba, int w, int h, std::vector<Detection> &out) {
     std::unique_lock<std::mutex> lock(gDetectorMutex, std::try_to_lock);
     if (!lock.owns_lock() || !gDetector) return false;
@@ -71,6 +99,10 @@ bool NativeDetectOnRgba(const uint8_t *rgba, int w, int h, std::vector<Detection
 }
 
 // ═══════════ YOLO ═══════════
+// ★ InitYolo（ArkTS 调用名：initYolo）：加载 YOLO 鱼类识别模型（ncnn）。
+//   参数：args[0]=param 文件路径，args[1]=bin 文件路径，args[2]=模型输入边长（默认 640）。
+//   要点：先同步释放旧检测器（防止双模型占内存）、持锁重建；
+//   返回值：boolean 是否加载成功
 // ★ 修改：接收 paramPath, binPath, inputSize 三个参数
 static napi_value InitYolo(napi_env env, napi_callback_info info) {
     size_t argc = 3; 
@@ -98,6 +130,10 @@ static napi_value InitYolo(napi_env env, napi_callback_info info) {
     return r;
 }
 
+// ★ Detect（ArkTS 调用名：detect）：一次性同步 YOLO 检测（调试/演示路径，
+//   正式识别走管线内部异步线程）。参数：args[0]=RGBA ArrayBuffer，args[1]=宽，
+//   args[2]=高，args[3]=置信度阈值。要点：try_lock 防阻塞（模型被换时返回空数组）；
+//   返回值：二维数组，每项 [x,y,w,h,score,label]（x,y 为框中心，图像坐标）
 static napi_value Detect(napi_env env, napi_callback_info info) {
     napi_value empty; napi_create_array(env, &empty);
     size_t argc = 4; napi_value args[4];
@@ -125,6 +161,8 @@ static napi_value Detect(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// ★ ReleaseYolo（ArkTS 调用名：releaseYolo）：释放 YOLO 检测器，
+//   释放 ncnn 网络/缓冲内存；无参数无返回值，可安全重复调用
 static napi_value ReleaseYolo(napi_env env, napi_callback_info info) {
     std::lock_guard<std::mutex> lock(gDetectorMutex);
     if (gDetector) { gDetector->Release(); gDetector.reset(); }
@@ -132,6 +170,11 @@ static napi_value ReleaseYolo(napi_env env, napi_callback_info info) {
 }
 
 // ═══════════ YuvPipeline (保持原样) ═══════════
+// ★ CreateYuvReceiver（ArkTS 调用名：createYuvReceiver）：创建手机相机路径渲染管线。
+//   参数：args[0]/args[1]=占位宽/高（相机档位 init 后才确定，之后 updateFrameSize 校正）。
+//   要点：先停旧管线再重建 → 按序回灌会话级状态（YOLO 开关/位置水印/字体/类名）→
+//   CreateReceiver 取接收 surfaceId；失败返回 undefined，成功返回 surfaceId 字符串
+//   （ArkTS 用它配置相机输出）。管线"销毁重建"是切换前后摄像头/退后台重连的统一入口
 static napi_value CreateYuvReceiver(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -160,6 +203,9 @@ static napi_value CreateYuvReceiver(napi_env env, napi_callback_info info) {
     napi_value r; napi_create_string_utf8(env, sid.c_str(), sid.size(), &r); return r;
 }
 
+// ★ StartPipeline（ArkTS 调用名：startPipeline）：启动管线（订阅相机帧回调、
+//   拉起全部工作线程）。要点：启动前再补灌一次字体/类名（兼容 ArkTS 先 setFontPath
+//   后 startPipeline 的时序），幂等可重复调用
 static napi_value StartPipeline(napi_env env, napi_callback_info) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
     if (gPipeline) {
@@ -172,6 +218,7 @@ static napi_value StartPipeline(napi_env env, napi_callback_info) {
 
 // ★ 手机相机路径：createYuvReceiver 用占位尺寸创建，camera init 选定实际
 //   预览档位后调用本接口把管线处理尺寸对齐到真实档位（保留旋转/镜像）
+// （ArkTS 调用名：updateFrameSize）参数：args[0]/args[1]=实际预览档位宽/高；返回值：boolean
 static napi_value UpdateFrameSizeNapi(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -184,6 +231,9 @@ static napi_value UpdateFrameSizeNapi(napi_env env, napi_callback_info info) {
     napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
+// ★ StopPipeline（ArkTS 调用名：stopPipeline）：停止并销毁渲染管线。
+//   要点：必须先停 UVC 取流并断开（UVC 帧回调持有管线裸指针，先停 UVC 防止
+//   回调访问悬垂指针），再 join 管线各线程后销毁。相机页面销毁/退后台的统一出口
 static napi_value StopPipeline(napi_env env, napi_callback_info) {
     // 若 UVC 尚在推流，先停 UVC 再销毁管线，避免帧回调访问悬垂指针
     UvcCamera::Instance().Stop();
@@ -194,6 +244,12 @@ static napi_value StopPipeline(napi_env env, napi_callback_info) {
 }
 
 // ═══════════ UVC（USB 摄像头，fd 注入） ═══════════
+// ★ SetupExternalPipeline（ArkTS 调用名：setupExternalPipeline）：创建 USB 摄像头
+//   路径渲染管线（无 ImageReceiver，uvc_camera 帧回调解码出 RGBA 反调 ProcessExternalRgba 供帧）。
+//   参数：args[0]/args[1]=相机协商出的取流宽/高。
+//   要点：先停旧 UVC 与旧管线 → 重建 → 回灌会话级状态（YOLO 开关/变焦/位置水印/
+//   字体/类名）→ ConfigureExternal；成功直接 StartExternal，失败销毁新管线。
+//   返回值：boolean 是否创建成功
 static napi_value SetupExternalPipeline(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -223,6 +279,9 @@ static napi_value SetupExternalPipeline(napi_env env, napi_callback_info info) {
     napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
+// ★ UvcConnectNapi（ArkTS 调用名：uvcConnect）：打开 USB 摄像头设备。
+//   参数：args[0]=fd（ArkTS 经 USBManager 打开的设备节点），args[1]/args[2]=VID/PID，
+//   args[3]/args[4]=总线号/设备地址（诊断用）。返回值：boolean 是否连接成功
 static napi_value UvcConnectNapi(napi_env env, napi_callback_info info) {
     size_t argc = 5; napi_value args[5];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -237,6 +296,10 @@ static napi_value UvcConnectNapi(napi_env env, napi_callback_info info) {
     napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
+// ★ UvcStartStreamingNapi（ArkTS 调用名：uvcStartStreaming）：启动 USB 取流。
+//   参数：args[0]/args[1]=取流宽/高，args[2]=帧率。
+//   要点：持 gPipelineMutex 把相机对象绑定到当前管线（帧回调解码后直投管线）。
+//   返回值：boolean 是否取流成功
 static napi_value UvcStartStreamingNapi(napi_env env, napi_callback_info info) {
     size_t argc = 3; napi_value args[3];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -253,11 +316,15 @@ static napi_value UvcStartStreamingNapi(napi_env env, napi_callback_info info) {
     napi_value r; napi_get_boolean(env, ok, &r); return r;
 }
 
+// ★ UvcStopStreamingNapi（ArkTS 调用名：uvcStopStreaming）：停止 USB 取流
+//   （保留设备连接，可再次 startStreaming 而无需重连）
 static napi_value UvcStopStreamingNapi(napi_env env, napi_callback_info) {
     UvcCamera::Instance().Stop();
     return nullptr;
 }
 
+// ★ UvcDisconnectNapi（ArkTS 调用名：uvcDisconnect）：停止取流并关闭 USB 设备
+//   （释放 fd 与 libuvc 资源，下次使用需重新 uvcConnect）
 static napi_value UvcDisconnectNapi(napi_env env, napi_callback_info) {
     UvcCamera::Instance().Stop();
     UvcCamera::Instance().Disconnect();
@@ -265,6 +332,7 @@ static napi_value UvcDisconnectNapi(napi_env env, napi_callback_info) {
 }
 
 // 取最近一次 UVC Connect/Start 失败的具体原因（阶段+错误码+errno）
+// （ArkTS 调用名：uvcGetLastError）返回值：string（空错误时返回 "no error"）
 static napi_value UvcGetLastError(napi_env env, napi_callback_info) {
     std::string err = UvcCamera::Instance().GetLastError();
     if (err.empty()) err = "no error";
@@ -272,27 +340,35 @@ static napi_value UvcGetLastError(napi_env env, napi_callback_info) {
 }
 
 // ★ 设备上报的格式/分辨率清单（诊断协商失败）
+// （ArkTS 调用名：uvcDumpFormats）返回值：string（设备描述符中的格式/分辨率列表）
 static napi_value UvcDumpFormatsNapi(napi_env env, napi_callback_info) {
     std::string s = UvcCamera::Instance().DumpFormats();
     napi_value r; napi_create_string_utf8(env, s.c_str(), s.size(), &r); return r;
 }
 
 // ★ 取流帧计数（"连接成功但黑屏"看门狗：0=无帧、停增=断流、decodeFail=解码失败）
+// （ArkTS 调用名：uvcGetFrameCount）返回值：number（累计帧数）
 static napi_value UvcGetFrameCountNapi(napi_env env, napi_callback_info) {
     napi_value r; napi_create_uint32(env, UvcCamera::Instance().FrameCount(), &r); return r;
 }
 
+// ★ UvcGetDecodeFailCountNapi（ArkTS 调用名：uvcGetDecodeFailCount）：USB 帧解码累计
+//   失败计数（偶发增长属正常，持续快速增长=码流异常；配合帧数看门狗区分"无帧"
+//   与"有帧解不出"两种黑屏成因）。返回值：number
 static napi_value UvcGetDecodeFailCountNapi(napi_env env, napi_callback_info) {
     napi_value r; napi_create_uint32(env, UvcCamera::Instance().DecodeFailCount(), &r); return r;
 }
 
 // ★ 首帧诊断（帧描述尺寸 vs JPEG 真实尺寸 vs actual_bytes/帧头 + 解码返回码）：
 //   连接成功但黑屏时一次定位真因
+// （ArkTS 调用名：uvcGetFrameInfo）返回值：string（首帧多维诊断信息）
 static napi_value UvcGetFrameInfoNapi(napi_env env, napi_callback_info) {
     std::string s = UvcCamera::Instance().GetFrameInfo();
     napi_value r; napi_create_string_utf8(env, s.c_str(), s.size(), &r); return r;
 }
 
+// ★ GetLatestResults（ArkTS 调用名：getLatestResults）：取最近一帧 YOLO 检测结果。
+//   返回值：二维数组，每项 [x,y,w,h,score,label]（图像坐标，x,y 为框中心与边长）
 static napi_value GetLatestResults(napi_env env, napi_callback_info) {
     napi_value result; napi_create_array(env, &result);
     std::vector<DetectItem> items;
@@ -306,12 +382,16 @@ static napi_value GetLatestResults(napi_env env, napi_callback_info) {
     return result;
 }
 
+// ★ GetInferCount（ArkTS 调用名：getInferCount）：取 YOLO 累计推理次数（HUD 统计）。
+//   返回值：number（可能超 2^31，故用 napi_create_double）
 static napi_value GetInferCount(napi_env env, napi_callback_info) {
     uint64_t c = 0;
     { std::lock_guard<std::mutex> lock(gPipelineMutex); if (gPipeline) c = gPipeline->GetInferCount(); }
     napi_value r; napi_create_double(env, (double)c, &r); return r;
 }
 
+// ★ SetConfThresh（ArkTS 调用名：setConfThresh）：设置 YOLO 置信度阈值。
+//   参数：args[0]=阈值（0~1）。对管线内检测与 detect 接口同时生效
 static napi_value SetConfThresh(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -320,6 +400,9 @@ static napi_value SetConfThresh(napi_env env, napi_callback_info info) {
     napi_value u; napi_get_undefined(env, &u); return u;
 }
 
+// ★ CaptureLatestFrame（ArkTS 调用名：captureLatestFrame）：拍照——取当前显示帧
+//   （含叠加层：检测框/水印/OCR 框）。返回值：ArrayBuffer（RGBA 数据，像素编码
+//   需配合 getFrameSize）；管线未启动返回零长度 ArrayBuffer
 static napi_value CaptureLatestFrame(napi_env env, napi_callback_info) {
     std::vector<uint8_t> data;
     { std::lock_guard<std::mutex> lock(gPipelineMutex); if (gPipeline) data = gPipeline->GetLatestRgba(); }
@@ -329,6 +412,8 @@ static napi_value CaptureLatestFrame(napi_env env, napi_callback_info) {
     return buf;
 }
 
+// ★ GetFrameSize（ArkTS 调用名：getFrameSize）：取最终显示帧尺寸。
+//   返回值：[宽, 高] 数组（像素），ArkTS 拍照编码/画布绘制依赖此值
 static napi_value GetFrameSize(napi_env env, napi_callback_info) {
     int w = 0, h = 0;
     { std::lock_guard<std::mutex> lock(gPipelineMutex); if (gPipeline) gPipeline->GetFrameSize(w, h); }
@@ -338,6 +423,9 @@ static napi_value GetFrameSize(napi_env env, napi_callback_info) {
     return arr;
 }
 
+// ★ SetYoloEnabledNapi（ArkTS 调用名：setYoloEnabled）：YOLO 识别总开关。
+//   参数：args[0]=boolean。要点：三重写入——gYoloOn 会话级缓存（管线重建后回灌）、
+//   extern "C" SetYoloEnabled（native 侧检测状态）、当前管线实例（立即停止入队）
 static napi_value SetYoloEnabledNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -348,6 +436,8 @@ static napi_value SetYoloEnabledNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ SetMotionEnabledNapi（ArkTS 调用名：setMotionEnabled）：运动检测开关
+//   （鱼群活跃度评估）。参数：args[0]=boolean；实现在 yuv_pipeline.cpp（帧差统计）
 static napi_value SetMotionEnabledNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -356,11 +446,15 @@ static napi_value SetMotionEnabledNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ GetMotionLevelNapi（ArkTS 调用名：getMotionLevel）：取当前画面运动强度。
+//   返回值：number（帧差统计值，0=无运动，越大越剧烈）
 static napi_value GetMotionLevelNapi(napi_env env, napi_callback_info info) {
     float level = GetMotionLevel();
     napi_value result; napi_create_double(env, (double)level, &result); return result;
 }
 
+// ★ SetDepthEnabledNapi（ArkTS 调用名：setDepthEnabled）：水深估算开关
+//   （探鱼场景，结合运动强度与钓组参数估算）。参数：args[0]=boolean
 static napi_value SetDepthEnabledNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -369,12 +463,15 @@ static napi_value SetDepthEnabledNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ GetDepthCmNapi（ArkTS 调用名：getDepthCm）：取当前估算水深。
+//   返回值：number（厘米，未开启估算时为 0）
 static napi_value GetDepthCmNapi(napi_env env, napi_callback_info info) {
     float depth = GetDepthCm();
     napi_value result; napi_create_double(env, (double)depth, &result); return result;
 }
 
 // ★ 用户设置水深模型参数：摄像头重量(g)、水的浑浊度(0清澈/1微浑/2浑浊)
+// （ArkTS 调用名：setDepthParams）参数：args[0]=坠重（克），args[1]=浑浊度档位
 static napi_value SetDepthParamsNapi(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -386,6 +483,7 @@ static napi_value SetDepthParamsNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ 识别框/标签画面显示开关：false 时检测照常，仅不绘制框与文字
+// （ArkTS 调用名：setDrawBoxesEnabled）参数：args[0]=boolean
 static napi_value SetDrawBoxesNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -398,6 +496,8 @@ static napi_value SetDrawBoxesNapi(napi_env env, napi_callback_info info) {
 // ★ 画质增强（USB/手机前后置全部相机生效）：
 //   mode 0 关 / 1 非AI(亮度+锐度+对比度+饱和度) / 2 AI增强
 //   （超分细节 + AI降噪 + 水下去浊 + 色彩还原，修复层异步合成不卡顿）
+// （ArkTS 调用名：setUsbEnhance）参数：args[0]=mode，args[1..4]=亮度/锐度/对比度/饱和度，
+//   args[5]=AI 强度，args[6]=降噪，args[7]=清晰度，args[8]=色彩还原
 static napi_value SetUsbEnhanceNapi(napi_env env, napi_callback_info info) {
     size_t argc = 9; napi_value args[9];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -421,6 +521,8 @@ static napi_value SetUsbEnhanceNapi(napi_env env, napi_callback_info info) {
 // ═══════════ 人脸识别（SCRFD det_500m + 2d106det 106 关键点 + genderage）═══════════
 
 // 异步加载三个人脸模型（对齐 initTable 模式，避免阻塞 UI 线程）
+// ★ FaceInitCtx：异步工作上下文——三个模型路径 + 推理线程数 + 结果标志；
+//   JS 入口 new、Complete 回调 delete（napi_async_work 固定资源生命周期，防泄漏）
 struct FaceInitCtx {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
@@ -431,6 +533,8 @@ struct FaceInitCtx {
     bool ok = false;
 };
 
+// ★ FaceInitExecute：异步加载执行体（napi 工作线程，UI 不阻塞）——
+//   先确保 libocr.so 已加载（内部 dlopen+dlsym），再 faceInit 加载检测/关键点/性别年龄三模型
 static void FaceInitExecute(napi_env env, void *data) {
     auto *ctx = static_cast<FaceInitCtx *>(data);
     if (!ocr_bridge::load()) {
@@ -441,6 +545,8 @@ static void FaceInitExecute(napi_env env, void *data) {
     ctx->ok = ocr_bridge::faceInit(ctx->detPath, ctx->lmPath, ctx->gaPath, ctx->threads);
 }
 
+// ★ FaceInitComplete：异步加载完成回调（JS 线程）——resolve Promise<boolean>，
+//   按序清理 async work 与上下文（napi_delete_async_work → delete ctx）
 static void FaceInitComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<FaceInitCtx *>(data);
     napi_value result = nullptr;
@@ -450,6 +556,9 @@ static void FaceInitComplete(napi_env env, napi_status status, void *data) {
     delete ctx;
 }
 
+// ★ InitFace（ArkTS 调用名：initFace）：异步加载人脸模型集，返回 Promise<boolean>。
+//   参数：args[0]=检测模型路径，args[1]=关键点模型路径，args[2]=性别年龄模型路径，
+//   args[3]=推理线程数（默认 3）。模型推理实现在 libocr.so，经 ocr_bridge 桥接
 static napi_value InitFace(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4];
@@ -481,12 +590,14 @@ static napi_value InitFace(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ★ ReleaseFace（ArkTS 调用名：releaseFace）：释放人脸模型集（回收 onnxruntime 会话内存）
 static napi_value ReleaseFace(napi_env env, napi_callback_info) {
     ocr_bridge::faceRelease();
     return nullptr;
 }
 
 // ★ 人脸识别画面开关：false 时工作线程不再入队，已画连线框 1.5s 过期自动消失
+// （ArkTS 调用名：setFaceEnabled）参数：args[0]=boolean
 static napi_value SetFaceEnabledNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -497,6 +608,7 @@ static napi_value SetFaceEnabledNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ HUD 人脸信息（JSON：count/faces[gender,age,beauty,x,y,w,h]，500ms 轮询）
+// （ArkTS 调用名：getFaceInfo）返回值：string（JSON，管线未启动返回 {"count":0,"faces":[]}）
 static napi_value GetFaceInfoNapi(napi_env env, napi_callback_info) {
     std::string json = "{\"count\":0,\"faces\":[]}";
     {
@@ -509,6 +621,8 @@ static napi_value GetFaceInfoNapi(napi_env env, napi_callback_info) {
 }
 
 // ★ AI 超分模型加载（libocr.so 经 OcrBridge dlsym）：onnxPath + 推理线程数
+// （ArkTS 调用名：initSr）参数：args[0]=ONNX 模型路径，args[1]=线程数（默认 4）；
+//   返回值：boolean 是否加载成功
 static napi_value InitSrNapi(napi_env env, napi_callback_info info) {
     size_t argc = 2; napi_value args[2];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -523,11 +637,15 @@ static napi_value InitSrNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ 释放超分模型（切换/关闭时回收 25MB 级推理缓冲）
+// （ArkTS 调用名：releaseSr）无参数无返回值
 static napi_value ReleaseSrNapi(napi_env env, napi_callback_info info) {
     ocr_bridge::srRelease();
     return nullptr;
 }
 
+// ★ AttachPreviewSurface（ArkTS 调用名：attachPreviewSurface）：把 XComponent 的
+//   预览 surface 绑定到管线。参数：args[0]=surfaceId 字符串（十进制）。
+//   要点：由 id 创建 native window 交给管线；绑定后渲染帧直接上屏
 static napi_value AttachPreviewSurface(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -552,6 +670,8 @@ static napi_value AttachPreviewSurface(napi_env env, napi_callback_info info) {
 
 // ★ 录像直供：AVRecorder getInputSurface 的 surfaceId 交给 native，
 //   由现有帧路径直接喂 NV12 帧（相机/预览不重配不中断）
+// （ArkTS 调用名：attachRecordSurface）参数：args[0]=录像 surfaceId 字符串，
+//   args[1]/args[2]=录像宽/高；无返回值
 static napi_value AttachRecordSurfaceNapi(napi_env env, napi_callback_info info) {
     size_t argc = 3; napi_value args[3];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -576,12 +696,16 @@ static napi_value AttachRecordSurfaceNapi(napi_env env, napi_callback_info info)
     return nullptr;
 }
 
+// ★ DetachRecordSurfaceNapi（ArkTS 调用名：detachRecordSurface）：解绑录像 surface，
+//   录像停止/失败时调用，此后管线不再向录像窗口供帧
 static napi_value DetachRecordSurfaceNapi(napi_env, napi_callback_info) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
     if (gPipeline) gPipeline->DetachRecordSurface();
     return nullptr;
 }
 
+// ★ SetRotationNapi（ArkTS 调用名：setRotation）：设置画面旋转角（0/90/180/270，
+//   相机传感器方向+屏幕方向合成值）。参数：args[0]=角度；90/270 时宽高互换
 static napi_value SetRotationNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -594,6 +718,7 @@ static napi_value SetRotationNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ 前置摄像头镜像开关（对齐 Android 前摄自拍镜像预览）
+// （ArkTS 调用名：setMirror）参数：args[0]=boolean
 static napi_value SetMirrorNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -605,6 +730,8 @@ static napi_value SetMirrorNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ ClearSurfaceNapi（ArkTS 调用名：clearSurface）：清空预览 surface（填黑帧），
+//   防止切换摄像头/停管线后画面残留上一帧
 static napi_value ClearSurfaceNapi(napi_env env, napi_callback_info) {
     std::lock_guard<std::mutex> lock(gPipelineMutex);
     if (gPipeline) gPipeline->ClearSurface();
@@ -612,6 +739,7 @@ static napi_value ClearSurfaceNapi(napi_env env, napi_callback_info) {
 }
 
 // ★ USB 摄像头数字变焦（照抄 Android CameraUVC.setZoomScale：1.0~5.0，中心裁剪放大）
+// （ArkTS 调用名：setUvcZoom）参数：args[0]=变焦倍数；会话级缓存 gUvcZoom，USB 重连后回灌
 static napi_value SetUvcZoomNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -625,6 +753,7 @@ static napi_value SetUvcZoomNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ 位置水印文字：ArkTS 逆地理解析的地理位置名，画到图片/录像底部居中（空串=清除）
+// （ArkTS 调用名：setLocationText）参数：args[0]=位置名；会话级缓存，管线重建后回灌
 static napi_value SetLocationTextNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -639,6 +768,7 @@ static napi_value SetLocationTextNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ 位置水印纵向位置：预览底部被底部面板遮挡时，ArkTS 按可见区域传比例上移
+// （ArkTS 调用名：setLocationBottomRatio）参数：args[0]=纵向位置比例（0.4~1.0）
 static napi_value SetLocationBottomRatioNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -652,6 +782,8 @@ static napi_value SetLocationBottomRatioNapi(napi_env env, napi_callback_info in
 }
 
 // ═══════════ OCR ═══════════
+// ★ OcrAsyncCtx：OCR 引擎初始化异步工作上下文——模型目录 + 结果标志；
+//   生命周期与 FaceInitCtx 相同（Execute/Complete 配对 new/delete）
 struct OcrAsyncCtx {
     napi_async_work work = nullptr;
     napi_deferred deferred = nullptr;
@@ -659,6 +791,8 @@ struct OcrAsyncCtx {
     bool ok = false;
 };
 
+// ★ OcrInitExecute：异步初始化执行体——确保 libocr.so 已加载后按"模型目录+
+//   字典"方式初始化 det/cls/rec 三件套（内部 onnxruntime 建会话，耗时）
 static void OcrInitExecute(napi_env env, void *data) {
     auto *ctx = static_cast<OcrAsyncCtx *>(data);
     if (!ocr_bridge::load()) {
@@ -669,6 +803,7 @@ static void OcrInitExecute(napi_env env, void *data) {
     ctx->ok = ocr_bridge::init(ctx->modelDir);
 }
 
+// ★ OcrInitComplete：初始化完成回调——resolve Promise<boolean>，清理 work 与上下文
 static void OcrInitComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<OcrAsyncCtx *>(data);
     napi_value result = nullptr;
@@ -678,6 +813,8 @@ static void OcrInitComplete(napi_env env, napi_status status, void *data) {
     delete ctx;
 }
 
+// ★ InitOcr（ArkTS 调用名：initOcr）：异步初始化 OCR 引擎，返回 Promise<boolean>。
+//   参数：args[0]=模型目录（内含 det/cls/rec/keys 文件）
 static napi_value InitOcr(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -707,10 +844,14 @@ struct OcrReleaseCtx {
     napi_deferred deferred = nullptr;
 };
 
+// ★ OcrReleaseExecute：异步释放执行体（napi 工作线程）——必须异步的原因：
+//   release 内部 join OCR worker（可能正跑长推理），同步调用会卡主线程 >6s
+//   触发 appfreeze
 static void OcrReleaseExecute(napi_env env, void *data) {
     ocr_bridge::release();
 }
 
+// ★ OcrReleaseComplete：释放完成回调——resolve Promise<undefined>，清理 work 与上下文
 static void OcrReleaseComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<OcrReleaseCtx *>(data);
     napi_value result = nullptr;
@@ -720,6 +861,8 @@ static void OcrReleaseComplete(napi_env env, napi_status status, void *data) {
     delete ctx;
 }
 
+// ★ ReleaseOcr（ArkTS 调用名：releaseOcr）：异步释放 OCR 引擎，返回 Promise<undefined>。
+//   要点：release 耗时（见 OcrReleaseExecute），整体放 napi 工作线程执行
 static napi_value ReleaseOcr(napi_env env, napi_callback_info) {
     auto *ctx = new OcrReleaseCtx();
     napi_value promise = nullptr;
@@ -732,6 +875,8 @@ static napi_value ReleaseOcr(napi_env env, napi_callback_info) {
     return promise;
 }
 
+// ★ SetOcrEnabledNapi（ArkTS 调用名：setOcrEnabled）：OCR 识别总开关。
+//   参数：args[0]=boolean；关闭后管线侧 maybeTrigger 变为空操作（省电）
 static napi_value SetOcrEnabledNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -742,6 +887,8 @@ static napi_value SetOcrEnabledNapi(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ GetOcrTextNapi（ArkTS 调用名：getOcrText）：取最近一次 OCR 识别的整段文本。
+//   返回值：string（各行以换行拼接），无结果/未加载返回空串
 static napi_value GetOcrTextNapi(napi_env env, napi_callback_info) {
     std::string text = ocr_bridge::getResult();
     napi_value r = nullptr;
@@ -750,6 +897,7 @@ static napi_value GetOcrTextNapi(napi_env env, napi_callback_info) {
 }
 
 // ★ OCR 识别进度（done/total），供 HUD"识别中"徽标显示（不再画在画面上）
+// （ArkTS 调用名：getOcrProgress）返回值：[done, total] 数组
 static napi_value GetOcrProgressNapi(napi_env env, napi_callback_info) {
     int done = 0, total = 0;
     ocr_bridge::getProgress(done, total);
@@ -765,6 +913,8 @@ static napi_value GetOcrProgressNapi(napi_env env, napi_callback_info) {
 
 // ═══════════ 能耗模式 / OCR 参数 ═══════════
 // ★ 节奏参数统一入口：渲染节流 + YOLO 有目标/空闲间隔 + 水深采样间隔（立即生效）
+// （ArkTS 调用名：setPipelineTiming）参数：args[0]=渲染节流 ms，args[1]=YOLO 有目标
+//   推理间隔 ms，args[2]=YOLO 空闲推理间隔 ms，args[3]=传感器采样间隔 ms
 static napi_value SetPipelineTimingNapi(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4];
@@ -780,6 +930,7 @@ static napi_value SetPipelineTimingNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ YOLO 推理线程数：会话级原子 + 当前检测器热更新（ncnn 下次 create_extractor 生效）
+// （ArkTS 调用名：setYoloThreads）参数：args[0]=线程数
 static napi_value SetYoloThreadsNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -793,6 +944,7 @@ static napi_value SetYoloThreadsNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ OCR 定时识别间隔（能耗模式可调，立即生效）
+// （ArkTS 调用名：setOcrTriggerInterval）参数：args[0]=间隔 ms
 static napi_value SetOcrTriggerIntervalNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -805,6 +957,7 @@ static napi_value SetOcrTriggerIntervalNapi(napi_env env, napi_callback_info inf
 }
 
 // ★ OCR det 阈值三件套（检出/框置信度/文本框扩展，立即生效）
+// （ArkTS 调用名：setOcrDetParams）参数：args[0]=检出阈值，args[1]=框置信度，args[2]=扩展比
 static napi_value SetOcrDetParamsNapi(napi_env env, napi_callback_info info) {
     size_t argc = 3;
     napi_value args[3];
@@ -819,6 +972,7 @@ static napi_value SetOcrDetParamsNapi(napi_env env, napi_callback_info info) {
 }
 
 // ★ OCR 推理线程数（下次 init 生效）
+// （ArkTS 调用名：setOcrNumThreads）参数：args[0]=线程数
 static napi_value SetOcrNumThreadsNapi(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -841,6 +995,8 @@ struct OcrInitPathsCtx {
     bool ok = false;
 };
 
+// ★ OcrInitPathsExecute：异步初始化（显式路径版）执行体——按 det/cls/rec/keys
+//   四个显式文件路径初始化，支持任意命名的模型集（paddle/xiaomi 等）
 static void OcrInitPathsExecute(napi_env env, void *data) {
     auto *ctx = static_cast<OcrInitPathsCtx *>(data);
     if (!ocr_bridge::load()) {
@@ -851,6 +1007,7 @@ static void OcrInitPathsExecute(napi_env env, void *data) {
     ctx->ok = ocr_bridge::initPaths(ctx->detPath, ctx->clsPath, ctx->recPath, ctx->keysPath);
 }
 
+// ★ OcrInitPathsComplete：初始化（显式路径版）完成回调——resolve Promise，清理
 static void OcrInitPathsComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<OcrInitPathsCtx *>(data);
     napi_value result = nullptr;
@@ -860,6 +1017,10 @@ static void OcrInitPathsComplete(napi_env env, napi_status status, void *data) {
     delete ctx;
 }
 
+// ★ InitOcrPaths（ArkTS 调用名：initOcrPaths）：按显式模型文件路径初始化 OCR 引擎，
+//   返回 Promise<boolean>。参数：args[0]=det 路径，args[1]=cls 路径，args[2]=rec 路径，
+//   args[3]=keys 字典路径。要点：参数不足时立即 resolve(false)，仍返回 Promise
+//   保证 ArkTS 侧 await 风格统一
 static napi_value InitOcrPaths(napi_env env, napi_callback_info info) {
     size_t argc = 4;
     napi_value args[4];
@@ -895,6 +1056,8 @@ static napi_value InitOcrPaths(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ★ SetFontPath（ArkTS 调用名：setFontPath）：设置中文标签/水印渲染字体（TTF）。
+//   要点：双写——gPendingFontPath 会话级缓存（管线重建后回灌）+ 当前管线实例立即生效
 static napi_value SetFontPath(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -911,6 +1074,9 @@ static napi_value SetFontPath(napi_env env, napi_callback_info info) {
     return nullptr;
 }
 
+// ★ SetClassNames（ArkTS 调用名：setClassNames）：设置 YOLO 类别名列表。
+//   参数：args[0]=string 数组（与模型输出 label 索引对齐）。
+//   要点：双写——会话级缓存 + 当前管线实例（检测框标签显示用）
 static napi_value SetClassNames(napi_env env, napi_callback_info info) {
     size_t argc = 1; napi_value args[1];
     napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
@@ -947,6 +1113,8 @@ struct TableInitCtx {
     bool ok = false;
 };
 
+// ★ TableInitExecute：异步表格模型加载执行体——SLANet 独立于 OCR 三件套
+//   （单独生命周期，卸载 OCR 不影响表格模型）
 static void TableInitExecute(napi_env env, void *data) {
     auto *ctx = static_cast<TableInitCtx *>(data);
     if (!ocr_bridge::load()) {
@@ -957,6 +1125,7 @@ static void TableInitExecute(napi_env env, void *data) {
     ctx->ok = ocr_bridge::initTable(ctx->modelPath);
 }
 
+// ★ TableInitComplete：表格模型加载完成回调——resolve Promise<boolean>，清理
 static void TableInitComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<TableInitCtx *>(data);
     napi_value result = nullptr;
@@ -966,6 +1135,8 @@ static void TableInitComplete(napi_env env, napi_status status, void *data) {
     delete ctx;
 }
 
+// ★ InitTable（ArkTS 调用名：initTable）：异步加载 SLANet 表格结构模型，
+//   返回 Promise<boolean>。参数：args[0]=表格模型文件路径
 static napi_value InitTable(napi_env env, napi_callback_info info) {
     size_t argc = 1;
     napi_value args[1];
@@ -1033,6 +1204,11 @@ static void tableEventTrampoline(int stage, const char *path, void *userdata) {
     }
 }
 
+// ★ TableRecognizeExecute：表格识别执行体（napi 工作线程）——核心流程：
+//   抓"叠加绘制前"的干净帧（避免把水印/自绘框识别成内容）→ recognizeTableEx
+//   （SLANet 结构 + 表格区域 OCR + 单元格匹配 → JSON）→ 未识别到表格结构时
+//   换新画面自动重试（最多 3 次，间隔 600ms 等画面变化）。
+//   要点：等干净帧期间持 gPipelineMutex（防管线被销毁），推理本身不持锁
 static void TableRecognizeExecute(napi_env env, void *data) {
     auto *ctx = static_cast<TableRecognizeCtx *>(data);
     ctx->json.clear();
@@ -1068,6 +1244,8 @@ static void TableRecognizeExecute(napi_env env, void *data) {
     }
 }
 
+// ★ TableRecognizeComplete：识别完成回调——先释放 tsfn（必须先于 resolve，
+//   否则 Promise 结束后 JS 回调仍可能被调用），再 resolve JSON 串，最后清理
 static void TableRecognizeComplete(napi_env env, napi_status status, void *data) {
     auto *ctx = static_cast<TableRecognizeCtx *>(data);
     if (ctx->tsfn) {
@@ -1081,6 +1259,12 @@ static void TableRecognizeComplete(napi_env env, napi_status status, void *data)
     delete ctx;
 }
 
+// ★ RecognizeTable（ArkTS 调用名：recognizeTable）：单次表格结构识别，
+//   返回 Promise<string>（结果 JSON）。参数：args[0]=预览图输出目录
+//   （table_frame.jpg/table_boxed.jpg 落盘位置），args[1]=阶段事件回调
+//   onEvent(stage, path)（可省略，经 tsfn 跨线程投递）。
+//   要点：识别在 napi 工作线程执行；预览图事件由 tableEventTrampoline +
+//   TableEventJsCall 中转回 JS 线程
 static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
     size_t argc = 2;
     napi_value args[2] = {nullptr, nullptr};
@@ -1112,6 +1296,9 @@ static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ★ Init：entry 模块初始化回调——把全部导出函数经 napi_property_descriptor
+//   挂载到 exports 对象。每项第一个字符串即 ArkTS 侧 import 'libentry.so' 后
+//   直接调用的方法名（下表为全部 native 能力的唯一权威清单，按功能分组）
 EXTERN_C_START
 static napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
@@ -1181,9 +1368,13 @@ static napi_value Init(napi_env env, napi_value exports) {
 }
 EXTERN_C_END
 
+// ★ entryModule：NAPI 模块描述——modname "entry" 与 ArkTS 侧
+//   import xxx from 'libentry.so' 一一对应；加载 .so 时系统回调 Init 完成导出挂载
 static napi_module entryModule = {
     .nm_version = 1, .nm_flags = 0, .nm_filename = nullptr,
     .nm_register_func = Init, .nm_modname = "entry",
     .nm_priv = nullptr, .reserved = { 0 },
 };
+// ★ RegisterEntryModule：.so 加载时自动注册模块（constructor 属性）——
+//   无需外部主动调用，模块注册在动态库装载阶段即完成
 extern "C" __attribute__((constructor)) void RegisterEntryModule() { napi_module_register(&entryModule); }

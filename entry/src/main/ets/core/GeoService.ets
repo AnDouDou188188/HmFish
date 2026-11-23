@@ -38,6 +38,8 @@ export interface GeoPlace {
   lon: number;
 }
 
+// ★ GeoService：位置水印取数服务（全静态方法 + 60s 结果缓存）。
+//   一次成功结果被 Index.ets 拼进拍照/录像的水印文字
 export class GeoService {
   // 结果缓存：60s 内复用，避免频繁定位/请求
   private static cachedPlace: GeoPlace | null = null;
@@ -47,6 +49,7 @@ export class GeoService {
   private static failReason: string = '';
 
   // ★ 权限：LOCATION（精确）+ APPROXIMATELY_LOCATION（模糊）必须成对申请
+  //   （系统强制约束，缺任一个都无法定位）
   static async ensurePermission(ctx: common.UIAbilityContext): Promise<boolean> {
     try {
       const atManager = abilityAccessCtrl.createAtManager();
@@ -131,6 +134,7 @@ export class GeoService {
     return GeoService.failReason;
   }
 
+  // ───────── 逆地理三级兜底链：系统 → 高德 → 百度 ─────────
   // ★ 系统 Geocoder（免费、无 Key）：市 + 区 + 街道 组合
   private static async regeoSystem(lat: number, lon: number): Promise<string> {
     try {
@@ -157,6 +161,7 @@ export class GeoService {
     return '';
   }
 
+  // ★ 高德 regeo 兜底：需 AMAP_WEB_KEY；status='1' 且有地址才算成功
   private static async regeoAmap(lat: number, lon: number): Promise<string> {
     return await GeoService.httpGetText(
       `https://restapi.amap.com/v3/geocode/regeo?key=${AMAP_WEB_KEY}` +
@@ -172,6 +177,7 @@ export class GeoService {
       });
   }
 
+  // ★ 百度逆地理兜底：coordtype=wgs84ll 声明输入为 WGS-84，免坐标系转换
   private static async regeoBaidu(lat: number, lon: number): Promise<string> {
     return await GeoService.httpGetText(
       `https://api.map.baidu.com/reverse_geocoding/v3/?ak=${BAIDU_AK}` +

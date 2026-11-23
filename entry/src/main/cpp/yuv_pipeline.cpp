@@ -1,6 +1,32 @@
-// ★ 渲染管线核心实现：内置相机帧接收转换（NV21→RGBA/旋转/镜像）、
-//   UVC 外部供帧路径、YOLO 异步推理调度、叠加绘制（框/水印/OCR）、
-//   预览 surface 与录像直供推流、USB 画质增强（AI 超分细节注入架构）
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ YuvPipeline —— HmFish 渲染管线核心实现（yuv_pipeline.cpp）                    ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【职责】相机帧进入后的全部"看"与"算"：                                       ║
+// ║   转换（NV21→RGBA/旋转/镜像/数字变焦）→ 画质增强（非AI/AI超分）→             ║
+// ║   叠加绘制（YOLO 框/水印/OCR 框/人脸连线框）→ 推流（预览 surface +           ║
+// ║   录像直供 surface）→ 异步推理调度（YOLO/人脸/SR/运动/水深/OCR）             ║
+// ║                                                                              ║
+// ║ 【两条帧入口，一个汇合点】                                                   ║
+// ║   A. 手机相机：CameraService → ImageReceiver(CreateReceiver 的 surface)      ║
+// ║      → OnImageArrival(ReadLatestImage) → ProcessFrame(NV21→RGBA→旋转镜像    ║
+// ║      →变焦→增强) → ProcessCommonTail                                        ║
+// ║   B. USB/UVC：libuvc 回调解码出 RGBA → ProcessExternalRgba(变焦→投喂 SR     ║
+// ║      →基底渲染→增强) → ProcessCommonTail                                    ║
+// ║   ProcessCommonTail 是两条路径的共同尾部（识别触发→叠加绘制→录像/预览推流）， ║
+// ║   保证手机/USB 画面行为完全一致。                                            ║
+// ║                                                                              ║
+// ║ 【线程模型】（全部 busy-skip：忙时丢帧不积压，永远处理最新画面）              ║
+// ║   ① 相机/渲染线程：OnImageArrival 或 ProcessExternalRgba（事件驱动）        ║
+// ║   ② InferenceLoop：YOLO 推理（RequestInference 条件变量唤醒）               ║
+// ║   ③ SrWorkerLoop：AI 超分/降噪/去浊层产出（只产"细节层"，不接管渲染）        ║
+// ║   ④ FaceWorkerLoop：SCRFD 人脸检测（启用时才入队推理）                       ║
+// ║   OCR/表格在 libocr.so 侧自有 worker（ocr_bridge / OcrBridge.h 桥接）        ║
+// ║                                                                              ║
+// ║ 【坐标系约定】                                                               ║
+// ║   rgbaBuf_ = 最终显示帧（displayWidth_×displayHeight_，内存序 RGBA），       ║
+// ║   所有叠加绘制/录像推流/懒快照都在它上面进行；                               ║
+// ║   width_/height_ = 相机原始输出尺寸（旋转前）；rotation 90/270 时二者互换。  ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 #include "yuv_pipeline.h"
 #include "OcrBridge.h"
 #include <hilog/log.h>
@@ -66,6 +92,8 @@ static std::atomic<bool> g_face_enabled(false);
 static std::atomic<int>  g_sr_factor(2);
 
 // ───────── 运动 & 水深 ─────────
+// ★ 帧分析公共底座：降采样到 160×120 灰度图 + 平均 RGB + 水体特征像素计数。
+//   运动检测（帧差）与水深（亮度/水体/运动）共用，每帧只分析一次的开销预算
 static pthread_mutex_t g_motion_mutex = PTHREAD_MUTEX_INITIALIZER;
 static std::vector<uint8_t> g_prev_gray;
 static std::atomic<float> g_motion_level(0.0f);
@@ -103,6 +131,8 @@ static std::vector<uint8_t> g_depth_prev_gray;
 static float g_depth_entry_brightness = -1.0f;
 static int g_depth_bright_rise_count = 0;    // 连续亮度回升采样数
 
+// ★ analyzeFrame：降采样帧分析（160×120）。输出灰度缩略图、平均 B/G/R、
+//   水体特征像素数。采样为步进抽取（非插值），保持轻量；灰度用 ITU-R 601 权重
 // outWaterPx：采样点中"蓝显著高于红"的水体特征像素数（水下红光被吸收，蓝占优；
 //   陆地无论明暗红蓝接近 → 晃动镜头不会误判入水）
 static void analyzeFrame(const uint8_t* rgba, int w, int h,
@@ -133,6 +163,8 @@ static void analyzeFrame(const uint8_t* rgba, int w, int h,
     if (outWaterPx) *outWaterPx = waterPx;
 }
 
+// ★ 运动检测：与上一帧灰度缩略图做帧差（阈值 15），变化像素占比即运动等级；
+//   非对称时域平滑（上升快 0.4/0.6、下降慢 0.7/0.3）抑制瞬时抖动、延缓衰减
 static void update_motion_level(const uint8_t* rgba, int w, int h) {
     if (!g_motion_enabled.load()) {
         g_motion_level.store(0.0f);
@@ -414,8 +446,12 @@ extern "C" {
     }
 }
 
+// ═══════════════ YuvPipeline 类实现 ═══════════════
+// 生命周期：CreateReceiver/ConfigureExternal（配置）→ Start/StartExternal（起线程）
+//           → 帧处理 → Stop（join 全部线程并释放资源）
 static YuvPipeline *gActivePipeline = nullptr;
 
+// ★ 析构：停管线 + 销毁预览窗口 + 释放 FreeType 字体库/字形
 YuvPipeline::~YuvPipeline() {
     Stop();
     {
@@ -432,6 +468,8 @@ YuvPipeline::~YuvPipeline() {
     }
 }
 
+// ★ 设置渲染旋转角（0/90/180/270，非法值回退 0）：仅接受 90 的倍数——
+//   libyuv ARGBRotate 只支持这四档；改变后立即按新方向重算显示尺寸
 void YuvPipeline::SetRotation(int degrees) {
     degrees = ((degrees % 360) + 360) % 360;
     if (degrees != 0 && degrees != 90 && degrees != 180 && degrees != 270) {
@@ -444,11 +482,14 @@ void YuvPipeline::SetRotation(int degrees) {
 
 // ★ 前置摄像头镜像：对齐 Android 平台行为（前摄预览默认水平镜像/自拍镜像视图）。
 //   ImageReceiver 输出不会自动镜像，需在渲染侧手动翻转
+// ★ 前置摄像头镜像开关（true=水平翻转自拍画面）
 void YuvPipeline::SetMirror(bool mirror) {
     mirror_.store(mirror);
     OH_LOG_INFO(LOG_APP, "SetMirror: %{public}d", (int)mirror);
 }
 
+// ★ 重算显示尺寸并扩容显示帧缓冲：
+//   90°/270° 旋转会把宽高互换（displayWidth_/displayHeight_），rgbaBuf_ 随之重分配
 void YuvPipeline::UpdateDisplaySize() {
     if (rotationDegrees_ == 90 || rotationDegrees_ == 270) {
         displayWidth_ = height_;
@@ -462,6 +503,9 @@ void YuvPipeline::UpdateDisplaySize() {
     }
 }
 
+// ★ 创建手机相机帧接收器（ImageReceiver）：相机输出的 NV21 帧进入本管线的入口。
+//   ArkTS 拿返回的 surfaceId 交给 CameraService 完成绑定；capacity=8 缓冲抗抖动。
+//   注：入参宽高只是初始占位，实际档位确定后需 UpdateFrameSize 对齐
 bool YuvPipeline::CreateReceiver(int width, int height, std::string &outSurfaceId) {
     width_ = width; height_ = height;
     tempBuf_.resize((size_t)width * height * 4);
@@ -487,6 +531,8 @@ bool YuvPipeline::CreateReceiver(int width, int height, std::string &outSurfaceI
     return true;
 }
 
+// ★ 启动管线（手机相机路径）：注册帧到达回调、拉起 YOLO 推理线程与人脸工作线程。
+//   幂等：无 receiver 或已在运行则直接返回
 void YuvPipeline::Start() {
     if (!receiver_ || running_) return;
     gActivePipeline = this;
@@ -510,6 +556,10 @@ void YuvPipeline::Start() {
     OH_LOG_INFO(LOG_APP, "Pipeline started (async inference)");
 }
 
+// ★ 停止管线并全量释放（Stop 后可 Start 复用）。
+//   关停顺序有讲究：先 join 各工作线程（SR → 人脸 → YOLO，均先置 false 再 notify），
+//   再注销相机回调，最后清空两个输出 surface（预览+录像）并释放 ImageReceiver。
+//   注：callbackMutex_ 由调用方（NAPI 层）持有，保证清资源期间无并发帧处理
 void YuvPipeline::Stop() {
     running_ = false;
 
@@ -557,6 +607,8 @@ void YuvPipeline::Stop() {
     OH_LOG_INFO(LOG_APP, "Pipeline stopped (fully released)");
 }
 
+// ★ 设置预览输出窗口（ArkTS XComponent 的 NativeWindow）：
+//   重复设置时销毁旧窗口；窗口格式固定 RGBA_8888，几何尺寸对齐当前显示帧
 void YuvPipeline::SetPreviewWindow(OHNativeWindow *win) {
     std::lock_guard<std::mutex> lock(previewWindowMutex_);
     if (previewWindow_ && previewWindow_ != win) {
@@ -569,6 +621,7 @@ void YuvPipeline::SetPreviewWindow(OHNativeWindow *win) {
     }
 }
 
+// ★ 开关 YOLO 识别：关闭时同步清空历史识别框（画面上立即消失，不留残影）
 void YuvPipeline::SetYoloEnabled(bool enabled) {
     yoloEnabled_.store(enabled);
     if (!enabled) {
@@ -577,11 +630,15 @@ void YuvPipeline::SetYoloEnabled(bool enabled) {
     }
 }
 
+// ★ 设置类别名表（与 YOLO 模型的类别 id 一一对应，绘制标签时查表取名）
 void YuvPipeline::SetClassNames(const std::vector<std::string> &names) {
     std::lock_guard<std::mutex> lock(classNamesMutex_);
     classNames_ = names;
 }
 
+// ★ 加载中文字体（.ttf，FreeType）：供水印/标签/OCR 框文字的中文渲染。
+//   可变字体（Multiple Masters）时取第一个命名样式的坐标复位为默认字重，
+//   防止可变轴停在渲染过程中被拨动的极端值上
 void YuvPipeline::LoadFont(const std::string &path) {
     std::lock_guard<std::mutex> lock(ftMutex_);
     if (ftFace_) { FT_Done_Face(ftFace_); ftFace_ = nullptr; }
@@ -613,6 +670,8 @@ void YuvPipeline::LoadFont(const std::string &path) {
 
 
 
+// ★ 投喂一帧给 YOLO 推理线程（替换式队列，容量恒为 1）：
+//   上一帧还没被取走则直接丢弃本帧 → 永远推理最新画面，无排队延迟
 void YuvPipeline::RequestInference(const uint8_t *rgba, int w, int h) {
     if (!rgba || w <= 0 || h <= 0) return;
     size_t sz = (size_t)w * h * 4;
@@ -633,6 +692,9 @@ void YuvPipeline::RequestInference(const uint8_t *rgba, int w, int h) {
     }
     inferCV_.notify_one();
 }
+// ★ YOLO 推理线程主循环：条件变量休眠 → swap 取帧（零拷贝扩容）→
+//   NativeDetectOnRgba 推理 → 结果存入 latestResults_ 供绘制线程消费。
+//   yoloEnabled_ 关闭时取帧后直接跳过推理（省满载功耗）
 void YuvPipeline::InferenceLoop() {
     while (inferRunning_.load()) {
         std::vector<uint8_t> frame;
@@ -671,6 +733,8 @@ void YuvPipeline::InferenceLoop() {
         }
     }
 }
+// ★ 存入最新识别结果：关闭开关时丢弃并清空；记录"最后一次非空结果时间"
+//   供 HUD 展示"最近 x 秒识别到"的语义（丢帧/暂时丢目标不清空旧框）
 void YuvPipeline::StoreResults(const std::vector<DetectItem> &items) {
     std::lock_guard<std::mutex> lock(resultsMutex_);
     
@@ -699,6 +763,9 @@ std::vector<uint8_t> YuvPipeline::GetLatestRgba() {
     return rgbaBuf_;
 }
 
+// ★ 干净快照（无叠加水印/识别框的原帧）请求-等待对（拍照用）：
+//   Request 置位请求并作废旧帧 → 下一帧渲染在叠加前拷贝 cleanSnapBuf_ →
+//   Wait 条件变量阻塞等新帧（超时兜底），保证拍到的永远是"裸画面"
 void YuvPipeline::RequestCleanSnapshot() {
     {
         // 清掉上一次未消费的旧帧，防止等待方拿到过期画面
@@ -708,6 +775,7 @@ void YuvPipeline::RequestCleanSnapshot() {
     cleanSnapRequested_.store(true);
 }
 
+// ★ 等待干净快照就绪（超时返回 false）；宽高随快照一并输出
 bool YuvPipeline::WaitCleanSnapshot(int timeoutMs, std::vector<uint8_t> &out,
                                     int &w, int &h) {
     std::unique_lock<std::mutex> lock(cleanSnapMutex_);
@@ -722,11 +790,14 @@ bool YuvPipeline::WaitCleanSnapshot(int timeoutMs, std::vector<uint8_t> &out,
     return !out.empty();
 }
 
+// ★ 返回当前显示帧尺寸（旋转后的最终输出宽高）
 void YuvPipeline::GetFrameSize(int &w, int &h) {
     w = displayWidth_;
     h = displayHeight_;
 }
 
+// ★ 相机帧到达回调（相机路径入口 A）：回调互斥锁串行化 → ReadLatestImage 取
+//   最新帧 → 按 g_render_interval_ms（默认 40ms ≈ 25fps）限频丢弃过密帧 → ProcessFrame
 void YuvPipeline::OnImageArrival() {
     std::lock_guard<std::mutex> lock(callbackMutex_);
     if (!running_ || !receiver_) return;
@@ -753,6 +824,9 @@ void YuvPipeline::OnImageArrival() {
     OH_ImageNative_Release(image);
 }
 
+// ★ 手机相机帧处理主体（相机路径核心）：
+//   NV21→ARGB（libyuv SIMD）→ 通道交换（BGRA→RGBA）→ 旋转/镜像 → 数字变焦 →
+//   画质增强（AI 修复层投喂 + ApplyFrameEnhance）→ ProcessCommonTail 汇合
 void YuvPipeline::ProcessFrame(OH_ImageNative *image) {
     uint32_t *typesPtr = nullptr;
     size_t typeSize = 0;
@@ -899,6 +973,11 @@ void YuvPipeline::ProcessFrame(OH_ImageNative *image) {
     ProcessCommonTail();
 }
 
+// ★ 两条供帧路径的共同尾部（手机/USB 行为一致性的锚点）：
+//   ① OCR 触发（叠加绘制前的干净帧）→ ② 表格干净快照 → ③ 人脸入队 →
+//   ④ 运动检测（隔帧）→ ⑤ 水深采样（可配间隔）→ ⑥ YOLO 按有目标/空闲两档
+//   间隔投喂 → ⑦ 叠加绘制（YOLO 框→OCR 框→人脸连线框）→ ⑧ 录像推流（含
+//   叠加内容，用户要求）→ ⑨ 预览推流
 void YuvPipeline::ProcessCommonTail() {
     // OCR：在绘制任何叠加内容（YOLO 框/标签、时间戳水印）之前，
     // 用干净的相机帧触发识别，避免把自绘水印识别成文字
@@ -974,6 +1053,8 @@ void YuvPipeline::ProcessCommonTail() {
     PushToSurface();
 }
 
+// ★ 相机输出分辨率变更（切档位/切镜头）：重配缓冲、保留旋转角、清空过期的
+//   YOLO/人脸坐标、同步预览 surface geometry
 bool YuvPipeline::UpdateFrameSize(int width, int height) {
     if (width <= 0 || height <= 0) return false;
     if (width == width_ && height == height_) return true;
@@ -1006,6 +1087,8 @@ bool YuvPipeline::UpdateFrameSize(int width, int height) {
     return true;
 }
 
+// ★ 配置 USB/UVC 外部供帧路径：清零旋转（UVC 帧已按采集方向解码）、
+//   重配缓冲与显示尺寸、清空过期识别结果、同步预览 surface geometry
 bool YuvPipeline::ConfigureExternal(int width, int height) {
     if (width <= 0 || height <= 0) return false;
     width_ = width;
@@ -1035,6 +1118,8 @@ bool YuvPipeline::ConfigureExternal(int width, int height) {
     return true;
 }
 
+// ★ 启动管线（USB/UVC 路径）：拉起 YOLO 推理 + SR 工作线程 + 人脸工作线程。
+//   帧由 libuvc 回调经 NAPI 调 ProcessExternalRgba 进入，无 ImageReceiver
 void YuvPipeline::StartExternal() {
     if (running_) return;
     gActivePipeline = this;
@@ -1067,11 +1152,13 @@ void YuvPipeline::SetZoomScale(float scale) {
     zoomScale_.store(scale);
 }
 
+// ★ 设置位置水印文字（空串=不显示）；绘制见 DrawOverlayOnRgba 的位置水印段
 void YuvPipeline::SetLocationText(const std::string &text) {
     std::lock_guard<std::mutex> lock(locationMutex_);
     locationText_ = text;
 }
 
+// ★ 设置位置水印的垂直可见比例（0.4~1.0）：预览底部被面板遮挡时上移水印条
 void YuvPipeline::SetLocationBottomRatio(float ratio) {
     if (ratio < 0.4f) ratio = 0.4f;
     if (ratio > 1.0f) ratio = 1.0f;
@@ -1526,6 +1613,9 @@ void YuvPipeline::ApplyFrameEnhance(uint8_t *rgba, int W, int H) {
     }, 64);
 }
 
+// ★ USB/UVC 外部 RGBA 帧处理主体（入口路径 B，由 libuvc 回调经 NAPI 进入）：
+//   限频 → 数字变焦裁剪 → AI 修复层投喂（忙时跳过）→ 基底渲染入 rgbaBuf_ →
+//   ApplyFrameEnhance → ProcessCommonTail 汇合
 void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
     if (!rgba || w <= 0 || h <= 0) return;
 
@@ -1603,6 +1693,8 @@ void YuvPipeline::ProcessExternalRgba(const uint8_t *rgba, int w, int h) {
     ProcessCommonTail();
 }
 
+// ★ 叠加绘制第一层：YOLO 识别框 + 彩色标签（19 色表/字号等比对齐 Android）+
+//   绿色时间水印（左上角）+ 位置水印（底部居中，半透明黑底）
 void YuvPipeline::DrawOverlayOnRgba() {
     uint8_t *rgba = rgbaBuf_.data();
     int W = displayWidth_, H = displayHeight_;
@@ -1772,6 +1864,7 @@ void YuvPipeline::DrawOverlayOnRgba() {
 }
 
 // ───────── OCR 叠加：触发识别 + 画框 + 画文字 ─────────
+// ★ UTF-8 按字符数截断（多字节边界安全，越界补省略号）——OCR 标签限 30 字用
 static std::string truncateUtf8(const std::string &text, int maxChars) {
     int chars = 0;
     size_t bytes = 0;
@@ -1810,6 +1903,8 @@ static void fillRectAlpha(uint8_t *rgba, int W, int H, int x0, int y0, int w, in
     }
 }
 
+// ★ 叠加绘制第二层：OCR 框线（RapidOCR 内部画）+ 框上文字标签
+//   （已识别=彩色底+识别文本，待识别=灰底"…"，5 色轮换对齐 Android）
 void YuvPipeline::DrawOcrOverlay() {
     if (displayWidth_ <= 0 || displayHeight_ <= 0 || rgbaBuf_.empty()) return;
     if (!ocr_bridge::isReady()) return;
@@ -1917,6 +2012,7 @@ void YuvPipeline::drawTextCN(uint8_t *rgba, int W, int H,
     }
 }
 
+// ★ 测量 UTF-8 文本按指定像素高度渲染的宽度（FreeType advance 累加，不渲染）
 int YuvPipeline::measureTextCN(const std::string &text, int fontHeight) {
     std::lock_guard<std::mutex> lock(ftMutex_);
     if (!ftFace_) return 0;
@@ -1937,6 +2033,8 @@ int YuvPipeline::measureTextCN(const std::string &text, int fontHeight) {
     return w;
 }
 
+// ★ 预览推流核心：请求 surface buffer → mmap → 尺寸不一致时 CenterCrop+缩放 →
+//   按 buffer 格式写 NV12 或 RGBA（stride 对齐按行拷贝）→ Flush 上屏
 bool YuvPipeline::PushPixelsToSurface(const uint8_t *src, int srcW, int srcH) {
     std::lock_guard<std::mutex> lock(previewWindowMutex_);
     if (!previewWindow_ || !src || srcW <= 0 || srcH <= 0) return false;
@@ -2038,6 +2136,7 @@ bool YuvPipeline::PushPixelsToSurface(const uint8_t *src, int srcW, int srcH) {
     return true;
 }
 
+// ★ 每帧预览推流入口（PushPixelsToSurface 的显示帧特化）
 bool YuvPipeline::PushToSurface() {
     return PushPixelsToSurface(rgbaBuf_.data(), displayWidth_, displayHeight_);
 }
@@ -2082,6 +2181,7 @@ bool YuvPipeline::AttachRecordSurface(uint64_t surfaceId, int width, int height)
     return true;
 }
 
+// ★ 解绑录像 surface（录像停止时调用）：销毁窗口并汇总推帧成功/总数日志
 void YuvPipeline::DetachRecordSurface() {
     std::lock_guard<std::mutex> lock(recordWindowMutex_);
     if (recordWindow_) {
@@ -2092,6 +2192,9 @@ void YuvPipeline::DetachRecordSurface() {
     }
 }
 
+// ★ 每帧录像推流：真实时间戳（SET_UI_TIMESTAMP 必须在 RequestBuffer 前）→
+//   请求 buffer → mmap → R/B 通道修正（内存序 RGBA→BGRA）→ CenterCrop →
+//   ARGBToNV12 → Flush 喂编码器。失败节流打日志
 bool YuvPipeline::PushToRecordSurface(const uint8_t *src, int srcW, int srcH) {
     std::lock_guard<std::mutex> lock(recordWindowMutex_);
     if (!recordWindow_ || !src || srcW <= 0 || srcH <= 0) return false;
@@ -2226,6 +2329,7 @@ bool YuvPipeline::PushToRecordSurface(const uint8_t *src, int srcW, int srcH) {
     return true;
 }
 
+// ★ 停止时清屏：推一帧纯黑（alpha=255）到预览 surface，避免残留最后一帧画面
 void YuvPipeline::ClearSurface() {
     if (displayWidth_ <= 0 || displayHeight_ <= 0) return;
     size_t sz = (size_t)displayWidth_ * displayHeight_ * 4;

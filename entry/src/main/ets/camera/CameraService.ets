@@ -1,13 +1,19 @@
-// ★ 手机内置相机会话管理：预览档位选择、变焦范围查询、USB/内置双源路由，
-//   渲染侧据此决定旋转/镜像与预览尺寸对齐
+// ★ 手机内置相机会话管理（@ohos.multimedia.camera / CameraKit）：
+//   负责预览档位选择（上限 1080p）、双 surface 输出（XComponent 显示 +
+//   ImageReceiver surface 送 native 推理/录像）、变焦范围查询、
+//   USB/内置双源路由。init/switchTo 把实际选中设备的传感器角度、位置、
+//   预览尺寸暴露给 Index.ets——渲染侧据此决定旋转/镜像与 native 管线对齐
 import { camera } from '@kit.CameraKit';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 import { UsbCameraState, CameraSource } from './UsbCameraState';
 
+// ★ CameraService：同一时刻只持有一个 CaptureSession（切换摄像头 = 释放重建）
 export class CameraService {
   private cameraManager: camera.CameraManager | null = null;
+  // ★ 当前相机会话：init/switchTo 各建一个，release 后置空
   private captureSession: camera.CaptureSession | null = null;
+  // ★ 当前会话支持的变焦区间（捏合手势夹紧用）
   private zoomRange: [number, number] = [1.0, 1.0];
   private usbState: UsbCameraState = new UsbCameraState();
   // ★ 当前会话实际选中的相机设备信息（供渲染侧决定旋转/镜像）
@@ -18,6 +24,8 @@ export class CameraService {
   // ★ 当前会话选中摄像头的型号描述（如"手机后置主摄"）：供变焦气泡展示
   private activeLabel: string = '手机后置主摄';
 
+  // ★ init：按 preferredPosition 路由设备——2=优先 USB（无则回退内置），
+  //   0/1=后置/前置；选中后配置会话并返回实际来源（'USB'|'BUILT_IN'）
   async init(context: common.UIAbilityContext,
     displaySurfaceId: string,
     secondSurfaceId: string,
@@ -53,6 +61,8 @@ export class CameraService {
     return source;
   }
 
+  // ★ switchTo：切换前后摄/USB 的唯一入口——先完整 release 旧会话再走 init
+  //   （相机硬件不支持两个 CaptureSession 并存，必须先释放后重建）
   async switchTo(context: common.UIAbilityContext,
     displaySurfaceId: string,
     secondSurfaceId: string,
@@ -63,6 +73,9 @@ export class CameraService {
     return this.init(context, displaySurfaceId, secondSurfaceId, preferredPosition, mode);
   }
 
+  // ★ configureSession：组装会话——input + 显示 PreviewOutput +
+  //   第二输出（ai 模式 = 推理 PreviewOutput；录像模式 = VideoOutput），
+  //   输出挂载必须在 beginConfig/commitConfig 之间一次性完成
   private async configureSession(device: camera.CameraDevice,
     displaySurfaceId: string,
     secondSurfaceId: string,
@@ -128,6 +141,8 @@ export class CameraService {
     return best !== null ? best : profiles[0];
   }
 
+  // ★ 录像档位选择：与预览同策略（≤1080p 取最大，面积并列取更宽）；
+  //   设备未上报 videoProfiles 时用预览档位拼 30fps 兜底
   private pickVideoProfile(profiles: camera.VideoProfile[], fallback: camera.Profile): camera.VideoProfile {
     if (profiles && profiles.length > 0) {
       const CAP = 1920 * 1080;
@@ -154,6 +169,7 @@ export class CameraService {
     };
   }
 
+  // ★ 变焦下发：捏合手势换算出的倍率直接交给系统（超范围由系统夹紧）
   setZoomRatio(ratio: number): void {
     if (!this.captureSession) { console.warn('[pinchZoom] no captureSession'); return; }
     try {
@@ -194,6 +210,7 @@ export class CameraService {
     return this.activePosition === camera.CameraPosition.CAMERA_POSITION_FRONT;
   }
 
+  // ★ release：停止并释放当前会话（异常吞掉——切换路径上不允许半路抛出）
   async release(): Promise<void> {
     if (this.captureSession) {
       try { await this.captureSession.stop(); } catch (_) {}
@@ -202,6 +219,7 @@ export class CameraService {
     }
   }
 
+  // ★ releaseAll：会话 + USB 状态监听一起释放（退出相机页/Ability 销毁时用）
   releaseAll(): void {
     this.release();
     this.usbState.release();

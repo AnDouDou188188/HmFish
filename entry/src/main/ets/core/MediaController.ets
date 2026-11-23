@@ -1,4 +1,8 @@
-// ★ 拍照/录像产物管理：Fish_年月日_时分秒 命名、保存到系统图库
+// ★ 拍照/录像产物管理：拍照（native 抓当前合成帧→PNG→图库）与录像产物
+//   （RecorderService 的 MP4）统一以 Fish_年月日_时分秒 命名保存到系统图库。
+//   与 native（libentry.so）交互：entry.captureLatestFrame/getFrameSize 取
+//   渲染合成帧；保存链路纯 ArkTS（photoAccessHelper 直接入库），
+//   权限被拒时回退系统保存弹窗——无人值守自动录像与手动保存都能落库
 import { RecorderService } from '../camera/RecorderService';
 import { common } from '@kit.AbilityKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
@@ -16,7 +20,9 @@ export interface SaveResult {
   errorCode?: number;
 }
 
+// ★ MediaController：媒体产物出口（截图/入库），聚合 RecorderService 录像能力
 export class MediaController {
+  // ★ 录像服务实例：Index 通过它启停录像、取产物路径
   public recorder: RecorderService = new RecorderService();
 
   // ★ 专用命名：Fish_年月日_时分秒（截图/录像统一前缀；
@@ -27,6 +33,8 @@ export class MediaController {
     return `Fish_${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
   }
 
+  // ★ snapshot：拍照 = native 取最新合成帧 → 沙箱 PNG → 存图库；
+  //   任一环节失败返回 false（UI 提示"拍照失败"）
   async snapshot(ctx: common.UIAbilityContext): Promise<boolean> {
     try {
       const buf = entry.captureLatestFrame();
@@ -136,6 +144,7 @@ export class MediaController {
     }
   }
 
+  // ★ 当前/最近一段录像产物路径透传（自动录像完成后存相册用）
   getRecorderPath(): string {
     return this.recorder.getVideoPath();
   }

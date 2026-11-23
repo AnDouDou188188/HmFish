@@ -1,5 +1,9 @@
-// ★ UVC 设备枚举：相机服务未注册时走 USB 层枚举 USB 摄像头
-//   （等价 Android UsbManager.getDeviceList + UVC 过滤），含授权弹窗流程
+// ★ UVC 设备枚举（ArkTS usbManager 双通道之 USB 总线通道）：
+//   当 USB 摄像头未被系统相机服务枚举（拿不到 CameraDevice）时，
+//   走 USB 总线层直接发现 UVC 设备——等价 Android UsbManager.getDeviceList
+//   + default_device_filter.xml 过滤，含 requestRight 授权弹窗与插拔广播订阅。
+//   发现的设备名与 usbfs 文件描述符(fd)交给 native libuvc（libentry.so 内）
+//   做 fd 注入直开摄像头，绕开系统相机服务对部分 UVC 设备的兼容性问题
 import { usbManager, commonEventManager } from '@kit.BasicServicesKit';
 import { BusinessError } from '@kit.BasicServicesKit';
 
@@ -22,6 +26,8 @@ const FILTER_VID_PID: string[] = [
   '9573_4836', '1133_2229', '1409_640', '9228_258', '19_16981', '1409_5120'
 ];
 
+// ★ 扫描出的 UVC 相机信息：busNum/devAddress 定位物理端口，
+//   hasMic 决定录像音源选择，hasRight 表示已授权（可免弹窗直连）
 export interface UsbCamInfo {
   name: string;
   productName: string;
@@ -41,6 +47,8 @@ export interface UsbPipeHandle {
   fd: number;
 }
 
+// ───────── 静态工具：识别 / 扫描 / 授权 / 打开管道 ─────────
+// ★ UsbDeviceScanner：静态工具（无状态）+ 实例订阅（插拔广播）两部分
 export class UsbDeviceScanner {
   // ★ 照抄 Android CameraUtils.isUsbCamera + isFilterDevice(default_device_filter.xml)：
   //   1. 设备类 = VIDEO 直接是相机；MISC(0xEF)/0 则遍历接口找 VIDEO 类
@@ -141,7 +149,10 @@ export class UsbDeviceScanner {
     return null;
   }
 
+  // ★ 插拔广播订阅者句柄：unsubscribe 后置空，避免重复取消订阅报错
   private subscriber: commonEventManager.CommonEventSubscriber | null = null;
+
+  // ───────── 实例方法：USB 插拔广播订阅 ─────────
 
   // ★ 等价 Android USB_DEVICE_ATTACHED / USB_DEVICE_DETACHED 广播：
   //   订阅系统公共事件监听 USB 设备插拔
@@ -171,6 +182,7 @@ export class UsbDeviceScanner {
       });
   }
 
+  // ★ 退订插拔广播：页面卸载/Ability 销毁时调用，防回调打到已释放的 UI
   unsubscribe(): void {
     if (this.subscriber) {
       try { commonEventManager.unsubscribe(this.subscriber); } catch (_) {}

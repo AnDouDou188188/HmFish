@@ -1,3 +1,16 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ AngleNet.cpp —— 文本方向分类网实现（cls 阶段，0/180 度二分类）                ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【职责】getAngles 批量判断行小图是否整体倒置：doAngle=true 时逐行             ║
+// ║   resize 到 192x48 → mean/norm 127.5 前处理 → 推理 → argmax 取                ║
+// ║   二分类结果（0=正向 / 1=倒置）；doAngle=false 时整网跳过推理，               ║
+// ║   全部返回 index=-1 占位；mostAngle=true 时按多数行的方向统一覆盖。           ║
+// ║ 【流水线位置】三网居中：OcrLiteImpl 核心流程第④步，产出 angles[]              ║
+// ║   决定哪些行需旋转 180 度再送 CrnnNet。                                       ║
+// ║ 【注意】HmFish 的调用方（RapidOCR.cpp）固定传 doAngle=false/mostAngle=false， ║
+// ║   即本网在探鱼相机场景完全不推理（省时延），仅保留代码路径完整性。            ║
+// ║ 【与 Android 原版差异】无逻辑差异。                                           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 #include "AngleNet.h"
 #include "OcrUtils.h"
 #include <numeric>
@@ -6,6 +19,8 @@
 #include <onnxruntime/core/providers/dml/dml_provider_factory.h>
 #endif
 
+// ★ setGpuIndex：__CUDA__/__DIRECTML__ 构建时挂对应 GPU 提供者；
+//   HmFish 为 CPU 构建，函数体被宏裁掉为空
 void AngleNet::setGpuIndex(int gpuIndex) {
 #ifdef __CUDA__
     if (gpuIndex >= 0) {
@@ -35,12 +50,15 @@ void AngleNet::setGpuIndex(int gpuIndex) {
 #endif
 }
 
+// ★ 析构：释放 ONNX 会话并清空输入/输出名
 AngleNet::~AngleNet() {
     delete session;
     inputNamesPtr.clear();
     outputNamesPtr.clear();
 }
 
+// ★ setNumThread：设置 ORT 图内/图间并行线程数并开最高图优化等级；
+//   须在 initModel 前调（与 DbNet/CrnnNet 同构）
 void AngleNet::setNumThread(int numOfThread) {
     numThread = numOfThread;
     //===session options===
@@ -63,6 +81,8 @@ void AngleNet::setNumThread(int numOfThread) {
     sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 }
 
+// ★ initModel：按平台构建方向分类会话（Windows 需 wchar 路径），
+//   提取输入/输出节点名缓存备用
 void AngleNet::initModel(const std::string &pathStr) {
 #ifdef _WIN32
     std::wstring clsPath = strToWstr(pathStr);
@@ -74,6 +94,8 @@ void AngleNet::initModel(const std::string &pathStr) {
     outputNamesPtr = getOutputNames(session);
 }
 
+// ★ scoreToAngle：对 2 类输出概率取最大者——maxIndex 即方向判定
+//   （0=正向 / 1=倒置），maxScore 为置信度；time 由调用方回填
 Angle scoreToAngle(const std::vector<float> &outputData) {
     int maxIndex = 0;
     float maxScore = 0;
@@ -86,6 +108,9 @@ Angle scoreToAngle(const std::vector<float> &outputData) {
     return {maxIndex, maxScore};
 }
 
+// ★ getAngle：单行方向分类全流程——substractMeanNormalize
+//   （(pix-127.5)/127.5，HWC→CHW）→ 建 NCHW 张量推理 → 输出展平拷出 →
+//   scoreToAngle 取二分类结果
 Angle AngleNet::getAngle(cv::Mat &src) {
     std::vector<float> inputTensorValues = substractMeanNormalize(src, meanValues, normValues);
     std::array<int64_t, 4> inputShape{1, src.channels(), src.rows, src.cols};
@@ -107,6 +132,14 @@ Angle AngleNet::getAngle(cv::Mat &src) {
     return scoreToAngle(outputData);
 }
 
+// ★ getAngles：批量方向判定入口。三分支：
+//   ① doAngle=true：逐行 resize 到 192x48 后推理（resize 破坏宽高比但
+//      方向特征对此不敏感），单行计时；
+//   ② doAngle=false：整网跳过推理，全部填 Angle{-1, 0} 占位（-1 表示
+//      "未分类"，上游据此不做旋转）——HmFish 固定走此分支，零推理开销；
+//   ③ mostAngle 投票（仅 doAngle=true 时）：对全部行的 index 求和，
+//      与行数一半比较得多数方向，再统一覆盖所有行——印刷品整页倒置时，
+//      个别行的误判被多数票纠正，避免同一页出现旋转不一致
 std::vector<Angle> AngleNet::getAngles(std::vector<cv::Mat> &partImgs, const char *path,
                                        const char *imgName, bool doAngle, bool mostAngle) {
     size_t size = partImgs.size();
@@ -134,6 +167,7 @@ std::vector<Angle> AngleNet::getAngles(std::vector<cv::Mat> &partImgs, const cha
         }
     }
     //Most Possible AngleIndex
+    // 多数投票：index 求和 < 行数一半 → 多数为正向(0)，否则统一倒置(1)
     if (doAngle && mostAngle) {
         auto angleIndexes = getAngleIndexes(angles);
         double sum = std::accumulate(angleIndexes.begin(), angleIndexes.end(), 0.0);

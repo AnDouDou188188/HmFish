@@ -1,5 +1,8 @@
 // ★ OCR 模型集管理：内置 paddle/paddle5 两套 + 沙箱外部模型集自动发现
-//   （filesDir/ocrmodels/<id>/），rawfile 提取到沙箱供 native 加载
+//   （filesDir/ocrmodels/<id>/），rawfile 提取到沙箱供 native 加载。
+//   与 native（libentry.so）交互：initOcrPaths 把 det/cls/rec/keys 四个
+//   文件路径传入 native 由 PaddleOCR 封装加载；切换模型集必须先
+//   await releaseOcr（异步 join OCR worker）再重新 init，避免争 native 锁
 import { common } from '@kit.AbilityKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import entry from 'libentry.so';
@@ -36,6 +39,7 @@ interface BuiltinSetDef {
   keys: string;
 }
 
+// ★ 内置模型集注册表：id 唯一标识（设置持久化引用它），文件名即 rawfile 内路径
 const BUILTIN_SETS: BuiltinSetDef[] = [
   {
     id: 'paddle',
@@ -55,22 +59,29 @@ const BUILTIN_SETS: BuiltinSetDef[] = [
   }
 ];
 
-// 目录名 → 显示名（config.json 的 name 优先）
+// ★ 目录名 → 默认显示名兜底表（外部模型集未提供 config.json name 时查这里）
 const SET_NAMES: Record<string, string> = {
   'paddle': 'PaddleOCR 普通文本',
   'paddle5': 'PP-OCRv5 票据高精度',
   'xiaomi': 'Xiaomi-OCR 票据格式'
 };
 
+// ★ OcrManager：模型集生命周期管理（发现/提取/初始化/切换），
+//   同一时刻 native 侧只保持一套 OCR 引擎加载
 export class OcrManager {
+  // ★ native 侧 OCR 引擎是否已按当前模型集初始化成功
   private inited: boolean = false;
+  // ★ 初始化互斥：initSet 进行中再进来的并发调用直接返回 false
   private initing: boolean = false;
+  // ★ 已初始化成功的模型集 id（同 id 重复 initSet 直接短路返回）
   private initedSetId: string = '';
 
+  // ★ ready：OCR 引擎可用性（Index 据此决定文字识别开关是否可用）
   get ready(): boolean {
     return this.inited;
   }
 
+  // ★ currentSetId：当前已加载的模型集 id（设置页高亮选中项用）
   get currentSetId(): string {
     return this.initedSetId;
   }
@@ -83,6 +94,9 @@ export class OcrManager {
     return null;
   }
 
+  // ───────── 模型集发现与 rawfile 提取 ─────────
+
+  // ★ getBuiltinSet：内置集定义 → 沙箱路径形式的 OcrModelSet（det/cls/rec/keys 定位）
   getBuiltinSet(ctx: common.UIAbilityContext, id: string): OcrModelSet {
     const def = this.findBuiltinDef(id) ?? BUILTIN_SETS[0];
     return {
@@ -202,7 +216,9 @@ export class OcrManager {
     return null;
   }
 
-  // 初始化指定模型集（按显式文件路径，任意命名均可）
+  // ★ 初始化指定模型集（按显式文件路径，任意命名均可）：
+  //   内置集先 ensureBuiltinFiles 释放 rawfile，外部集直接 scanDir 定位；
+  //   成功后记录 initedSetId，同 id 重复调用零开销
   async initSet(ctx: common.UIAbilityContext, setId: string): Promise<boolean> {
     if (this.initing) return false;
     if (this.inited && this.initedSetId === setId) return true;
@@ -250,17 +266,20 @@ export class OcrManager {
     return this.initSet(ctx, setId);
   }
 
-  // 兼容旧入口：初始化当前（默认 paddle）模型集
+  // ★ 兼容旧入口：初始化当前（默认 paddle）模型集；
+  //   识别循环每轮 OCR 前调用，幂等（已就绪立即返回 true）
   async ensureInited(ctx: common.UIAbilityContext): Promise<boolean> {
     return this.initSet(ctx, this.initedSetId !== '' ? this.initedSetId : 'paddle');
   }
 
   // ═══════ 表格结构识别（PP-Structure SLANet）═══════
   // rawfile → filesDir/ocrmodels/table/，幂等（已存在且够大跳过）
+  // ★ SLANet 沙箱路径（rawfile 文件名与 ocrmodels/table 目录均固定）
   private tableModelPath(ctx: common.UIAbilityContext): string {
     return `${ctx.filesDir}/ocrmodels/table/ch_ppstructure_mobile_v2_SLANet.onnx`;
   }
 
+  // ★ 表格模型 rawfile 提取：幂等（已存在且 >100 字节视为上次已释放，跳过）
   private ensureTableModel(ctx: common.UIAbilityContext): void {
     const dir = `${ctx.filesDir}/ocrmodels/table`;
     try { fs.mkdirSync(dir, true); } catch (_) {}
@@ -278,6 +297,7 @@ export class OcrManager {
     }
   }
 
+  // ★ 表格模型独立状态：SLANet 常驻内存，不随 OCR 引擎 release 一起释放
   private tableInited: boolean = false;
   private tableInitPromise: Promise<boolean> | null = null;
 

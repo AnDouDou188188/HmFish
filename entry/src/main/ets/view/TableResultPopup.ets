@@ -1,3 +1,21 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ TableResultPopup（TableResultPopup.ets）—— 表格识别结果弹窗                    ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  点顶部"表格"徽标触发的 PP-Structure(SLANet) 表格识别结果弹窗，               ║
+// ║  两态复用同一弹窗：loading 态（转圈 + 阶段提示 + 预览图大图）→ 结果态          ║
+// ║  （结构框标注图缩小为小条 + Grid 绝对定位还原表格 + 复制 TSV/HTML）           ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  rows/cols/cells/html/耗时/loading/loadingHint/previewPath 全部由 Index       ║
+// ║  解析 native JSON 后下发；onClose 上抛关闭；复制走系统剪贴板                  ║
+// ║  （TSV 制表符分隔可直接粘贴 Excel/WPS）                                       ║
+// ║                                                                              ║
+// ║ 【渲染要点】                                                                 ║
+// ║  TableCellData 为 native JSON "cells" 元素的 TS 映射；GridItem 用              ║
+// ║  rowStart/rowEnd/columnStart/columnEnd 绝对定位渲染合并单元格；               ║
+// ║  折叠边框（每格画上/左，末行补下、末列补右）避免相邻格重复双线                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 表格识别结果弹窗：表格文本展示与复制
 import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction } from '@kit.ArkUI';
@@ -9,7 +27,8 @@ import { promptAction } from '@kit.ArkUI';
  * - 复制文本（TSV，可直接粘贴 Excel/WPS）/ 复制 HTML / 关闭
  */
 
-// 单元格数据（native JSON 的 "cells" 数组元素）
+// ★ 单元格数据模型：native JSON "cells" 数组元素的 TS 映射
+//   （行列坐标 + 跨行跨列数 + 表头标志 + 文本），导出供 Index 解析时构造
 export class TableCellData {
   r: number = 0;   // 起始行
   c: number = 0;   // 起始列
@@ -28,8 +47,10 @@ export class TableCellData {
   }
 }
 
+// ★ TableResultPopup：表格结果弹窗主体（loading/结果两态 + Grid 表格还原）
 @Component
 export struct TableResultPopup {
+  // ★ 表格结构（Index 解析 native JSON 后下发）：行列数/单元格数组/HTML 原文/总耗时 ms
   @Prop rows: number = 0;
   @Prop cols: number = 0;
   @Prop cells: TableCellData[] = [];
@@ -54,11 +75,12 @@ export struct TableResultPopup {
     return this.cols > 8;
   }
 
+  // ★ 横向滚动模式下的网格总宽：每列固定 46vp，保证窄列文字可读
   private gridWidthVp(): number {
     return this.cols * 46;
   }
 
-  // TSV 文本：行×列矩阵展开 span（锚点格放文本，跨占格留空），制表符分隔可直接粘 Excel
+  // ★ TSV 文本：行×列矩阵展开 span（锚点格放文本，跨占格留空），制表符分隔可直接粘 Excel
   private buildTsv(): string {
     if (this.rows <= 0 || this.cols <= 0) return '';
     const matrix: string[][] = [];
@@ -82,6 +104,7 @@ export struct TableResultPopup {
     return lines.join('\n');
   }
 
+  // ★ 复制到系统剪贴板并 toast 反馈（成功文案由调用方传入，失败统一提示）
   private copyWithToast(text: string, toastOk: string): void {
     try {
       const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text);
@@ -99,6 +122,7 @@ export struct TableResultPopup {
 
   build() {
     Column() {
+      // ── 标题行：状态圆点 + 标题 + loading 转圈/规模·耗时徽标 + 关闭 ✕ ──
       Row({ space: 8 }) {
         Row().width(6).height(6).borderRadius(3).backgroundColor('#FF9500')
         Text('表格识别结果')
@@ -166,6 +190,7 @@ export struct TableResultPopup {
             .borderRadius(8)
             .margin({ top: 10 })
         }
+        // ── 表格还原：外层纵向滚动 + 内层横向滚动（列数>8 时）+ Grid 固定行列模板 ──
         Scroll() {
           Scroll() {
             Grid() {
@@ -228,6 +253,7 @@ export struct TableResultPopup {
         .padding(4)
       }
 
+      // ── 底部操作行：loading 态只留"关闭"；结果态为 复制文本(TSV)/复制HTML/关闭 ──
       if (this.loading) {
         Button('关闭')
           .fontSize(12).fontColor('#D7DAE1')

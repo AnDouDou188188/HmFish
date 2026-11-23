@@ -1,3 +1,23 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ UvcCamera 实现 —— libuvc fd 注入式 UVC 取流全流程（uvc_camera.cpp）          ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【职责】① 连接链：uvc_init2(usbfs 根) → uvc_get_device_with_fd（fd 注入     ║
+// ║   定位设备）→ uvc_open（解析描述符，建 stream_ifs/format_descs 链表）。      ║
+// ║   ② 三级协商链：NegotiateMax（设备最高分辨率，MJPEG 优先、≥15fps 优先）      ║
+// ║   → 固定参数链（MJPEG w×h → YUYV w×h → YUYV@15）→ AutoNegotiate（按设备     ║
+// ║   实际上报格式逐个协商）——保证任何相机都能找到一个可用组合。                  ║
+// ║   ③ 取流：uvc_start_streaming_bandwidth 按带宽选等时端点 altsetting 提交     ║
+// ║   URB；帧回调里 MJPEG（uvc_mjpeg2rgbx，libjpeg JCS_EXT_RGBA 直出）或        ║
+// ║   YUYV（libyuv YUY2ToARGB + ARGBToBGRA 原地换 R/B）解码为 RGBA，             ║
+// ║   送 YuvPipeline::ProcessExternalRgba（B 入口，与手机相机路径汇合于          ║
+// ║   ProcessCommonTail）。                                                      ║
+// ║   ④ 诊断体系：lastError_（阶段+错误码+errno）/ DumpFormats（设备格式清单）/  ║
+// ║   FrameCount/DecodeFailCount（看门狗判"有连接无画面"）/ RecordFrameInfo      ║
+// ║   （首帧头尾字节+EOI+JPEG 真实宽高，一次定位空帧/固件尺寸造假/数据损坏）。    ║
+// ║                                                                              ║
+// ║ 【线程模型】OnFrame 在 libuvc 取流线程执行；Connect/Start/Stop/Disconnect    ║
+// ║   在 NAPI 线程；状态跨线程共享全走 atomic，诊断文本走 frameInfoMutex_。      ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ UVC 摄像头取流（libuvc fd 注入）：格式协商（NegotiateMax 最高分辨率优先）、
 //   MJPEG/YUYV 帧解码为 RGBA 送渲染管线、帧诊断计数
 #include "uvc_camera.h"
@@ -17,19 +37,26 @@
 #define LOG_E(...) OH_LOG_Print(LOG_APP, LOG_ERROR, 0, UVC_TAG, __VA_ARGS__)
 
 namespace {
+// usbfs 根目录：OHOS 的 USB 设备节点统一挂载于此，libuvc 需要它配合注入 fd
+// 在用户态完成设备枚举与后续 usbfs IO（等时 URB 提交目标也在此树下）
 constexpr const char *kUsbFs = "/dev/bus/usb";
 }
 
+// ───────── 单例与生命周期 ─────────
+
+// ★ Instance：进程级单例入口（magic static 惰性构造，线程安全）
 UvcCamera &UvcCamera::Instance() {
     static UvcCamera inst;
     return inst;
 }
 
+// ★ ~UvcCamera：析构兜底调用 Disconnect，保证进程退出前释放
+//   libuvc 句柄与解码缓冲（单例实际随进程存活，主要防内存审计误报泄漏）
 UvcCamera::~UvcCamera() {
     Disconnect();
 }
 
-// 记录失败阶段与错误码（含 errno/strerror，便于定位 fd 读取/描述符解析类问题）
+// ★ SetError：记录失败阶段与错误码（含 errno/strerror，便于定位 fd 读取/描述符解析类问题）
 void UvcCamera::SetError(const char *stage, int code) {
     char buf[256];
     snprintf(buf, sizeof(buf), "%s ret=%d errno=%d(%s)",
@@ -38,10 +65,20 @@ void UvcCamera::SetError(const char *stage, int code) {
     LOG_E("%{public}s", buf);
 }
 
+// ───────── 连接管理 ─────────
+
+// ★ Connect：三步连接链，任一步失败即回滚已建资源并记录阶段错误。
+//   ① uvc_init2：建 libuvc 上下文（指定 usbfs 根，非默认 /dev/bus/usb 之外路径）
+//   ② uvc_get_device_with_fd：按 vid/pid + 授权 fd + 总线/地址定位设备
+//      （绕开 libuvc 自行枚举——应用无 usbfs 全目录权限，必须用注入 fd）
+//   ③ uvc_open：打开设备并解析全部 UVC 描述符，产出
+//      devh_->info->stream_ifs → format_descs → frame_descs 协商数据源
 bool UvcCamera::Connect(int fd, int vid, int pid, int busnum, int devaddr) {
     Disconnect();
     lastError_.clear();
 
+    // fd 合法性前置校验：ArkTS 侧授权失败/设备拔出时 fd 可能已失效，
+    // 提前拦截避免 libuvc 深处报晦涩错误
     if (fd <= 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "invalid fd=%d", fd);
@@ -84,8 +121,12 @@ bool UvcCamera::Connect(int fd, int vid, int pid, int busnum, int devaddr) {
     return true;
 }
 
-// ★ 设备实际上报的格式/分辨率清单：诊断 -51 INVALID_MODE 的关键
+// ───────── 格式诊断 ─────────
+
+// ★ DumpFormats：设备实际上报的格式/分辨率清单：诊断 -51 INVALID_MODE 的关键
 //   （GUID 前缀 MJPG=4d4a5047、YUY2=59555932）
+//   实现：直接遍历 uvc_open 解析出的 stream_ifs→format_descs→frame_descs
+//   三级链表（DL_FOREACH），每格式最多展示 10 档分辨率防日志爆炸
 std::string UvcCamera::DumpFormats() const {
     std::string out;
     if (!devh_ || !devh_->info) return "(no device handle)";
@@ -116,10 +157,14 @@ std::string UvcCamera::DumpFormats() const {
     return out;
 }
 
-// ★ 直接上设备支持的最高分辨率（用户要求，不再默认 640x480）：
+// ───────── 流协商（NegotiateMax 最高分辨率优先 → AutoNegotiate 逐个兜底）─────────
+
+// ★ NegotiateMax：直接上设备支持的最高分辨率（用户要求，不再默认 640x480）：
 //   遍历 MJPG/YUY2 格式描述，挑面积最大的帧协商；
 //   优先选最高帧率 ≥15fps 的帧（避免协商到 5fps 的静态大头照档位变幻灯片），
 //   该条件下无帧时退回绝对最大面积（哪怕低帧率）
+//   两轮 pass 的原因：先"≥15fps 里挑最大"保证流畅，失败再"无条件挑最大"
+//   保证有画面——流畅与可用性分级降级
 bool UvcCamera::NegotiateMax() {
     if (!devh_ || !devh_->info) return false;
     static const struct {
@@ -129,6 +174,8 @@ bool UvcCamera::NegotiateMax() {
         {"MJPG", UVC_FRAME_FORMAT_MJPEG},
         {"YUY2", UVC_FRAME_FORMAT_YUYV},
     };
+    // MJPG 优先于 YUY2：MJPEG 是帧内压缩，同等带宽下分辨率上限远高于
+    // 未压缩的 YUY2（YUY2 1080p@15 需 ~500MB/s，多数 USB2 链路根本跑不动）
     for (int p = 0; p < 2; p++) {
         uvc_streaming_interface_t *stream_if;
         // 先在 ≥15fps 的帧里挑最大面积，找不到再无条件挑最大面积
@@ -142,6 +189,9 @@ bool UvcCamera::NegotiateMax() {
                     if (memcmp(fmt->guidFormat, prefs[p].tag, 4) != 0) continue;
                     uvc_frame_desc_t *fr;
                     DL_FOREACH(fmt->frame_descs, fr) {
+                        // UVC 帧率间隔单位是 100ns：fps = 10^7 / interval；
+                        // intervals 数组以 0 结尾，取最大 interval 算最低帧率、
+                        // 最小 interval 算最高帧率，得到该帧可协商的 fps 区间
                         int frMin = 1, frMax = 120;
                         if (fr->intervals && fr->intervals[0]) {
                             uint32_t maxI = fr->intervals[0], minI = fr->intervals[0];
@@ -168,6 +218,7 @@ bool UvcCamera::NegotiateMax() {
                 }
             }
             if (!bestFr) continue;
+            // 用选出的帧发起 UVC 流协商（PROBING_COMMIT 探测设备是否接受）
             uvc_error_t r = uvc_get_stream_ctrl_format_size_fps(
                 devh_, &ctrl_, prefs[p].fmt,
                 (int)bestFr->wWidth, (int)bestFr->wHeight, minFps, maxFps);
@@ -185,8 +236,10 @@ bool UvcCamera::NegotiateMax() {
     return false;
 }
 
-// ★ 遍历设备上报的 MJPEG/YUYV 格式与分辨率逐个协商：
+// ★ AutoNegotiate：遍历设备上报的 MJPEG/YUYV 格式与分辨率逐个协商：
 //   部分相机不支持 640x480（固定 1080p/720p 等），固定参数协商会得到 -51 INVALID_MODE
+//   与 NegotiateMax 的区别：不挑"最大"，而是全量逐个试，第一个成功的即用，
+//   是协商链的最后兜底（成功率最高，但分辨率/帧率不可控）
 bool UvcCamera::AutoNegotiate() {
     if (!devh_ || !devh_->info) return false;
     static const struct {
@@ -238,6 +291,15 @@ bool UvcCamera::AutoNegotiate() {
     return false;
 }
 
+// ───────── 取流启停 ─────────
+
+// ★ Start：三级协商 → 缓冲重建 → 管线重配 → 启动等时取流。
+//   w/h/fps 只是期望值；实际以协商结果 lastNegW_/lastNegH_ 为准。
+//   协商链（由高到低）：
+//     ① NegotiateMax：设备最高分辨率（MJPEG 优先、≥15fps 优先）
+//     ② 固定参数链：MJPEG w×h → YUYV w×h → YUYV@15（三次返回码全记录）
+//     ③ AutoNegotiate：按设备上报格式逐个协商（最后兜底）
+//   成启后由 uvc_start_streaming_bandwidth 按协商带宽选等时端点提交 URB
 bool UvcCamera::Start(YuvPipeline *pipeline, int width, int height, int fps) {
     if (!devh_ || !pipeline || !connected_.load()) {
         SetError("Start: not ready (no device or not connected)", 0);
@@ -317,6 +379,8 @@ bool UvcCamera::Start(YuvPipeline *pipeline, int width, int height, int fps) {
     decodeFailCount_.store(0);
     lastStatTime_ = std::chrono::steady_clock::now();
 
+    // bandwidth_factor=1.0：libuvc 按协商带宽上限选择等时端点 altsetting，
+    // 再由内核 usbfs 提交等时 URB；帧到达后在 libuvc 取流线程回调 FrameCb
     r = uvc_start_streaming_bandwidth(devh_, &ctrl_, &UvcCamera::FrameCb, this, 1.0f, 0);
     if (r != UVC_SUCCESS) {
         SetError("uvc_start_streaming_bandwidth", (int)r);
@@ -328,6 +392,8 @@ bool UvcCamera::Start(YuvPipeline *pipeline, int width, int height, int fps) {
     return true;
 }
 
+// ★ Stop：仅停流（向设备发 CLEAR_FEATURE + 停等时 URB），设备句柄保留，
+//   支持 Stop→Start 换分辨率重开而无需重新授权 fd
 void UvcCamera::Stop() {
     if (devh_ && streaming_.load()) {
         uvc_stop_streaming(devh_);
@@ -336,6 +402,8 @@ void UvcCamera::Stop() {
     streaming_.store(false);
 }
 
+// ★ Disconnect：按"句柄→设备→上下文→缓冲"逆序全量释放，
+//   与 Connect 的建立顺序严格对称，防止泄漏与悬空句柄
 void UvcCamera::Disconnect() {
     Stop();
     if (devh_) {
@@ -359,11 +427,14 @@ void UvcCamera::Disconnect() {
     LOG_I("UVC disconnected");
 }
 
+// ───────── 帧回调与解码（libuvc 取流线程）─────────
+
+// ★ FrameCb：libuvc C 回调入口（user 携带 this），仅做类型转发进 OnFrame
 void UvcCamera::FrameCb(uvc_frame_t *frame, void *user) {
     static_cast<UvcCamera *>(user)->OnFrame(frame);
 }
 
-// ★ 首帧诊断信息：帧描述尺寸 vs JPEG 头真实尺寸 vs actual_bytes/帧头字节。
+// ★ RecordFrameInfo：首帧诊断信息：帧描述尺寸 vs JPEG 头真实尺寸 vs actual_bytes/帧头字节。
 //   "连接成功但黑屏"时据此一次定位：
 //   actual_bytes=0 → 帧空（内核取流/接触问题）；
 //   jpeg_dim != 帧描述尺寸 → 相机固件尺寸造假（已由 mjpeg2rgbx 补丁兼容）；
@@ -371,6 +442,8 @@ void UvcCamera::FrameCb(uvc_frame_t *frame, void *user) {
 void UvcCamera::RecordFrameInfo(const uvc_frame_t *frame) {
     const uint8_t *d = (const uint8_t *)frame->data;
     const size_t ab = frame->actual_bytes;
+    // 帧头前 8 字节十六进制：合法 MJPEG 必以 SOI(ffd8) 开头，
+    // 非 ffd8 即数据损坏/错位（带宽不足丢包含错位时常见）
     char head[20] = {0};
     const size_t headN = ab < 8 ? ab : 8;
     for (size_t i = 0; i < headN; i++) {
@@ -388,7 +461,8 @@ void UvcCamera::RecordFrameInfo(const uvc_frame_t *frame) {
     for (size_t i = eoiFrom; i + 1 < ab; i++) {
         if (d[i] == 0xff && d[i + 1] == 0xd9) { eoi = 1; break; }
     }
-    // 扫描 SOF0/SOF2 标记取 JPEG 真实宽高（在 SOS 前的头部区域）
+    // 扫描 SOF0/SOF2 标记取 JPEG 真实宽高（在 SOS 前的头部区域）：
+    // SOF 段按 JPEG 规范存放 高度(2B)+宽度(2B)，比相机上报的帧描述更可信
     int jw = 0, jh = 0;
     const size_t scanLen = ab < 4096 ? ab : 4096;
     for (size_t i = 0; i + 9 < scanLen; i++) {
@@ -409,11 +483,18 @@ void UvcCamera::RecordFrameInfo(const uvc_frame_t *frame) {
     LOG_I("%{public}s", buf);
 }
 
+// ★ GetFrameInfo：线程安全取回首帧诊断快照（未收到帧时返回占位提示）
 std::string UvcCamera::GetFrameInfo() {
     std::lock_guard<std::mutex> lock(frameInfoMutex_);
     return lastFrameInfo_.empty() ? "(no frame yet)" : lastFrameInfo_;
 }
 
+// ★ OnFrame：帧解码与投递核心（libuvc 取流线程）。
+//   职责：合法性过滤 → 帧计数/周期统计 → 按帧格式分路解码：
+//     MJPEG：uvc_mjpeg2rgbx（libjpeg 解压直出 JCS_EXT_RGBA）→ ProcessExternalRgba
+//     YUYV：libyuv YUY2ToARGB → ARGBToBGRA 原地换 R/B → ProcessExternalRgba
+//   解码失败计入 decodeFailCount_（首失败附 libjpeg 具体报错），画面黑时
+//   与 frameCount_ 联合区分"没帧"和"有帧解不出"
 void UvcCamera::OnFrame(uvc_frame_t *frame) {
     if (!streaming_.load() || !pipeline_ || !frame || !frame->data) {
         return;
@@ -440,7 +521,9 @@ void UvcCamera::OnFrame(uvc_frame_t *frame) {
         lastStatTime_ = now;
     }
 
+    // ── 分路一：MJPEG（等时带宽友好，绝大多数 UVC 相机的高分辨率档只有 MJPEG）──
     if (frame->frame_format == UVC_FRAME_FORMAT_MJPEG) {
+        // 解码输出帧按首帧 w*h*4 懒分配（Start 里已预释放旧缓冲，这里必然新建）
         if (!mjpegOut_) {
             mjpegOut_ = uvc_allocate_frame((size_t)w * h * 4);
             if (!mjpegOut_) {
@@ -451,6 +534,8 @@ void UvcCamera::OnFrame(uvc_frame_t *frame) {
         // JCS_EXT_RGBA 直接输出 RGBA，与管线字节序一致
         const uvc_error_t dr = uvc_mjpeg2rgbx(frame, mjpegOut_);
         if (dr == UVC_SUCCESS && mjpegOut_->data) {
+            // 解码尺寸以输出帧为准（兼容相机固件"帧描述尺寸造假"——
+            // JPEG 头真实尺寸与 UVC 帧描述不一致时 mjpeg2rgbx 已按实际解码）
             pipeline_->ProcessExternalRgba((const uint8_t *)mjpegOut_->data,
                                            (int)mjpegOut_->width, (int)mjpegOut_->height);
         } else {
@@ -471,6 +556,7 @@ void UvcCamera::OnFrame(uvc_frame_t *frame) {
             }
         }
     } else if (frame->frame_format == UVC_FRAME_FORMAT_YUYV) {
+        // ── 分路二：YUYV（未压缩 YUY2 4:2:2，仅低分辨率档可用）──
         const size_t rgbaSize = (size_t)w * h * 4;
         if (yuyvBuf_.size() < rgbaSize) {
             yuyvBuf_.resize(rgbaSize);

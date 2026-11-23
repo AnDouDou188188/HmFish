@@ -1,5 +1,39 @@
-// ★ 主页面（总装入口）：相机预览 XComponent、HUD、各设置弹窗、
-//   USB/UVC 设备管理、native 管线与模型加载调度、录像/拍照全链路组装
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ HmFish 主页面（Index.ets）—— 探鱼相机应用总装入口                            ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【页面职责】                                                                 ║
+// ║  本文件是应用唯一 @Entry 页面，负责把所有子系统"总装"成一个完整相机应用：      ║
+// ║   1. 相机预览：双层 XComponent（cam_raw 原始层 + preview 显示层），           ║
+// ║      手机摄像头（后置/前置）与 USB/UVC 外接摄像头两条供帧链路                 ║
+// ║   2. AI 能力调度：YOLO 目标识别 / OCR 文字识别 / 表格识别(SLANet) /           ║
+// ║      人脸识别(SCRFD) / 水深估计 / 运动检测 / AI 超分增强，全部端侧推理         ║
+// ║   3. HUD 与交互：TopHudView（顶部状态徽标）、BottomPanel（底部控制）、        ║
+// ║      十余个设置弹窗（识别/画质/能耗/记录/位置…）                              ║
+// ║   4. 媒体产出：截图入相册、AVRecorder 录像（native 直供 NV12 帧不中断预览）    ║
+// ║   5. 设置持久化：SettingsStore（Preferences）统一读写，150ms 防抖落盘          ║
+// ║                                                                              ║
+// ║ 【核心数据流】                                                               ║
+// ║   相机帧 → native 管线(libentry.so, yuv_pipeline.cpp) →                     ║
+// ║     ├─ 处理后 RGBA 推到 preview XComponent 的 surface（用户看到的画面）      ║
+// ║     ├─ YOLO/水深/运动/人脸 结果 → tsfn 回调 → VisionController 节流分发 →    ║
+// ║     │    onResult/onOcrText/onOcrProgress → 本页 @State → HUD 刷新           ║
+// ║     └─ 录像帧(NV12) 直供 AVRecorder 的 surface（编码不走 JS 层）             ║
+// ║   反向控制：本页调用 entry.xxx()（setOcrEnabled/setPipelineTiming/           ║
+// ║     setUsbEnhance/uvcStartStreaming…）原子热更新 native 管线参数              ║
+// ║                                                                              ║
+// ║ 【两条供帧链路】                                                             ║
+// ║   手机摄像头：CameraService → ImageReceiver(createYuvReceiver) → native      ║
+// ║   USB/UVC：UsbDeviceScanner(usbManager) 授权拿 fd → libuvc 取流 →            ║
+// ║            setupExternalPipeline 外部供帧（无 ImageReceiver）                ║
+// ║   两者最终汇入同一套 native 处理/显示/录像管线，页面状态无差别消费             ║
+// ║                                                                              ║
+// ║ 【生命周期骨架】                                                             ║
+// ║   aboutToAppear：权限申请→设置恢复→模型加载→回调注册→各功能恢复               ║
+// ║   XComponent.onLoad → startOrRestoreCamera → startCamera/USB 重连            ║
+// ║   onPageHide：停管线/停 USB 取流/带超时释放相机（息屏不占带宽）               ║
+// ║   onPageShow：按退出前摄像头恢复（USB 优先重连，拔出则回退后置）              ║
+// ║   aboutToDisappear：清全部定时器/监听/TTS，带超时释放相机与录像资源           ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 import { CameraService } from '../camera/CameraService';
 import { CameraSource, CameraStatusEvent } from '../camera/UsbCameraState';
 import { SettingsStore } from '../common/SettingsStore';
@@ -192,9 +226,16 @@ function measureFor(name: string): string {
   return '个';
 }
 
+// ═══════════════ 页面主体（struct Index）═══════════════
+// 成员排布约定（自上而下）：
+//   ① @State 响应式状态区（按功能分组：画面/识别/OCR/能耗/人脸/录像/USB…）
+//   ② private 服务实例与非响应式内部状态（定时器句柄、锁标志、Canvas 上下文）
+//   ③ 功能方法区（位置循环/录像计时/持久化/生命周期/模型/人脸/表格/相机/USB）
+//   ④ build()：全屏 Stack 逐层叠放（预览层 → HUD → 弹层 → 弹窗 → loading 遮罩）
 @Entry
 @Component
 struct Index {
+  // ───────── ① 画面与加载状态 ─────────
   @State loading: boolean = true;
   @State loadingMsg: string = '正在初始化…';
   @State yoloInited: boolean = false;
@@ -203,10 +244,13 @@ struct Index {
   @State cameraPosition: number = 0;
   @State usbConnected: boolean = false;
 
+  // ───────── ② AI 识别结果（native 回调灌入）─────────
+  // detList：原始检测框；mergedList：按类名合并后的 HUD 徽标数据
   @State detList: Det[] = [];
   @State mergedList: Merged[] = [];
   @State motionLevel: number = 0;
   @State depthCm: number = 0;
+  // ═══════════════ 位置水印循环（GeoService 逆地理）═══════════════
   // ★ 位置水印：启动即取一次；首次成功前每 60s 重试，成功后降频 180s 刷新
   //   （失败保持原水印不动并提示一次原因）
   private geoTimer: number = -1;
@@ -355,10 +399,10 @@ struct Index {
   @State powerYoloMs: number = 300;
   @State powerYoloIdleMs: number = 800;
   @State powerSensorMs: number = 250;
-  @State powerOcrMs: number = 4000;
+  @State powerOcrMs: number = 1500;
   @State powerThreads: number = 8;
   // ★ 自定义档参数（最近一次手动微调）：点"自定义"按钮恢复这套参数
-  @State powerCustom: number[] = [40, 300, 800, 4000, 250, 8];
+  @State powerCustom: number[] = [40, 300, 800, 1500, 250, 8];
   @State powerSheetVisible: boolean = false;
 
   // ★ OCR 模型集（长按 OCR 弹窗选择）+ det 阈值三件套
@@ -468,6 +512,7 @@ struct Index {
   // ★ USB 帧看门狗定时器（连接成功但无画面时给出明确提示并回退）
   private uvcWatchdogTimer: number = -1;
 
+  // ═══════════════ 录像计时（HUD 红点闪烁 + 00:00 计秒浮窗）═══════════════
   @State recordSec: number = -1;
   @State recBlink: boolean = true;
 
@@ -488,6 +533,8 @@ struct Index {
     this.recordSec = -1;
   }
 
+  // ═══════════════ 设置持久化（SettingsStore 统一出口）═══════════════
+  // 全部功能开关/参数经 persistSettings() 写入 Preferences；restore 在 aboutToAppear
   private persistSettings(): void {
     if (this.persistTimer >= 0) clearTimeout(this.persistTimer);
     // ★ 所有设置更改立即保存（150ms 防抖合并高频滑条），flush 落盘防丢失
@@ -543,6 +590,10 @@ struct Index {
     }, 150);
   }
 
+  // ═══════════════ 生命周期：aboutToAppear（启动总装）═══════════════
+  // 执行顺序：日志自检 → 屏幕/折叠监听 → 权限申请 → 常亮+安全区 →
+  //           设置恢复(含旧版迁移) → YOLO 模型加载 → native 开关同步 →
+  //           字体/OCR/人脸/超分恢复 → 回调注册 → USB 插拔监听 → 位置循环
   async aboutToAppear(): Promise<void> {
     try {
       // ★ 落盘日志自检：每次启动写一行，重连 PC 后检查 files/uvc_debug.log 是否存在即可确认通路
@@ -632,10 +683,14 @@ struct Index {
       this.powerYoloIdleMs = s.powerYoloIdleMs;
       this.powerSensorMs = s.powerSensorMs;
       this.powerOcrMs = s.powerOcrMs;
+      // ★ 旧版迁移：旧标准档 OCR 间隔 4000ms 滞后明显，统一迁到新标准 1500ms
+      if (this.powerOcrMs === 4000) {
+        this.powerOcrMs = 1500;
+      }
       this.powerThreads = s.powerThreads;
       // ★ 自定义档参数恢复（非法长度回退标准预设）
       this.powerCustom = s.powerCustom.length === 6
-        ? s.powerCustom : [40, 300, 800, 4000, 250, 8];
+        ? s.powerCustom : [40, 300, 800, 1500, 250, 8];
       this.ocrModelId = s.ocrModelId;
       this.ocrDbScore = s.ocrDbScore;
       this.ocrDbBox = s.ocrDbBox;
@@ -816,6 +871,9 @@ struct Index {
     }
   }
 
+  // ═══════════════ 生命周期：onPageHide / onPageShow（后台与前台切换）═══════════════
+  // onHide：停管线/停 USB 取流（省带宽防发热）/带超时释放相机；
+  // onShow：按退出前摄像头恢复（USB 设备在则重连+重新授权，拔出回退后置）
   onPageHide(): void {
     this.pageHidden = true;
     this.persistSettings();
@@ -897,6 +955,9 @@ struct Index {
     this.restoreCamera(0);
   }
 
+  // ═══════════════ 字体与 YOLO 模型加载 ═══════════════
+  // copyFontToSandbox：CJK 字体解包到沙箱供 native FreeType 水印绘制；
+  // loadModel：释放旧 YOLO → ModelManager 解包 → initYolo → 同步阈值/类名
   private async copyFontToSandbox(ctx: common.UIAbilityContext): Promise<string> {
     const dest = `${ctx.filesDir}/NotoSerifCJKsc-VF.ttf`;
     try { if (fs.accessSync(dest)) return dest; } catch (_) {}
@@ -934,6 +995,10 @@ struct Index {
     this.persistSettings();
   }
 
+  // ═══════════════ OCR 文字识别（开关/参数/模型集切换）═══════════════
+  // 引擎：OcrManager 管理 RapidOCR 模型集（内置 paddle/paddle5 + 外部目录扫描）；
+  // 触发：native 端场景变化+间隔判定（g_trigger_interval_ms，默认 1500ms），
+  //       ArkTS 侧仅控制开关、det 阈值与间隔参数下发
   private async toggleOcr(): Promise<void> {
     if (this.ocrEnabled) {
       this.ocrEnabled = false;
@@ -1130,6 +1195,9 @@ struct Index {
     this.persistSettings();
   }
 
+  // ═══════════════ 画质增强（USB 与手机前后置通用）═══════════════
+  // 非AI：亮度/锐度/对比度/饱和度四滑条（native OpenCV 实时处理）
+  // AI：QuickSRNet x4 超分 + 降噪/去浊/色彩还原三强度（native 异步合成层）
   // ★ 画质增强统一应用入口：模式/亮度/锐度/对比度/饱和度/AI 四模块强度 → native
   private applyUsbEnhanceSettings(): void {
     try {
@@ -1245,6 +1313,9 @@ struct Index {
     this.persistSettings();
   }
 
+  // ═══════════════ 人脸识别（SCRFD 检测 + 106 关键点 + 性别年龄颜值）═══════════════
+  // 数据链：native 每 250ms 轮询 getFaceInfo() → faceHudFaces/faceHudRows →
+  //         HUD 每人脸一行摘要；详情面板（头像/分项条/箭头）按需弹出
   // ★ 人脸识别：rawfile 提取三模型（SCRFD det_500m / 2d106det / genderage）+ initFace
   private async initFaceModels(): Promise<boolean> {
     try {
@@ -1868,6 +1939,9 @@ struct Index {
     setTimeout(() => { this.autoRecordCooldown = false; }, 15000);
   }
 
+  // ═══════════════ 录像（手动/自动/随时保存）═══════════════
+  // 手动：底部录像按钮 toggleRecord；自动：checkAutoRecord 由 YOLO 命中/运动触发；
+  // 架构：AVRecorder.getInputSurface 交给 native 直供 NV12 帧——预览/识别全程不中断
   // ★ 录像不中断（对齐 Android 录像架构）：AVRecorder getInputSurface 交给
   //   native 直供 NV12 帧，相机/预览/识别/运动/水深全程不重配不中断
   private async beginRecording(durationMs: number): Promise<boolean> {
@@ -2448,6 +2522,9 @@ struct Index {
     } catch (_) {}
   }
 
+  // ═══════════════ 手机摄像头生命周期（启动/切换/恢复/释放）═══════════════
+  // startCamera：首次启动；selectCamera：用户切换（含 USB 列表/授权流）；
+  // restoreCamera：异常后无条件重建；releaseCameraSafe：3s 超时兜底释放
   private async startCamera(rawDisplayId: string, previewDisplayId: string): Promise<void> {
     if (this.switching) return;
     this.switching = true;
@@ -2682,6 +2759,10 @@ struct Index {
     await this.beginRecording(0);
   }
 
+  // ═══════════════ USB/UVC 外接摄像头（授权→fd 注入→libuvc 取流→看门狗）═══════════════
+  // 插拔双通道监听（相机服务 cameraStatus + USB 公共事件）→ notifyUsbAttached/Detached；
+  // 连接：requestRight 授权 → openPipe 拿 fd → uvcConnect → uvcStartStreaming；
+  // 保障：5s/10s 帧看门狗（无帧/全解码失败提示并回退）、UVC 诊断日志落盘
   // ★ 照抄 Android CameraFragment.onAttachDev：插入即申请权限并自动连接
   //   （相机服务 cameraStatus 与 USB 层公共事件可能都触发，2.5s 去重防止重复连接）
   private notifyUsbAttached(): void {
@@ -2914,6 +2995,8 @@ struct Index {
     this.startUvcWatchdog(prevPos);
   }
 
+  // ═══════════════ 生命周期：aboutToDisappear（页面销毁清理）═══════════════
+  // 清全部定时器/监听/轮询 → TTS shutdown → 录像收尾 → 带超时释放相机与音效资源
   aboutToDisappear(): void {
     this.vision.stop();
     this.previewReady = false;
@@ -2947,6 +3030,16 @@ struct Index {
     })();
   }
 
+  // ═══════════════ build()：全屏 Stack 层级结构 ═══════════════
+  // 自下而上叠放顺序（z 轴从低到高）：
+  //   1. cam_raw XComponent：相机原始输出层（不可见，仅提供 raw surface，随旋转角转动）
+  //   2. preview Stack：preview XComponent（native 推流的显示层，按内容比例适配尺寸）
+  //      + 触摸覆盖层（点击命中人脸框 / 双指捏合变焦）+ 未就绪黑遮罩
+  //   3. TopHudView：顶部 HUD 徽标条（识别/OCR/电量/人脸行…，回调全部转发本页方法）
+  //   4. 人脸详情弹层（遮罩 + 全屏箭头 Canvas + 详情面板）
+  //   5. BottomPanel：底部控制面板（录像/截图/识别/水深/运动/相册/变焦滑条）
+  //   6. 录像计时浮窗 RecTimerPopup / loading 遮罩 LoadingOverlay
+  //   7. 各功能弹窗（识别设置/画质/OCR/表格结果/运动/水深/记录/能耗/位置/USB 列表）
   build() {
     Stack({ alignContent: Alignment.Center }) {
       Stack() {
@@ -3228,6 +3321,7 @@ struct Index {
         visible: this.loading || (!this.previewReady && !this.pageHidden)
       })
 
+      // ───────── 弹窗层：功能设置与结果展示（互不叠加，各自 visible 独立）─────────
       if (this.sheetVisible) {
         ModelSheet({
           models: this.models.getModels(),

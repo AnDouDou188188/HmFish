@@ -1,3 +1,20 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ OcrResultPopup（OcrResultPopup.ets）—— OCR 识别结果弹窗（小票风格）          ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  点击顶部 HUD"文字识别"行的识别摘要弹出。以"小票/票据"拟物风格全量展示        ║
+// ║  OCR 识别文本：米黄纸底 + 上下虚线 + 居中票头（标题+时间戳）+ 逐行内容 +       ║
+// ║  行数落款；支持一键复制（保留 \n 换行）与长按自由选词                         ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  text/modelName 由 Index 下发（@Prop 只读）；onClose 上抛关闭；               ║
+// ║  时间戳组件内自理（aboutToAppear 定格，不随后续刷新变化）；                   ║
+// ║  复制走系统剪贴板（纯文本 MIME）+ toast 反馈                                  ║
+// ║                                                                              ║
+// ║ 【关闭契约】                                                                 ║
+// ║  弹窗体 onClick 置空消费点击，阻止冒泡到 Index 的全屏遮罩关闭逻辑——           ║
+// ║  关闭只走 ✕ / 关闭按钮 / 点遮罩空白处，长按系统选词不受影响                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ OCR 识别结果弹窗：文本展示与一键复制
 import { pasteboard } from '@kit.BasicServicesKit';
 import { promptAction } from '@kit.ArkUI';
@@ -8,22 +25,27 @@ import { promptAction } from '@kit.ArkUI';
  * - 复制带格式原文（保留 \n 换行）
  * - 长按行可自由选词（系统选择手柄）
  */
+// ★ OcrResultPopup：OCR 结果弹窗主体（票头/正文/落款 + 复制/关闭操作行）
 @Component
 export struct OcrResultPopup {
+  // ★ OCR 识别全文（\n 分行，弹窗按行 ForEach 渲染，空行渲染为占位空格）
   @Prop text: string = '';
   // ★ 当前模型集名（票据顶部展示，区分是哪个模型的输出）
   @Prop modelName: string = '';
+  // ★ 关闭回调（Index 隐藏弹窗与遮罩）
   onClose?: () => void = () => {};
 
   // ★ 票据时间戳：弹窗打开时定格
   private stamp: string = '';
 
+  // ★ 时间戳定格：打开时刻的 年-月-日 时:分（两位补零），后续刷新不变
   aboutToAppear(): void {
     const d = new Date();
     const p2 = (n: number): string => (n < 10 ? '0' + n : `${n}`);
     this.stamp = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
   }
 
+  // ★ 复制全文到系统剪贴板：纯文本 MIME 保留 \n 换行；成功/失败均 toast 反馈
   private copyToClipboard(): void {
     try {
       const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, this.text);
@@ -51,6 +73,7 @@ export struct OcrResultPopup {
 
   build() {
     Column() {
+      // ── 标题行：状态圆点 + "识别结果" + 模型集徽标 + 关闭 ✕ ──
       Row({ space: 8 }) {
         Row().width(6).height(6).borderRadius(3).backgroundColor('#00E5FF')
         Text('识别结果')
@@ -119,6 +142,7 @@ export struct OcrResultPopup {
       .align(Alignment.TopStart)
       .margin({ top: 10 })
 
+      // ── 底部操作行：复制全文（保留换行格式）/ 关闭 ──
       Row({ space: 10 }) {
         Button('复制')
           .fontSize(14).fontColor('#003B44')

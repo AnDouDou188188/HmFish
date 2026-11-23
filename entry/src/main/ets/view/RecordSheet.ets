@@ -1,15 +1,32 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ RecordSheet（RecordSheet.ets）—— 记录设置半模态弹窗                           ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  长按底部"记录"按钮弹出。配置录像行为三段：                                   ║
+// ║   1. 随时保存按钮：未录像=开始录像；录像中=不等时长立即停止并保存              ║
+// ║   2. 自动录像开关：识别到勾选类别/运动超阈值时按设定时长自动录                ║
+// ║   3. 录像时长滑条 5~30 秒 step5（自动录像的单段时长）                         ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  isRecording/autoRecordOn/recordDurationSec 由 Index 下发；操作经回调        ║
+// ║  上抛（Index 控制 AVRecorder 启停与落盘相册）；时长滑条本地缓冲，             ║
+// ║  松手才提交，避免拖动被父状态回写打断                                         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 /**
  * 记录设置弹窗：随时保存（开始/立即保存当前录像）、自动录像开关、
  * 录像时长 5~30 秒滑动选择
  * 样式照抄 MotionSheet：底部弹窗 + 操作按钮 + 开关行 + 滑条 + 完成按钮
  * 触发音效已挪到识别设置（ModelSheet）
  */
+// ★ RecordSheet：记录设置弹窗主体（随时保存/自动录像开关/时长滑条三段）
 @Component
 export struct RecordSheet {
+  // ★ 当前状态（Index 持有真值下发）：是否录像中/自动录像开关/自动录像单段时长（秒）
   @Prop isRecording: boolean = false;
   @Prop autoRecordOn: boolean = false;
   @Prop recordDurationSec: number = 10;
 
+  // ── 交互回调：关闭/随时保存（开始或立即保存）/自动录像开关/时长提交（松手才触发） ──
   onClose?: () => void;
   onSaveNow?: () => void;
   onAutoRecordToggle?: () => void;
@@ -19,6 +36,7 @@ export struct RecordSheet {
   // ★ 滑条本地缓冲：拖动期间只更新本地值，松手才提交父组件
   @State localDurationSec: number = 10;
 
+  // ★ 入场：时长本地缓冲对齐父状态；延时 30ms 置 appear 触发上滑动画
   aboutToAppear(): void {
     this.localDurationSec = this.recordDurationSec;
     setTimeout(() => { this.appear = true; }, 30);
@@ -26,12 +44,14 @@ export struct RecordSheet {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // ── 全屏半透明遮罩：appear 驱动 220ms 淡入，点击任意处关闭 ──
       Column()
         .width('100%').height('100%')
         .backgroundColor(this.appear ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)')
         .animation({ duration: 220, curve: Curve.EaseOut })
         .onClick(() => this.onClose?.())
 
+      // ── 底部面板容器：translate 620→0 上滑入场，限高 82% ──
       Column() {
         Row()
           .width(42).height(4).borderRadius(2)
@@ -62,6 +82,7 @@ export struct RecordSheet {
           .borderRadius(20)
           .onClick(() => this.onClose?.())
 
+        // ── 配置内容区：随时保存大按钮 / 自动录像开关行 / 时长滑条 ──
         Column() {
           // ★ 随时保存：未录像=开始录像；录像中=不等时长、立即停止并保存
           Button(this.isRecording ? '立即保存当前录像' : '开始录像')

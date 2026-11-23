@@ -1,4 +1,7 @@
-// ★ 自动录像触发音效服务：默认 rawfile/alarm.mp3，支持自定义 MP3 与截断播放
+// ★ 自动录像触发音效服务：目标触发自动录像时先播提示音（再接 TTS 播报）。
+//   默认 rawfile/alarm.mp3，支持用户自定义 MP3（沙箱路径）与按录像时长截断播放。
+//   播放链路为纯 ArkTS（AVPlayer），与 native（libentry.so）无交互；
+//   静音判定复用 SpeechService.isRingerSilent，保证"静音模式下一切不出声"
 import { media } from '@kit.MediaKit';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
@@ -13,9 +16,12 @@ import { SpeechService } from './SpeechService';
  * - maxPlayMs（录像时长）>0 时：MP3 总时长不超过它则完整播放；
  *   超过则跳到"高潮部分"（约 35% 处，通常副歌附近）只播不超过录像时长的一段
  */
+// ★ AlertService：单实例 AVPlayer 串行播放（busy 期间新请求直接回调跳过）
 export class AlertService {
   private player: media.AVPlayer | null = null;
+  // ★ 播放互斥：一次只播一段，期间的新请求视为放弃（防告警音叠播）
   private busy: boolean = false;
+  // ★ 一次性完成回调：finish 时取出并清空，保证只触发一次
   private onDone: (() => void) | null = null;
   // ★ 截断播放：到点 stop()，触发 'stopped' 后走完成回调
   private stopTimer: number = -1;
@@ -62,6 +68,8 @@ export class AlertService {
     }
   }
 
+  // ★ doPlay：走 AVPlayer 状态机（idle→initialized→prepared→playing→completed），
+  //   每次播放重建播放器（上次资源先 release），流转全部由 stateChange 驱动
   private async doPlay(ctx: common.UIAbilityContext): Promise<void> {
     try {
       if (this.player) {
@@ -114,6 +122,7 @@ export class AlertService {
     }
   }
 
+  // ───────── 播放策略（prepared 后决策） ─────────
   // ★ prepared 后决定播放策略：
   //   时长未知(-1) 或 <= maxPlayMs → 完整播放；
   //   超过 maxPlayMs → seek 到 35% 处（高潮段启发式），播 min(maxPlayMs, 剩余) 后 stop；
@@ -144,6 +153,7 @@ export class AlertService {
     this.player.seek(startMs, media.SeekMode.SEEK_PREV_SYNC);
   }
 
+  // ★ release：彻底释放播放器（页面销毁/设置变更时调用）
   async release(): Promise<void> {
     if (this.player) {
       try { await this.player.release(); } catch (_) {}

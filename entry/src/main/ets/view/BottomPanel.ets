@@ -1,3 +1,24 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ BottomPanel（BottomPanel.ets）—— 底部控制面板                                ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  相机全屏预览最下方的半透明操作面板，对齐 Android 原生相机底栏布局：           ║
+// ║   1. 位置行：地名展示 + 复制入口（点击弹复制地址/坐标弹窗）                    ║
+// ║   2. 变焦区：当前倍数气泡（>1x 青色高亮）+ 摄像头参数 + 变焦滑杆              ║
+// ║   3. 功能行：保存图片(SaveButton 安全组件)/旋转方向/识别/水深/运动 胶囊按钮    ║
+// ║   4. 底排：相册缩略图入口 + 中央快门(录像) + 自动记录开关                     ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  纯"哑组件"：所有状态由 Index 持有并经 @Link/@Prop 下发，用户操作一律经       ║
+// ║  onXxx 回调上抛，由 Index 决定开关/弹窗/启停；短按=切换开关、                 ║
+// ║  长按=弹出对应设置弹窗（对齐 Android 交互习惯）                               ║
+// ║                                                                              ║
+// ║ 【关键契约】                                                                 ║
+// ║  导出 PANEL_OCCUPIED_VP（面板屏幕内占用高度），Index 用它计算预览可见区域，   ║
+// ║  位置水印必须画在面板顶边之上；快门按钮不得自行翻转 isRecording——             ║
+// ║  开关状态由 Index.toggleRecord 内部翻转，按钮先行翻转会导致其读到已翻转        ║
+// ║  状态走错分支（启动即"停止"）                                                ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 底部控制面板：拍照/录像等主操作区（对齐 Android 底栏布局）
 import { CaptureMediaView } from './CaptureMediaView';
 import { image } from '@kit.ImageKit';
@@ -98,12 +119,18 @@ struct AutoRecordToggle {
   }
 }
 
+// ★ BottomPanel：底部面板主体。自上而下组装 位置行/变焦区/功能行/底排 四层；
+//   @Link 双向同步录像与变焦（Index 持有真值），@Prop 单向下发展示数据，
+//   全部操作经 onXxx 回调交由 Index 处理
 @Component
 export struct BottomPanel {
+  // ★ 双向绑定：录像开关/变焦倍数/相册最新缩略图（滑杆拖动直接回写 zoomRatio）
   @Link isRecording: boolean;
   @Link zoomRatio: number;
   @Link albumThumb: image.PixelMap | undefined;
 
+  // ★ 单向下发展示：旋转方向文案（水平/垂直/反转/反向）、当前拍摄模式（截图等）、
+  //   录像计时秒数（-1=未录像）、自动记录开关、位置地名、变焦上限、摄像头参数
   @Prop rotateText: string;
   @Link yoloEnabled: boolean;
   @Link motionEnabled: boolean;
@@ -118,6 +145,8 @@ export struct BottomPanel {
   // ★ 摄像头主要参数（预览分辨率）：变焦气泡旁展示
   @Prop cameraInfo: string = '';
 
+  // ── 与 Index 的交互回调：录像启停/自动记录/截图/旋转/相册/各功能开关与长按
+  //    弹设置/变焦提交/位置弹窗，全部由 Index 实现业务逻辑 ──
   onToggleRecord?: () => void;
   onAutoRecordToggle?: () => void;
   onAutoRecordLongPress?: () => void;
@@ -134,6 +163,8 @@ export struct BottomPanel {
   onZoomChange?: (v: number) => void;
   onShowGeoPopup?: () => void;
 
+  // ★ SideBtn：36×36 侧栏小按钮（图标+文字，深色底白边小方块），
+  //   当前布局未使用，保留为扩展入口
   @Builder
   SideBtn(icon: string, label: string, onTap: () => void) {
     Column({ space: 0 }) {
@@ -187,6 +218,7 @@ export struct BottomPanel {
       }
       .width('90%').justifyContent(FlexAlign.Center).margin({ top: ROW_GAP_ZOOM })
 
+      // ── 变焦滑杆行：1x~zoomMax，拖动实时回写 @Link zoomRatio 并回调 Index 生效 ──
       Row({ space: 10 }) {
         Text('1x').fontSize(10).fontColor('#8E8E93')
         Slider({ value: this.zoomRatio, min: 1.0, max: this.zoomMax, step: 0.1 })
@@ -202,6 +234,7 @@ export struct BottomPanel {
       }
       .width('90%').margin({ top: ROW_GAP_SLIDER_TOP, bottom: ROW_GAP_SLIDER_BOTTOM })
 
+      // ── 功能按钮行：保存图片 / 旋转方向 / 识别 / 水深 / 运动（短按开关、长按设置）──
       Row({ space: 8 }) {
         SaveButton({
           text: SaveDescription.SAVE_IMAGE,
@@ -242,6 +275,7 @@ export struct BottomPanel {
       }
       .width('100%').justifyContent(FlexAlign.SpaceAround).margin({ bottom: ROW_GAP_BUTTONS })
 
+      // ── 底排：相册缩略图入口 | 中央快门（只负责录像启停）| 自动记录开关 ──
       Row() {
         Column() {
           Stack() {

@@ -1,5 +1,23 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ PictureSheet（PictureSheet.ets）—— 画面设置半模态弹窗                         ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  点顶部"画面"徽标弹出。集中管理"画面长什么样"与"画不画框"：                    ║
+// ║   1. 显示识别框和文字开关（只管画不画，识别/朗读/自动录像不受影响）            ║
+// ║   2. 人脸识别开关（SCRFD + 106 关键点 + 性别年龄颜值标注）                     ║
+// ║   3. 画面增强三模式（USB + 手机前后置全部相机生效）：                          ║
+// ║      非 AI：亮度/锐度/对比度/饱和度四滑条 + 水下推荐值一键恢复（不占算力）      ║
+// ║      AI：超分(QuickSRNet)/降噪(联合双边滤波)/水下去浊(暗通道先验)/             ║
+// ║           色彩还原(灰世界白平衡) 四模块独立滑条，修复层异步合成不卡预览        ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  全部 @Prop 下发 + onXxx 上抛（Index 落盘并热更新 native 管线）；             ║
+// ║  八个滑条各自本地缓冲、松手提交；"完成"按钮 commitAndClose 兜底提交当前        ║
+// ║  模式全部滑条值（防拖动中断丢值）再关闭弹窗                                   ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ 画面设置弹窗：识别框/文字开关、画面增强（三模式 + 亮度/锐度/对比度/
 //   饱和度滑条 + 恢复水下默认值 + AI 四模块：超分/降噪/去浊/色彩）、人脸识别开关
+// ★ PictureSheet：画面设置弹窗主体（显示开关/人脸/增强三模式条件分段渲染）
 @Component
 export struct PictureSheet {
   // ★ 识别框/标签画面显示开关：关闭后画面干净不画框/文字（识别与自动录像不受影响）
@@ -19,6 +37,7 @@ export struct PictureSheet {
   // ★ 人脸识别开关：SCRFD 检测 + 106 关键点连线框 + 性别年龄颜值标注
   @Prop faceEnabled: boolean = false;
 
+  // ── 交互回调：关闭/画框开关/模式切换/八滑条提交/水下默认值/人脸开关 ──
   onClose?: () => void;
   onDrawBoxesToggle?: () => void;
   onUsbModeChange?: (m: number) => void;
@@ -44,6 +63,7 @@ export struct PictureSheet {
   @State localAiClarity: number = 50;
   @State localAiColorRestore: number = 60;
 
+  // ★ 入场：八个滑条本地缓冲对齐父状态；延时 30ms 置 appear 触发上滑动画
   aboutToAppear(): void {
     this.localUsbBright = this.usbBrightness;
     this.localUsbSharp = this.usbSharpness;
@@ -72,6 +92,7 @@ export struct PictureSheet {
     this.onClose?.();
   }
 
+  // ★ 分区标题行：图标 + 标题 + 右侧补充说明（extra 为空不渲染占位）
   @Builder
   SectionTitle(icon: string, title: string, extra: string) {
     Row({ space: 6 }) {
@@ -108,12 +129,14 @@ export struct PictureSheet {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // ── 全屏半透明遮罩：appear 驱动 220ms 淡入，点击任意处关闭 ──
       Column()
         .width('100%').height('100%')
         .backgroundColor(this.appear ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)')
         .animation({ duration: 220, curve: Curve.EaseOut })
         .onClick(() => this.onClose?.())
 
+      // ── 底部面板容器：translate 620→0 上滑入场，限高 82%，底部"完成"常显 ──
       Column() {
         Row()
           .width(42).height(4).borderRadius(2)
@@ -130,6 +153,7 @@ export struct PictureSheet {
         .width('100%')
         .padding({ left: 20, right: 10, top: 12 })
 
+        // ── 滚动配置区：按 usbEnhanceMode 条件渲染 非 AI 四滑条 / AI 四模块 ──
         Scroll() {
           Column() {
             // ★ 画面显示：识别框和文字开关（关闭后画面干净不画框/文字）

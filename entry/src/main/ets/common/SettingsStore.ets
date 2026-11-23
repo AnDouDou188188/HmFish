@@ -1,8 +1,14 @@
-// ★ 设置持久化：preferences 封装（全部用户设置项），
-//   含 USB 增强模式枚举的跨版本迁移（v2/v3 一次性迁移标记）
+// ★ 设置持久化层：preferences（文件 yolo_settings_v3）承载全部用户设置项。
+//   数据流：启动时 Index.ets 调 init→load 取"出厂默认值 + 已存值覆盖"的
+//   全量快照；之后任意设置变更调用 save(Partial) 增量写入并 flush 落盘。
+//   内含多代一次性迁移（画质增强布尔→对比度滑条、增强 mode 枚举 v3 收敛），
+//   保证老用户升级后设置不丢、语义正确
 import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
 
+// ★ AppSettings：全量设置快照（load 返回完整对象 / save 接收其 Partial）。
+//   新增设置项必须同时补 load 默认值与 save 写入分支，
+//   否则只在当次运行生效、不会落盘
 export interface AppSettings {
   hudOpacity: number;
   cameraPosition: number;
@@ -71,16 +77,21 @@ export interface AppSettings {
   usbEnhanceV3: boolean;
 }
 
+// ★ preferences 文件名：带版本号——跨大版本结构不兼容时换文件名即可整体重置
 const STORE = 'yolo_settings_v3';
 
+// ★ SettingsStore：静态单例风格（pref 全局一份，EntryAbility 启动后先 init）
 export class SettingsStore {
   private static pref: preferences.Preferences | null = null;
 
+  // ★ init：打开（或创建）preferences 实例；必须先于 load/save 调用
   static async init(ctx: common.UIAbilityContext): Promise<void> {
     if (SettingsStore.pref) return;
     SettingsStore.pref = await preferences.getPreferences(ctx, STORE);
   }
 
+  // ★ load：组装全量设置——先填出厂默认值，再用已存值逐项覆盖，
+  //   保证新增设置项在老数据下也拿到合理默认（不会是 undefined）
   static async load(): Promise<AppSettings> {
     const r: AppSettings = {
       hudOpacity: 0.45,
@@ -219,6 +230,9 @@ export class SettingsStore {
     return r;
   }
 
+  // ───────── 增量保存 ─────────
+  // ★ save：只落传入的字段（Partial 增量写），列表序列化为逗号串，
+  //   最后统一 flush 确保立刻持久化到磁盘
   static async save(s: Partial<AppSettings>): Promise<void> {
     if (!SettingsStore.pref) return;
     const p = SettingsStore.pref;
@@ -283,6 +297,7 @@ export class SettingsStore {
     await SettingsStore.pref.flush();
   }
 
+  // ★ 读取某模型的触发类别：null 表示从未设置过（调用方回退全局 alertLabels）
   static async getModelAlerts(modelId: string): Promise<number[] | null> {
     if (!SettingsStore.pref || !modelId) return null;
     // has() 区分"从未保存过"（回退全局 alertLabels）与"保存过但为空"（合法的空集合）
@@ -293,6 +308,7 @@ export class SettingsStore {
   }
 }
 
+// ★ parseNumList："1,2,3" → [1,2,3]；非法片段丢弃，空串返回空数组
 function parseNumList(s: string): number[] {
   if (!s) return [];
   return s.split(',').map((x: string) => parseInt(x)).filter((n: number) => !isNaN(n));

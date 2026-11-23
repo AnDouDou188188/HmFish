@@ -1,3 +1,22 @@
+// ╔═══════════════════════════════════════════════════════════════════════════╗
+// ║ OcrSheet（OcrSheet.ets）—— 文字识别设置半模态弹窗                             ║
+// ╠═══════════════════════════════════════════════════════════════════════════╣
+// ║ 【组件职责】                                                                 ║
+// ║  长按"OCR"徽标弹出。配置 OCR 文字识别三段内容：                               ║
+// ║   1. 文字识别总开关（Toggle）                                                ║
+// ║   2. 模型集单选列表：PaddleOCR 普通文本 / Xiaomi-OCR 票据格式等               ║
+// ║      （目录存在即列出；放入 应用文件/ocrmodels/<目录名> 可自动识别自定义集）   ║
+// ║   3. det 阈值三件套滑条：文字检测阈值/框置信度阈值/文本框扩展（立即生效）      ║
+// ║                                                                              ║
+// ║ 【数据流（与 Index.ets 的交互契约）】                                         ║
+// ║  modelSets 由 OcrManager 扫描后经 Index 下发；修改经 onXxx 回调上抛          ║
+// ║  （落盘 + 热更新）；三滑条共用 localVals/localLabels 数组缓冲，              ║
+// ║  @Watch syncLocal 跟随父值（选模型集重置参数时滑条跟着跳）                    ║
+// ║                                                                              ║
+// ║ 【ArkTS 关键点】                                                             ║
+// ║  @Builder 按值传参不会随状态变化刷新 UI——数值/文案必须在 @Builder 体内       ║
+// ║  直接读 this.localVals/localLabels（状态直读才响应刷新），不能按值传入         ║
+// ╚═══════════════════════════════════════════════════════════════════════════╝
 // ★ OCR 设置弹窗：模型集选择与识别参数配置
 import { OcrModelSet } from '../common/OcrManager';
 
@@ -7,8 +26,11 @@ import { OcrModelSet } from '../common/OcrManager';
  *   2) det 阈值三件套滑条（立即保存、立即生效）
  * 样式照抄 MotionSheet（运动设置）：底部弹窗 + 选项行 + 滑条 + 完成按钮
  */
+// ★ OcrSheet：文字识别设置弹窗主体（开关/模型集/det 三阈值三段）
 @Component
 export struct OcrSheet {
+  // ★ 当前配置（Index 持有真值下发）：开关/模型集 id/可选模型集列表/det 三参数
+  //   （@Watch：父值变化同步本地缓冲，选模型集重置参数时滑条跟着跳）
   @Prop ocrEnabled: boolean = false;
   @Prop ocrModelId: string = 'paddle';
   @Prop modelSets: OcrModelSet[] = [];
@@ -16,6 +38,7 @@ export struct OcrSheet {
   @Prop @Watch('syncLocal') ocrDbBox: number = 0.3;
   @Prop @Watch('syncLocal') ocrUnclip: number = 1.6;
 
+  // ── 交互回调：关闭/开关切换/选模型集/det 三参数提交（松手才触发，立即生效） ──
   onClose?: () => void;
   onOcrToggle?: () => void;
   onSelectSet?: (id: string) => void;
@@ -29,11 +52,14 @@ export struct OcrSheet {
   // ★ 数值文案（@Builder 体内直读才刷新，不能按值传入）
   @State localLabels: string[] = ['50%', '30%', '1.6'];
 
+  // ★ 入场：本地缓冲对齐父状态；延时 30ms 置 appear 触发上滑动画
   aboutToAppear(): void {
     this.syncLocal();
     setTimeout(() => { this.appear = true; }, 30);
   }
 
+  // ★ 本地缓冲与 @Prop 对齐（初始化 + 父组件改参数时同步）：
+  //   三值换算为滑条单位（%、%、×10）并同步刷新文案
   private syncLocal(): void {
     this.localVals = [this.ocrDbScore * 100, this.ocrDbBox * 100, this.ocrUnclip * 10];
     this.localLabels = [this.fmtVal(0, this.localVals[0]), this.fmtVal(1, this.localVals[1]),
@@ -48,12 +74,14 @@ export struct OcrSheet {
 
   build() {
     Stack({ alignContent: Alignment.Bottom }) {
+      // ── 全屏半透明遮罩：appear 驱动 220ms 淡入，点击任意处关闭 ──
       Column()
         .width('100%').height('100%')
         .backgroundColor(this.appear ? 'rgba(0,0,0,0.5)' : 'rgba(0,0,0,0)')
         .animation({ duration: 220, curve: Curve.EaseOut })
         .onClick(() => this.onClose?.())
 
+      // ── 底部面板容器：translate 620→0 上滑入场，限高 82% ──
       Column() {
         Row()
           .width(42).height(4).borderRadius(2)
@@ -84,6 +112,7 @@ export struct OcrSheet {
           .borderRadius(20)
           .onClick(() => this.onClose?.())
 
+        // ── 滚动配置区：开关 + 模型集列表 + det 三滑条，超一屏纵向滚动 ──
         Scroll() {
           Column() {
             // ───── 开关 ─────
