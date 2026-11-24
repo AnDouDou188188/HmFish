@@ -1,7 +1,7 @@
 // ╔═══════════════════════════════════════════════════════════════════════════╗
 // ║ FaceNet —— 人脸检测/关键点/属性引擎（libocr.so 内部实现，FaceNet.cpp）        ║
 // ╠═══════════════════════════════════════════════════════════════════════════╣
-// ║ 【职责】一帧 RGBA 进 → 最多 4 张脸出（face_detect_rgba，每脸 228 float：    ║
+// ║ 【职责】一帧 RGBA 进 → 最多 8 张脸出（face_detect_rgba，每脸 228 float：  ║
 // ║   框/检测分/性别/年龄/颜值 + 106 关键点 + 7 颜值分项 + trackId）。           ║
 // ║                                                                              ║
 // ║ 【模型组合】insightface buffalo_s 系（离线 Python 实证解码）：                ║
@@ -87,7 +87,8 @@ namespace {
     constexpr float kNmsThresh = 0.40f;
     constexpr int64_t kGaRefreshMs = 1200;   // 性别年龄复检间隔（track 内节流）
     constexpr size_t kMaxTracks = 8;
-    constexpr size_t kMaxFacesOut = 4;    // 最多输出脸数（关键点全部推理）
+    constexpr size_t kMaxFacesOut = 8;    // 最多输出脸数（关键点全部推理；相机路径
+                                          // 传 4 仅画 4 脸，相册静图 analyzeFaces 传 8）
     constexpr int kFaceFloats = 228;      // 每脸输出 float 数：[0..7]基本信息 + [8..219]106点 + [220..226]颜值分项 + [227]trackId
     constexpr float kGaVoteMargin = 0.25f;  // 性别投票置信度门槛（|logit 差|）
 
@@ -762,8 +763,8 @@ int face_detect_rgba(const uint8_t *rgba, int w, int h, float *facesOut, int max
     }
 
     // ⑥ 每脸：106 关键点（必有）+ 性别年龄（track 节流）+ 颜值
-    // 输出容量 = min(调用方容量, 4)：关键点/性别年龄每脸都要推理，
-    // 限 4 脸控制单帧总时延（人脸场景极少同帧 5+ 张有效脸）
+    // 输出容量 = min(调用方容量, 8)：关键点/性别年龄每脸都要推理，
+    // 相机实时路径传 4 控制单帧时延，相册静图路径传 8（合影场景）
     const size_t outCap = std::min((size_t)maxFaces, kMaxFacesOut);
     int n = 0;
     for (const auto &b : keep) {

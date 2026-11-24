@@ -1618,6 +1618,171 @@ static napi_value InitColor(napi_env env, napi_callback_info info) {
     return promise;
 }
 
+// ═══════════ 相册照片人脸识别 + 颜值打分（analyzeFaces）═══════════
+// 复用相机实时人脸链路的三个模型（SCRFD det_500m / 2d106det 106 点 /
+// genderage 性别年龄，推理实现均在 libocr.so 的 FaceNet.cpp），对相册
+// 静图一次性完成"检测 + 关键点 + 性别年龄 + 几何颜值"。
+// 与相机实时路径的差异：
+//   ① 静图无跨帧——性别为单次表决（低置信出 -1 未知）、年龄/颜值为单样本，
+//      无多帧中值平滑（精度略逊于相机连拍，静图场景可接受）
+//   ② 长边 >1280 先 INTER_AREA 降采样再送检：det 内部本来 letterbox 到 640，
+//      降采样几乎不损失检测精度，却省去 11MP 级（修复结果 4K 图）的
+//      cvtColor/resize 开销，单张分析控制在秒级
+//   ③ maxFaces=8（合影场景）；相机路径仍传 4 只画 4 脸
+// 输出 JSON 与 getFaceInfo 完全同构（ArkTS FaceHudItem 直解）：
+//   {"count":N,"ready":bool,"dw":送检宽,"dh":送检高,
+//    "faces":[{"i","tid","gender","age","beauty","comps"[7],"x","y","w","h"}]}
+//   dw/dh = 实际送检尺寸（降采样后），box 坐标为该尺寸下的像素值——
+//   ArkTS 以 dw/dh 做 contain-fit 映射，缩放对上层透明
+
+// ★ AnalyzeFacesCtx：静图分析上下文——JS 线程拷入像素，工作线程检测 +
+//   拼 JSON，Complete 回调（JS 线程）回传字符串并释放资源
+struct AnalyzeFacesCtx {
+    napi_async_work work = nullptr;
+    napi_deferred deferred = nullptr;
+    std::vector<uint8_t> in;    // 输入像素（bgra=true 时 BGRA 字节序，否则 RGBA）
+    int w = 0;
+    int h = 0;
+    bool bgra = false;
+    std::string json;           // 结果 JSON（Complete 回调回传）
+};
+
+// ★ AnalyzeFacesExecute：分析执行体（napi 工作线程，秒级耗时，不阻塞 UI）
+static void AnalyzeFacesExecute(napi_env env, void *data) {
+    auto *ctx = static_cast<AnalyzeFacesCtx *>(data);
+    int w = ctx->w;
+    int h = ctx->h;
+    // 参数自检失败/模型未就绪：统一返回 ready:false + 0 脸（ArkTS 提示重试）
+    if (w < 2 || h < 2 || ctx->in.size() != static_cast<size_t>(w) * h * 4 ||
+        !ocr_bridge::faceIsReady()) {
+        ctx->json = "{\"count\":0,\"ready\":false,\"dw\":0,\"dh\":0,\"faces\":[]}";
+        return;
+    }
+
+    // ① BGRA → RGBA 统一字节序（仅交换 R/B 两字节，A 不动）
+    if (ctx->bgra) {
+        for (size_t i = 0; i < ctx->in.size(); i += 4) {
+            std::swap(ctx->in[i], ctx->in[i + 2]);
+        }
+    }
+
+    // ② 长边 >1280 降采样（INTER_AREA 抗锯齿；dw/dh 随之变化并随 JSON 下发）
+    if (w > 1280 || h > 1280) {
+        const double r = 1280.0 / (w > h ? w : h);
+        const int nw = std::max(2, (int) ((double) w * r + 0.5));
+        const int nh = std::max(2, (int) ((double) h * r + 0.5));
+        cv::Mat big(h, w, CV_8UC4, ctx->in.data());
+        cv::Mat small;
+        cv::resize(big, small, cv::Size(nw, nh), 0, 0, cv::INTER_AREA);
+        // small 连续存储，整块拷回 in 供 faceDetect 使用
+        ctx->in.assign(small.data, small.data + small.total() * 4);
+        w = nw;
+        h = nh;
+    }
+
+    // ③ 同步检测（8 脸上限 × 228 float，布局见 ocr_c_api.h face_detect_rgba）
+    constexpr int kStillMaxFaces = 8;
+    constexpr int kFaceFloats = 228;
+    std::vector<float> faces(static_cast<size_t>(kStillMaxFaces) * kFaceFloats, 0.0f);
+    const int n = ocr_bridge::faceDetect(ctx->in.data(), w, h, faces.data(), kStillMaxFaces);
+
+    // ④ 拼 JSON（字段与 yuv_pipeline GetFaceInfoJson 逐一对齐）
+    std::string json = "{\"count\":" + std::to_string(n) +
+                       ",\"ready\":true,\"dw\":" + std::to_string(w) +
+                       ",\"dh\":" + std::to_string(h);
+    if (n > 0) {
+        json += ",\"faces\":[";
+        for (int i = 0; i < n; ++i) {
+            const float *o = faces.data() + static_cast<size_t>(i) * kFaceFloats;
+            const int gender = (int) o[5];
+            const float ageF = o[6];
+            const float beautyF = o[7];
+            const int tid = (int) o[227];
+            if (i > 0) json += ",";
+            json += "{\"i\":" + std::to_string(i) +
+                    ",\"tid\":" + std::to_string(tid) +
+                    ",\"gender\":" + std::to_string(gender) +
+                    ",\"age\":" + std::to_string(ageF >= 0 ? (int) (ageF + 0.5f) : -1) +
+                    ",\"beauty\":" + std::to_string(beautyF >= 0 ? (int) (beautyF + 0.5f) : -1) +
+                    ",\"comps\":[";
+            for (int ci = 0; ci < 7; ++ci) {
+                const float cv = o[220 + ci];
+                if (ci > 0) json += ",";
+                json += std::to_string(cv >= 0 ? (int) (cv + 0.5f) : -1);
+            }
+            json += "],\"x\":" + std::to_string((int) o[0]) +
+                    ",\"y\":" + std::to_string((int) o[1]) +
+                    ",\"w\":" + std::to_string((int) (o[2] - o[0])) +
+                    ",\"h\":" + std::to_string((int) (o[3] - o[1])) + "}";
+        }
+        json += "]";
+    }
+    json += "}";
+    ctx->json = std::move(json);
+    OH_LOG_INFO(LOG_APP, "analyzeFaces: n=%{public}d dw=%{public}d dh=%{public}d", n, w, h);
+}
+
+// ★ AnalyzeFacesComplete：分析完成回调（JS 线程）——resolve JSON 字符串，
+//   按序清理 async work 与上下文（napi_delete_async_work → delete ctx）
+static void AnalyzeFacesComplete(napi_env env, napi_status status, void *data) {
+    auto *ctx = static_cast<AnalyzeFacesCtx *>(data);
+    napi_value result = nullptr;
+    napi_create_string_utf8(env, ctx->json.c_str(), ctx->json.size(), &result);
+    napi_resolve_deferred(env, ctx->deferred, result);
+    napi_delete_async_work(env, ctx->work);
+    delete ctx;
+}
+
+// ★ AnalyzeFaces（ArkTS 调用名：analyzeFaces）：相册静图人脸识别 + 颜值打分，
+//   返回 Promise<string>（JSON，结构见上文注释块）。
+//   参数：args[0]=输入像素 ArrayBuffer（w*h*4），args[1]=宽，args[2]=高，
+//   args[3]=是否 BGRA 字节序（image.ImageInfo.pixelFormat === BGRA_8888 时 true）。
+//   模型未加载/参数非法不 reject，统一以 ready:false JSON 兜底（调用方按
+//   "未就绪"提示，避免异常路径分支）
+static napi_value AnalyzeFaces(napi_env env, napi_callback_info info) {
+    size_t argc = 4;
+    napi_value args[4];
+    napi_get_cb_info(env, info, &argc, args, nullptr, nullptr);
+    int32_t w = 0;
+    int32_t h = 0;
+    bool bgra = false;
+    void *data = nullptr;
+    size_t len = 0;
+    if (argc > 1) napi_get_value_int32(env, args[1], &w);
+    if (argc > 2) napi_get_value_int32(env, args[2], &h);
+    if (argc > 3) napi_get_value_bool(env, args[3], &bgra);
+
+    if (argc < 3 || w < 2 || h < 2 ||
+        napi_get_arraybuffer_info(env, args[0], &data, &len) != napi_ok || !data ||
+        len != static_cast<size_t>(w) * h * 4) {
+        napi_deferred deferred = nullptr;
+        napi_value promise = nullptr;
+        napi_value fallback = nullptr;
+        napi_create_promise(env, &deferred, &promise);
+        napi_create_string_utf8(env, "{\"count\":0,\"ready\":false,\"dw\":0,\"dh\":0,\"faces\":[]}",
+                                NAPI_AUTO_LENGTH, &fallback);
+        napi_resolve_deferred(env, deferred, fallback);
+        return promise;
+    }
+
+    auto *ctx = new AnalyzeFacesCtx();
+    ctx->w = w;
+    ctx->h = h;
+    ctx->bgra = bgra;
+    // JS 线程内完成输入拷贝（arraybuffer 在工作线程期间可能被调用方释放）
+    ctx->in.assign(static_cast<const uint8_t *>(data),
+                   static_cast<const uint8_t *>(data) + len);
+
+    napi_value promise = nullptr;
+    napi_create_promise(env, &ctx->deferred, &promise);
+    napi_value resourceName = nullptr;
+    napi_create_string_utf8(env, "analyzeFaces", NAPI_AUTO_LENGTH, &resourceName);
+    napi_create_async_work(env, nullptr, resourceName,
+                           AnalyzeFacesExecute, AnalyzeFacesComplete, ctx, &ctx->work);
+    napi_queue_async_work(env, ctx->work);
+    return promise;
+}
+
 // ★ Init：entry 模块初始化回调——把全部导出函数经 napi_property_descriptor
 //   挂载到 exports 对象。每项第一个字符串即 ArkTS 侧 import 'libentry.so' 后
 //   直接调用的方法名（下表为全部 native 能力的唯一权威清单，按功能分组）
@@ -1686,6 +1851,7 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"getFaceInfo",          nullptr, GetFaceInfoNapi,      nullptr, nullptr, nullptr, napi_default, nullptr},
         {"recognizeTable",       nullptr, RecognizeTable,       nullptr, nullptr, nullptr, napi_default, nullptr},
         {"restorePhoto",         nullptr, RestorePhoto,         nullptr, nullptr, nullptr, napi_default, nullptr},
+        {"analyzeFaces",         nullptr, AnalyzeFaces,         nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

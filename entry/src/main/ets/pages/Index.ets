@@ -128,6 +128,8 @@ interface FaceHudInfo {
   // display 像素尺寸：box 归一化后映射到屏幕坐标画详情箭头
   dw?: number;
   dh?: number;
+  // ★ analyzeFaces（相册静图）专用：人脸模型是否就绪（相机 getFaceInfo 无此字段）
+  ready?: boolean;
   faces: FaceHudItem[];
 }
 
@@ -148,6 +150,10 @@ interface FaceScreenRect {
 // ★ 每人脸配色（6 色循环，与 C++ 端 kFacePalette 完全一致）：
 //   连线框/外框/标注/HUD 圆点/详情箭头/详情面板描边同色
 const FACE_PALETTE: string[] = ['#00EBB2', '#FF9F40', '#50AAFF', '#FF64AA', '#BC8CFF', '#FFD750'];
+
+// ★ 颜值 7 分项名（与 native comps 数组顺序一一对应）：
+//   [0]对称 [1]眼形 [2]眉形 [3]鼻形 [4]嘴形 [5]三庭 [6]眼型
+const FACE_COMP_NAMES: string[] = ['对称', '眼形', '眉形', '鼻形', '嘴形', '三庭', '眼型'];
 
 // ★ 按跨帧跟踪 id 取色：key=(tid-1)%6 与 C++ DrawFaceOverlay 的 (trackId-1)%6
 //   完全一致——tid 是稳定身份，配色/箭头/详情不随置信度排序跳变；
@@ -451,6 +457,21 @@ struct Index {
   private restorePhotoStartMs: number = 0;
   @State restoring: boolean = false;
   @State autoRecordOn: boolean = false;
+
+  // ★ 相册照片人脸识别 + 颜值打分：复用 initFace 三模型（SCRFD/106 点/
+  //   性别年龄）对当前预览静图分析；分析中标志 + 结果列表 + 送检图尺寸
+  //   （box 坐标系）+ 照片显示区尺寸（contain-fit 映射）+ 选中脸详情下标
+  //   （-1=未选，点人脸框弹出分项卡）
+  @State faceAnalyzing: boolean = false;
+  @State albumFaces: FaceHudItem[] = [];
+  @State albumFaceDw: number = 0;
+  @State albumFaceDh: number = 0;
+  @State photoAreaW: number = 0;
+  @State photoAreaH: number = 0;
+  @State albumFaceDetailIdx: number = -1;
+  // 人脸模型是否已成功加载（initFace 成功后置 true；相机开关与相册分析
+  // 共用同一组模型，避免每次分析重复 initFace 数秒加载）
+  private faceModelsReady: boolean = false;
 
   // ★ 语音播报（识别设置弹窗开关+音量）+ 自动录像触发音效（开关+自定义 MP3）
   @State speechOn: boolean = true;
@@ -1412,10 +1433,141 @@ struct Index {
         }
         paths.push(dest);
       }
-      return await entry.initFace(paths[0], paths[1], paths[2], this.powerThreads);
+      const ok = await entry.initFace(paths[0], paths[1], paths[2], this.powerThreads);
+      // 加载成功置就绪标志：相机开关与相册静图分析共用同一组模型，
+      // 后续分析不再重复数秒级的模型加载
+      if (ok) {
+        this.faceModelsReady = true;
+      }
+      return ok;
     } catch (e) {
       return false;
     }
+  }
+
+  // ★ 相册静图人脸识别 + 颜值打分：当前预览图（源图或修复结果）读像素 →
+  //   native analyzeFaces（长边 >1280 自动降采样；SCRFD 检测 + 106 关键点 +
+  //   性别年龄 + 几何颜值）→ JSON 解析为 FaceHudItem 列表驱动框叠加。
+  //   送检尺寸（albumFaceDw/Dh）与显示区尺寸（photoAreaW/H）共同做
+  //   contain-fit 映射定位人脸框；点框弹分项详情卡
+  private async analyzeAlbumFaces(): Promise<void> {
+    if (this.faceAnalyzing || this.restoring) return;
+    const pm = this.albumPreviewPm;
+    if (!pm) return;
+    // 模型懒加载：与相机人脸识别共用（首次提取 rawfile + initFace 数秒）
+    if (!this.faceModelsReady) {
+      this.showToast('人脸模型加载中…');
+      const ok = await this.initFaceModels();
+      if (!ok) {
+        this.showToast('人脸模型加载失败');
+        return;
+      }
+    }
+    this.faceAnalyzing = true;
+    this.albumFaces = [];
+    this.albumFaceDetailIdx = -1;
+    try {
+      const info = await pm.getImageInfo();
+      const w = info.size.width;
+      const h = info.size.height;
+      const isBgra = info.pixelFormat === image.PixelMapFormat.BGRA_8888;
+      const buf = new ArrayBuffer(w * h * 4);
+      await pm.readPixelsToBuffer(buf);
+      const json = await entry.analyzeFaces(buf, w, h, isBgra);
+      const r = JSON.parse(json) as FaceHudInfo;
+      if (r.ready !== undefined && !r.ready) {
+        this.showToast('人脸模型未就绪，请重试');
+        return;
+      }
+      const faces: FaceHudItem[] =
+        r.faces !== undefined && r.faces !== null ? r.faces : [];
+      if (faces.length === 0) {
+        this.showToast('未检测到人脸');
+        return;
+      }
+      this.albumFaceDw = r.dw !== undefined && r.dw > 0 ? r.dw : w;
+      this.albumFaceDh = r.dh !== undefined && r.dh > 0 ? r.dh : h;
+      this.albumFaces = faces;
+      this.speak(`检测到${faces.length}张人脸`);
+    } catch (e) {
+      this.showToast('人脸分析失败');
+    } finally {
+      this.faceAnalyzing = false;
+    }
+  }
+
+  // ───────── 人脸框 contain-fit 映射（送检图坐标 → 照片显示区 vp 坐标）─────────
+  // Image 用 objectFit(Contain) 显示：实际显示矩形 = min(容器/图) 等比缩放居中。
+  // faceBoxScale 求 vp/送检px 比例，faceBoxLeft/Top 加上居中偏移定位框左上角
+
+  private faceBoxScale(): number {
+    if (this.albumFaceDw <= 0 || this.albumFaceDh <= 0 ||
+      this.photoAreaW <= 0 || this.photoAreaH <= 0) {
+      return 0;
+    }
+    return Math.min(this.photoAreaW / this.albumFaceDw, this.photoAreaH / this.albumFaceDh);
+  }
+
+  private faceBoxLeft(f: FaceHudItem): number {
+    const s = this.faceBoxScale();
+    return (this.photoAreaW - this.albumFaceDw * s) / 2 + f.x * s;
+  }
+
+  private faceBoxTop(f: FaceHudItem): number {
+    const s = this.faceBoxScale();
+    return (this.photoAreaH - this.albumFaceDh * s) / 2 + f.y * s;
+  }
+
+  private faceBoxW(f: FaceHudItem): number {
+    return Math.max(24, f.w * this.faceBoxScale());
+  }
+
+  private faceBoxH(f: FaceHudItem): number {
+    return Math.max(24, f.h * this.faceBoxScale());
+  }
+
+  // 框上标签：性别 + 年龄 + 颜值（未知项跳过，全未知显示"人脸"）
+  private faceLabelText(f: FaceHudItem): string {
+    let t = '';
+    if (f.gender === 0) {
+      t = '女';
+    } else if (f.gender === 1) {
+      t = '男';
+    }
+    if (f.age >= 0) {
+      t += `${f.age}岁`;
+    }
+    if (f.beauty >= 0) {
+      t += ` 颜值${f.beauty}`;
+    }
+    return t.length > 0 ? t : '人脸';
+  }
+
+  // 详情卡标题：性别 + 年龄（不含颜值，颜值单独大字展示）
+  private faceGenderAgeText(f: FaceHudItem): string {
+    let t = '';
+    if (f.gender === 0) {
+      t = '女';
+    } else if (f.gender === 1) {
+      t = '男';
+    }
+    if (f.age >= 0) {
+      t += ` ${f.age}岁`;
+    }
+    return t.length > 0 ? t : '未知';
+  }
+
+  // 汇总行文案：平均颜值（无有效样本返回空串）
+  private albumAvgBeautyText(): string {
+    let sum = 0;
+    let cnt = 0;
+    for (const f of this.albumFaces) {
+      if (f.beauty >= 0) {
+        sum += f.beauty;
+        cnt++;
+      }
+    }
+    return cnt > 0 ? ` · 平均颜值 ${Math.round(sum / cnt)}` : '';
   }
 
   // ★ 人脸识别开关：开启时加载模型，失败回退；关闭停 HUD 轮询
@@ -2249,10 +2401,13 @@ struct Index {
   }
 
   // ★ 换预览图：释放旧 PixelMap 后换新图（修复中实时显示当前处理的照片，
-  //   完成后显示修复结果；旧图统一在此释放避免泄漏）
+  //   完成后显示修复结果；旧图统一在此释放避免泄漏）。图已变化——清掉上一张
+  //   的人脸识别结果（框/详情卡），避免坐标错位叠在新图上
   private swapAlbumPreview(pm: image.PixelMap): void {
     const old = this.albumPreviewPm;
     this.albumPreviewPm = pm;
+    this.albumFaces = [];
+    this.albumFaceDetailIdx = -1;
     if (old) {
       try { old.release(); } catch (_) {}
     }
@@ -2347,6 +2502,11 @@ struct Index {
   //   （星光/涟漪/流彩/扫描）+ 阶段文案 + 模拟进度条，等待本身可视化
   private async startPhotoRestore(): Promise<void> {
     if (this.restoring) return;
+    // 人脸分析进行中禁入：修复会换/释放预览图，读像素会踩已释放对象
+    if (this.faceAnalyzing) {
+      this.showToast('人脸分析进行中，请稍候');
+      return;
+    }
     const uris = this.pendingRestoreUris;
     if (uris.length === 0) return;
     this.restoring = true;
@@ -2825,6 +2985,11 @@ struct Index {
     // 修复进行中禁止重新选图（防止覆盖在修清单与进度状态）
     if (this.restoring) {
       this.showToast('修复进行中，请稍候');
+      return;
+    }
+    // 人脸分析进行中同样禁入（防止换图踩正在读像素的预览对象）
+    if (this.faceAnalyzing) {
+      this.showToast('人脸分析进行中，请稍候');
       return;
     }
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
@@ -3687,16 +3852,17 @@ struct Index {
         })
       }
 
-      // ★ 相册照片预览与 AI 修复（PhotoViewPicker 多选后弹出）：预览首张 +
-      //   "AI 高清彩色修复"批量处理全部所选。修复进行中：照片区叠加随机进度
-      //   特效（星光点缀/水波涟漪/流光溢彩/光之扫描 四选一，覆盖整张照片），
-      //   下方显示阶段文案与进度条；修复中禁止关闭/换图（防止中断）
+      // ★ 相册照片预览与 AI 修复 + 人脸识别颜值打分（PhotoViewPicker 多选后
+      //   弹出）：预览首张 + "AI 高清彩色修复"批量处理 + "人脸识别·颜值打分"
+      //   静图分析。修复进行中：照片区叠加随机进度特效 + 阶段文案 + 进度条；
+      //   人脸分析完成后：检测框/标签/详情卡按 contain-fit 映射叠加在照片上
       if (this.albumPreviewVisible && this.albumPreviewPm) {
         Column() {
           Row() {
             Text(this.restoring ? 'AI 高清彩色修复中'
-              : (this.pendingRestoreUris.length > 0
-                ? `已选 ${this.pendingRestoreUris.length} 张照片` : '修复完成'))
+              : (this.faceAnalyzing ? '人脸识别中'
+                : (this.pendingRestoreUris.length > 0
+                  ? `已选 ${this.pendingRestoreUris.length} 张照片` : '修复完成')))
               .fontSize(16).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).layoutWeight(1)
             Text('✕').fontSize(18)
               .fontColor(this.restoring ? 'rgba(176,182,192,0.4)' : '#B0B6C0')
@@ -3707,7 +3873,7 @@ struct Index {
           }
           .width('92%').margin({ top: 18 })
 
-          // 照片区：源图/结果图 + 修复中的进度特效画布整幅覆盖
+          // 照片区：源图/结果图 + 修复进度特效 / 人脸识别结果多层叠加
           Stack() {
             Image(this.albumPreviewPm)
               .objectFit(ImageFit.Contain)
@@ -3722,10 +3888,123 @@ struct Index {
                 .borderRadius(12)
                 .clip(true)
             }
+            // 人脸分析中：照片中央小菊花 + 文案（不打断预览）
+            if (this.faceAnalyzing) {
+              Column({ space: 6 }) {
+                LoadingProgress().width(30).height(30).color('#00E5FF')
+                Text('人脸识别中…').fontSize(12).fontColor('#9FE8FF')
+              }
+              .width('100%').height('100%')
+              .justifyContent(FlexAlign.Center)
+            }
+            // 人脸识别结果：吞点击层 + 检测框/标签 + 分项详情卡
+            if (this.albumFaces.length > 0 && !this.restoring) {
+              // 吞点击层：结果展示期间点照片区域只清详情卡，不再误关面板
+              Column()
+                .width('100%').height('100%')
+                .backgroundColor('rgba(0,0,0,0.01)')
+                .onClick((): void => { this.albumFaceDetailIdx = -1; })
+              ForEach(this.albumFaces, (f: FaceHudItem, i: number) => {
+                Stack({ alignContent: Alignment.TopStart }) {
+                  // 检测框（配色与相机路径同一调色板，按 tid 认脸）
+                  Column()
+                    .width(this.faceBoxW(f)).height(this.faceBoxH(f))
+                    .border({
+                      width: 2,
+                      color: faceColorOfTid(f.tid !== undefined && f.tid !== null ? f.tid : -1, i)
+                    })
+                    .borderRadius(4)
+                  // 标签：框顶上方（贴顶时回落框内）
+                  Text(this.faceLabelText(f))
+                    .fontSize(10)
+                    .fontColor('#08131A')
+                    .backgroundColor(faceColorOfTid(f.tid !== undefined && f.tid !== null ? f.tid : -1, i))
+                    .borderRadius(6)
+                    .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                    .position({ x: 2, y: this.faceBoxTop(f) > 26 ? -20 : 2 })
+                }
+                .width(this.faceBoxW(f)).height(this.faceBoxH(f))
+                .position({ x: this.faceBoxLeft(f), y: this.faceBoxTop(f) })
+                .onClick((): void => { this.albumFaceDetailIdx = i; })
+              }, (f: FaceHudItem, i: number) => `${i}_${f.tid}_${f.beauty}_${f.x}_${f.y}`)
+              // 分项详情卡：点任一检测框弹出（性别年龄 + 颜值大字 + 7 分项条）
+              if (this.albumFaceDetailIdx >= 0 && this.albumFaceDetailIdx < this.albumFaces.length) {
+                Column({ space: 6 }) {
+                  Row({ space: 8 }) {
+                    Circle().width(8).height(8)
+                      .fill(faceColorOfTid(
+                        this.albumFaces[this.albumFaceDetailIdx].tid ?? -1,
+                        this.albumFaceDetailIdx))
+                    Text(this.faceGenderAgeText(this.albumFaces[this.albumFaceDetailIdx]))
+                      .fontSize(13).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).layoutWeight(1)
+                    if (this.albumFaces[this.albumFaceDetailIdx].beauty >= 0) {
+                      Text(`颜值 ${this.albumFaces[this.albumFaceDetailIdx].beauty}`)
+                        .fontSize(13).fontWeight(FontWeight.Bold)
+                        .fontColor(faceColorOfTid(
+                          this.albumFaces[this.albumFaceDetailIdx].tid ?? -1,
+                          this.albumFaceDetailIdx))
+                    }
+                  }
+                  .width('100%')
+                  if (this.albumFaces[this.albumFaceDetailIdx].comps !== undefined &&
+                    this.albumFaces[this.albumFaceDetailIdx].comps !== null) {
+                    ForEach(this.albumFaces[this.albumFaceDetailIdx].comps, (v: number, ci: number) => {
+                      if (v >= 0) {
+                        Row({ space: 6 }) {
+                          Text(FACE_COMP_NAMES[ci]).fontSize(10).fontColor('#9FB3C8').width(28)
+                          Progress({ value: v, total: 100, type: ProgressType.Linear })
+                            .color(faceColorOfTid(
+                              this.albumFaces[this.albumFaceDetailIdx].tid ?? -1,
+                              this.albumFaceDetailIdx))
+                            .backgroundColor('rgba(255,255,255,0.12)')
+                            .height(4).layoutWeight(1)
+                          Text(`${v}`).fontSize(10)
+                            .fontColor(faceColorOfTid(
+                              this.albumFaces[this.albumFaceDetailIdx].tid ?? -1,
+                              this.albumFaceDetailIdx))
+                            .width(24).textAlign(TextAlign.RIGHT)
+                        }
+                        .width('100%')
+                      }
+                    }, (v: number, ci: number) => `${ci}_${v}`)
+                  }
+                  Text('点卡片关闭')
+                    .fontSize(9).fontColor('rgba(159,179,200,0.7)')
+                }
+                .width(190)
+                .padding(10)
+                .backgroundColor('rgba(8,12,18,0.94)')
+                .borderRadius(10)
+                .border({
+                  width: 1,
+                  color: faceColorOfTid(
+                    this.albumFaces[this.albumFaceDetailIdx].tid !== undefined &&
+                      this.albumFaces[this.albumFaceDetailIdx].tid !== null
+                      ? this.albumFaces[this.albumFaceDetailIdx].tid : -1,
+                    this.albumFaceDetailIdx)
+                })
+                .position({ x: 10, y: 10 })
+                .onClick((): void => { this.albumFaceDetailIdx = -1; })
+              }
+            }
           }
           .layoutWeight(1)
           .width('92%')
           .margin({ top: 8 })
+          .onAreaChange((oldArea: Area, newArea: Area): void => {
+            // 照片显示区尺寸变化（旋转/布局）时重算 contain-fit 映射
+            const aw = newArea.width;
+            const ah = newArea.height;
+            this.photoAreaW = typeof aw === 'number' ? aw : 0;
+            this.photoAreaH = typeof ah === 'number' ? ah : 0;
+          })
+
+          // 人脸识别汇总行（检测数 + 平均颜值）
+          if (this.albumFaces.length > 0 && !this.restoring && !this.faceAnalyzing) {
+            Text(`检测到 ${this.albumFaces.length} 张人脸${this.albumAvgBeautyText()} · 点框看分项`)
+              .fontSize(12).fontColor('#00EBB2')
+              .width('92%').margin({ top: 8 })
+          }
 
           // 阶段文案 + 进度条（模型加载/逐张修复/完成汇总；完成后保留满条）
           if (this.restoreStageText !== '') {
@@ -3742,33 +4021,46 @@ struct Index {
             .margin({ top: 10 })
           }
 
+          // 按钮区第一行：打开相册 | 人脸识别·颜值打分
           Row({ space: 12 }) {
             Button('打开相册')
               .fontSize(14).fontColor('#E6F7FF')
               .backgroundColor('rgba(0,229,255,0.16)')
               .borderRadius(18).height(38).layoutWeight(1)
-              .enabled(!this.restoring)
+              .enabled(!this.restoring && !this.faceAnalyzing)
               .onClick((): void => {
                 this.albumPreviewVisible = false;
                 this.openGallery();
               })
-            Button('AI 高清彩色修复')
-              .fontSize(14)
-              .fontColor(this.restoring || this.pendingRestoreUris.length === 0
-                ? '#80A0AA' : '#003B44')
-              .backgroundColor(this.restoring || this.pendingRestoreUris.length === 0
-                ? 'rgba(0,229,255,0.4)' : '#00E5FF')
-              .borderRadius(18).height(38).layoutWeight(1.6)
-              .enabled(!this.restoring && this.pendingRestoreUris.length > 0)
-              .onClick((): void => { this.startPhotoRestore(); })
+            Button(this.faceAnalyzing ? '识别中…' : '人脸识别·颜值打分')
+              .fontSize(13)
+              .fontColor(this.restoring || this.faceAnalyzing ? '#80A0AA' : '#E6F7FF')
+              .backgroundColor(this.restoring || this.faceAnalyzing
+                ? 'rgba(0,235,178,0.35)' : 'rgba(0,235,178,0.22)')
+              .borderRadius(18).height(38).layoutWeight(1.3)
+              .enabled(!this.restoring && !this.faceAnalyzing)
+              .onClick((): void => { this.analyzeAlbumFaces(); })
           }
           .width('92%')
-          .margin({ top: 12, bottom: 26 })
+          .margin({ top: 12 })
+
+          // 按钮区第二行：AI 高清彩色修复（主功能整行）
+          Button('AI 高清彩色修复')
+            .fontSize(14)
+            .fontColor(this.restoring || this.pendingRestoreUris.length === 0
+              ? '#80A0AA' : '#003B44')
+            .backgroundColor(this.restoring || this.pendingRestoreUris.length === 0
+              ? 'rgba(0,229,255,0.4)' : '#00E5FF')
+            .borderRadius(18).height(38)
+            .width('92%')
+            .enabled(!this.restoring && this.pendingRestoreUris.length > 0)
+            .margin({ top: 10, bottom: 26 })
+            .onClick((): void => { this.startPhotoRestore(); })
         }
         .width('100%').height('100%')
         .backgroundColor('rgba(0,0,0,0.92)')
         .onClick((): void => {
-          if (!this.restoring) { this.albumPreviewVisible = false; }
+          if (!this.restoring && !this.faceAnalyzing) { this.albumPreviewVisible = false; }
         })
       }
 

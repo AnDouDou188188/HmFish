@@ -74,6 +74,11 @@ export interface RestorePhotoResult {
   h: number;
 }
 export const restorePhoto: (buf: ArrayBuffer, w: number, h: number, bgra: boolean) => Promise<RestorePhotoResult | null>;
+// ★ 相册静图人脸识别 + 颜值打分（复用 initFace 三模型：SCRFD 检测 + 106 关键点
+//   + 性别年龄 + 几何颜值；长边 >1280 自动降采样送检）。返回 JSON 字符串：
+//   {count, ready, dw, dh, faces:[{i,tid,gender,age,beauty,comps[7],x,y,w,h}]}
+//   （dw/dh=实际送检尺寸，box 为该尺寸下像素坐标；ready=false 表示模型未就绪）
+export const analyzeFaces: (buf: ArrayBuffer, w: number, h: number, bgra: boolean) => Promise<string>;
 export const setupExternalPipeline: (w: number, h: number) => boolean;
 export const uvcConnect: (fd: number, vid: number, pid: number, busnum: number, devaddr: number) => boolean;
 export const uvcStartStreaming: (w: number, h: number, fps: number) => boolean;
