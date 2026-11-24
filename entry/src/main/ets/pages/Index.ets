@@ -42,6 +42,8 @@ import { OcrManager, OcrModelSet } from '../common/OcrManager';
 import { AlertService } from '../common/AlertService';
 import { UsbDeviceScanner, UsbCamInfo, UsbPipeHandle } from '../common/UsbDeviceScanner';
 import { LoadingOverlay } from '../components/LoadingOverlay';
+
+import { RestoreProgressEffect } from '../components/RestoreProgressEffect';
 import { TopHudView, DepthRecord, FaceHudRow } from '../view/TopHudView';
 import { GeoService } from '../core/GeoService';
 import { BottomPanel, PANEL_OCCUPIED_VP } from '../view/BottomPanel';
@@ -75,6 +77,9 @@ import { pasteboard } from '@kit.BasicServicesKit';
 import { batteryInfo } from '@kit.BasicServicesKit';
 
 const SENSOR_ROTATION = 90;
+
+// ★ AI 修复进度特效名（与 RestoreProgressEffect 四类一一对应，每张照片随机一种）
+const RESTORE_EFFECT_NAMES: string[] = ['星光点缀', '水波涟漪', '流光溢彩', '光之扫描'];
 
 // ★ 表格识别 native JSON 原始模型（字段可选，逐个校验后再转 TableCellData）
 interface TableParsed {
@@ -433,6 +438,17 @@ struct Index {
   @State albumPreviewPm: image.PixelMap | undefined = undefined;
   // ★ AI 旧照片修复：PhotoViewPicker 多选 URI（≤9 张）与修复进行中标志
   @State pendingRestoreUris: string[] = [];
+
+  // ★ AI 修复进度特效状态：总进度 0..1（模拟曲线）+ 当前张序号（-1=模型
+  //   加载阶段）+ 随机特效类型（每张照片换）+ 阶段文案（标题下进度行显示）
+  @State restoreProgress: number = 0;
+  @State restorePhotoIdx: number = -1;
+  @State restoreEffectType: number = 0;
+  @State restoreStageText: string = '';
+
+  // 修复进度模拟循环的定时器句柄与当前照片起点毫秒（驱动进度逼近曲线）
+  private restoreTimerId: number = -1;
+  private restorePhotoStartMs: number = 0;
   @State restoring: boolean = false;
   @State autoRecordOn: boolean = false;
 
@@ -2188,17 +2204,22 @@ struct Index {
         this.showToast('图片解码失败');
         return;
       }
-      this.albumPreviewPm = pm;
+      // 预览首张（长边 ≤960 解码，与修复流水线输入同规格）；
+      // 换新选图时重置上一次修复的进度/阶段文案（避免残留"修复完成"）
+      this.restoreStageText = '';
+      this.restoreProgress = 0;
+      this.swapAlbumPreview(pm);
       this.albumPreviewVisible = true;
     } catch (e) {
       this.showToast('打开相册选择器失败');
     }
   }
 
-  // ★ 解码所选照片：等比缩放至长边 ≤720（SR 全帧 onnxruntime 推理的输入上限，
-  //   同时控制 readPixelsToBuffer 内存），输出像素图供预览与修复共用。
-  //   PhotoViewPicker 返回 file://media/ 相册 URI：须经 fs.openSync 换 fd 解码，
-  //   直接 createImageSource(uri) 在部分系统版本会抛异常（"图片解码失败"根因）
+  // ★ 解码所选照片：等比缩放至长边 ≤960（SR 超分输入上限——×4 后输出长边
+  //   3840 达 4K 级清晰度，再大会显著拉长单张推理时间），输出像素图供预览
+  //   与修复共用。PhotoViewPicker 返回 file://media/ 相册 URI：须经 fs.openSync
+  //   换 fd 解码，直接 createImageSource(uri) 在部分系统版本会抛异常（"图片
+  //   解码失败"根因）
   private async decodeForRestore(uri: string): Promise<image.PixelMap | undefined> {
     let file: fs.File | undefined = undefined;
     try {
@@ -2212,7 +2233,7 @@ struct Index {
         return undefined;
       }
       // 等比缩放：目标 desiredSize 按原图宽高比计算，避免拉伸变形
-      const ratio = Math.max(ow, oh) > 720 ? 720 / Math.max(ow, oh) : 1;
+      const ratio = Math.max(ow, oh) > 960 ? 960 / Math.max(ow, oh) : 1;
       const dw = Math.max(2, Math.round(ow * ratio));
       const dh = Math.max(2, Math.round(oh * ratio));
       const pm = await source.createPixelMap({
@@ -2227,12 +2248,55 @@ struct Index {
     }
   }
 
-  // ★ 单张照片 AI 修复全链路：解码 ≤720 → readPixelsToBuffer → native
+  // ★ 换预览图：释放旧 PixelMap 后换新图（修复中实时显示当前处理的照片，
+  //   完成后显示修复结果；旧图统一在此释放避免泄漏）
+  private swapAlbumPreview(pm: image.PixelMap): void {
+    const old = this.albumPreviewPm;
+    this.albumPreviewPm = pm;
+    if (old) {
+      try { old.release(); } catch (_) {}
+    }
+  }
+
+  // ★ 每张照片随机挑一种进度特效（星光/涟漪/流彩/扫描 四选一）
+  private pickRestoreEffect(): void {
+    this.restoreEffectType = Math.floor(Math.random() * 4);
+  }
+
+  private stopRestoreProgressLoop(): void {
+    if (this.restoreTimerId >= 0) {
+      clearInterval(this.restoreTimerId);
+      this.restoreTimerId = -1;
+    }
+  }
+
+  // ★ 修复进度模拟循环（100ms 步进）：模型加载阶段缓慢爬升（封顶 6%，
+  //   表达"已启动但不冒进"）；照片阶段按渐近曲线逼近——est = 1-e^(-t/3.2s)，
+  //   单张封顶 94%（永不提前到 100%，完成由代码直接置 1），整体 =
+  //   (当前张序号 + 当前张进度) / 总张数。native 推理无进度回调，该曲线
+  //   与真实耗时分布（前快后慢）吻合，观感平滑不"假满"
+  private beginRestoreProgressLoop(total: number): void {
+    this.stopRestoreProgressLoop();
+    this.restoreTimerId = setInterval((): void => {
+      const elapsed = Date.now() - this.restorePhotoStartMs;
+      if (this.restorePhotoIdx < 0) {
+        this.restoreProgress = Math.min(0.06, elapsed / 150000);
+      } else {
+        const est = Math.min(0.94, 1 - Math.exp(-elapsed / 3200));
+        this.restoreProgress = Math.min(0.995, (this.restorePhotoIdx + est) / total);
+      }
+    }, 100);
+  }
+
+  // ★ 单张照片 AI 修复全链路：解码 ≤960 → readPixelsToBuffer → native
   //   restorePhoto（去噪+超分×4+褪色修复）→ RGBA 像素图 → JPEG 95 → 入系统相册。
-  //   isFirst：首张成功后同步刷新预览图与缩略图缓存（立即看到修复效果）
+  //   解码后立即把源图换入预览（进度特效覆盖其上）；isFirst：首张成功后
+  //   预览切到修复结果并刷新缩略图缓存（立即看到修复效果）
   private async restoreOnePhoto(ctx: common.UIAbilityContext, uri: string, isFirst: boolean): Promise<boolean> {
     const pm = await this.decodeForRestore(uri);
     if (!pm) return false;
+    // 实时预览当前处理的照片（特效画布叠加其上）；pm 所有权移交预览状态
+    this.swapAlbumPreview(pm);
     let outPath: string = '';
     try {
       // ① 读取像素：按实际 pixelFormat 判断字节序（部分设备解码为 BGRA_8888）
@@ -2260,8 +2324,8 @@ struct Index {
       const saveRes = await this.media.saveToGallery(ctx, outPath, false);
       if (!saveRes.success) return false;
       if (isFirst) {
-        // 首张：更新预览为修复结果 + 刷新缩略图（解码大图做缓存）
-        this.albumPreviewPm = outPm;
+        // 首张：预览切到修复结果（立即看到效果）+ 刷新缩略图（解码大图做缓存）
+        this.swapAlbumPreview(outPm);
         try { fs.copyFileSync(outPath, `${ctx.filesDir}/album_thumb.jpg`); } catch (_) {}
         this.loadCachedAlbumThumb();
       } else {
@@ -2272,30 +2336,36 @@ struct Index {
       return false;
     } finally {
       if (outPath) { try { fs.unlinkSync(outPath); } catch (_) {} }
-      pm.release();
+      // 注意：pm 不在此释放——所有权已移交 albumPreviewPm（下次换图时统一释放）
     }
   }
 
   // ★ AI 高清彩色修复入口：SR/上色模型懒加载 → 逐张修复入相册 → 汇总提示。
   //   修复 = 边缘保持去噪 + 黑白/棕褐照片 AI 上色（DDColor-L 真黑白上色）
-  //   + AI 超分×4 高清 + 褪色修复（白平衡/对比度/饱和度），全部端侧本地推理
+  //   + AI 超分×4 高清 + 褪色修复（白平衡/对比度/饱和度），全部端侧本地推理。
+  //   全程不用全局 loading 遮罩：预览面板内实时显示当前照片 + 随机进度特效
+  //   （星光/涟漪/流彩/扫描）+ 阶段文案 + 模拟进度条，等待本身可视化
   private async startPhotoRestore(): Promise<void> {
     if (this.restoring) return;
     const uris = this.pendingRestoreUris;
     if (uris.length === 0) return;
     this.restoring = true;
-    this.loading = true;
     let okCount = 0;
+    this.restorePhotoIdx = -1;                    // -1 = 模型加载阶段
+    this.restoreProgress = 0;
+    this.restoreStageText = 'AI 修复模型加载中…';
+    this.restorePhotoStartMs = Date.now();
+    this.pickRestoreEffect();
+    this.beginRestoreProgressLoop(uris.length);
     try {
       // ① SR 超分模型懒加载（首次数秒；后续复用）
-      this.loadingMsg = 'AI 修复模型加载中…';
       const srOk = await this.ensureSrModel();
       if (!srOk) {
         // 模型加载失败：仍继续（native 端跳过超分，仅去噪+上色+褪色修复）
         this.showToast('超分模型加载失败，本次仅去噪与色彩修复');
       }
       // ② 上色模型懒加载（DDColor-L 241MB，首次加载数秒；黑白/棕褐照片上色）
-      this.loadingMsg = 'AI 上色模型加载中…';
+      this.restoreStageText = 'AI 上色模型加载中…';
       const colorOk = await this.ensureColorModel();
       if (!colorOk) {
         // 上色模型加载失败：仍继续（黑白照片本次仅去噪+超分+褪色修复）
@@ -2303,22 +2373,30 @@ struct Index {
       }
       const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
       for (let i = 0; i < uris.length; i++) {
-        this.loadingMsg = `AI 高清彩色修复中… (${i + 1}/${uris.length})`;
+        // 每张照片：随机换一种进度特效 + 重置该张进度起点
+        this.restorePhotoIdx = i;
+        this.restorePhotoStartMs = Date.now();
+        this.pickRestoreEffect();
+        this.restoreStageText =
+          `第 ${i + 1}/${uris.length} 张 · ${RESTORE_EFFECT_NAMES[this.restoreEffectType]}`;
         const ok = await this.restoreOnePhoto(ctx, uris[i], i === 0);
         if (ok) okCount++;
       }
       if (okCount > 0) {
+        // 完成：进度直接置满 + 汇总文案；预览面板保留展示修复结果（手动关闭）
+        this.restoreProgress = 1;
+        this.restoreStageText = `修复完成 · 已保存 ${okCount}/${uris.length} 张`;
         this.showToast(`已完成 ${okCount}/${uris.length} 张修复并保存到相册`);
         this.speak(`修复完成${okCount}张`);
         this.refreshAlbumThumb();
       } else {
+        this.restoreStageText = '修复失败，请重试';
         this.showToast('修复失败，请重试');
       }
-      this.albumPreviewVisible = false;
       this.pendingRestoreUris = [];
     } finally {
+      this.stopRestoreProgressLoop();
       this.restoring = false;
-      this.loading = false;
     }
   }
 
@@ -2744,6 +2822,11 @@ struct Index {
   }
 
   private async openGallery(): Promise<void> {
+    // 修复进行中禁止重新选图（防止覆盖在修清单与进度状态）
+    if (this.restoring) {
+      this.showToast('修复进行中，请稍候');
+      return;
+    }
     const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
     const tries: Want[] = [
       { bundleName: 'com.huawei.hmos.photos', abilityName: 'com.huawei.hmos.photos.MainAbility' },
@@ -3605,47 +3688,88 @@ struct Index {
       }
 
       // ★ 相册照片预览与 AI 修复（PhotoViewPicker 多选后弹出）：预览首张 +
-      //   "AI 高清彩色修复"批量处理全部所选（去噪+超分×4+褪色修复，端侧本地）
+      //   "AI 高清彩色修复"批量处理全部所选。修复进行中：照片区叠加随机进度
+      //   特效（星光点缀/水波涟漪/流光溢彩/光之扫描 四选一，覆盖整张照片），
+      //   下方显示阶段文案与进度条；修复中禁止关闭/换图（防止中断）
       if (this.albumPreviewVisible && this.albumPreviewPm) {
         Column() {
           Row() {
-            Text(`已选 ${this.pendingRestoreUris.length} 张照片`)
+            Text(this.restoring ? 'AI 高清彩色修复中'
+              : (this.pendingRestoreUris.length > 0
+                ? `已选 ${this.pendingRestoreUris.length} 张照片` : '修复完成'))
               .fontSize(16).fontColor('#FFFFFF').fontWeight(FontWeight.Bold).layoutWeight(1)
-            Text('✕').fontSize(18).fontColor('#B0B6C0')
+            Text('✕').fontSize(18)
+              .fontColor(this.restoring ? 'rgba(176,182,192,0.4)' : '#B0B6C0')
               .padding({ left: 12, right: 4, top: 4, bottom: 4 })
-              .onClick((): void => { this.albumPreviewVisible = false; })
+              .onClick((): void => {
+                if (!this.restoring) { this.albumPreviewVisible = false; }
+              })
           }
           .width('92%').margin({ top: 18 })
 
-          Image(this.albumPreviewPm)
-            .objectFit(ImageFit.Contain)
-            .borderRadius(12)
-            .layoutWeight(1)
+          // 照片区：源图/结果图 + 修复中的进度特效画布整幅覆盖
+          Stack() {
+            Image(this.albumPreviewPm)
+              .objectFit(ImageFit.Contain)
+              .borderRadius(12)
+              .width('100%').height('100%')
+            if (this.restoring) {
+              RestoreProgressEffect({
+                effectType: this.restoreEffectType,
+                progress: this.restoreProgress
+              })
+                .width('100%').height('100%')
+                .borderRadius(12)
+                .clip(true)
+            }
+          }
+          .layoutWeight(1)
+          .width('92%')
+          .margin({ top: 8 })
+
+          // 阶段文案 + 进度条（模型加载/逐张修复/完成汇总；完成后保留满条）
+          if (this.restoreStageText !== '') {
+            Column({ space: 6 }) {
+              Text(this.restoreStageText)
+                .fontSize(13).fontColor('#9FE8FF')
+                .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Progress({ value: this.restoreProgress * 100, total: 100, type: ProgressType.Linear })
+                .color('#00E5FF')
+                .backgroundColor('rgba(255,255,255,0.10)')
+                .height(4).width('100%')
+            }
             .width('92%')
-            .margin({ top: 8, bottom: 12 })
+            .margin({ top: 10 })
+          }
 
           Row({ space: 12 }) {
             Button('打开相册')
               .fontSize(14).fontColor('#E6F7FF')
               .backgroundColor('rgba(0,229,255,0.16)')
               .borderRadius(18).height(38).layoutWeight(1)
+              .enabled(!this.restoring)
               .onClick((): void => {
                 this.albumPreviewVisible = false;
                 this.openGallery();
               })
             Button('AI 高清彩色修复')
-              .fontSize(14).fontColor(this.restoring ? '#80A0AA' : '#003B44')
-              .backgroundColor(this.restoring ? 'rgba(0,229,255,0.4)' : '#00E5FF')
+              .fontSize(14)
+              .fontColor(this.restoring || this.pendingRestoreUris.length === 0
+                ? '#80A0AA' : '#003B44')
+              .backgroundColor(this.restoring || this.pendingRestoreUris.length === 0
+                ? 'rgba(0,229,255,0.4)' : '#00E5FF')
               .borderRadius(18).height(38).layoutWeight(1.6)
-              .enabled(!this.restoring)
+              .enabled(!this.restoring && this.pendingRestoreUris.length > 0)
               .onClick((): void => { this.startPhotoRestore(); })
           }
           .width('92%')
-          .margin({ bottom: 26 })
+          .margin({ top: 12, bottom: 26 })
         }
         .width('100%').height('100%')
         .backgroundColor('rgba(0,0,0,0.92)')
-        .onClick((): void => { this.albumPreviewVisible = false; })
+        .onClick((): void => {
+          if (!this.restoring) { this.albumPreviewVisible = false; }
+        })
       }
 
       // ★ 运动设置弹窗（照抄识别设置：开关 + 灵敏度滑条 + 完成）

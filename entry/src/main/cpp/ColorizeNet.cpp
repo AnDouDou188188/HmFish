@@ -16,7 +16,7 @@
 // ║   ② 512×512 降采样 → 逐像素亮度灰（sRGB EOTF 线性化→Y→gamma 编码）          ║
 // ║   ③ ORT 推理得 a/b 平面（512²）                                             ║
 // ║   ④ 去整体色偏：a/b 各减去 0.8×均值（DDColor 整片偏暖黄，去掉大头保留色彩）  ║
-// ║   ⑤ a/b 双线性放大回原尺寸，与原图 L（OpenCV BGR2Lab 取 L∈[0,100]）合成     ║
+// ║   ⑤ a/b 放大回原尺寸 + 原图 L 引导联合双边边缘对齐（消物体边缘溢色）        ║
 // ║   ⑥ Lab→BGR→RGBA（alpha 恒 255），输出分辨率与输入相同                      ║
 // ║                                                                              ║
 // ║ 【线程/内存】napi 异步工作线程经 OcrBridge dlsym 调用；g_color_mutex         ║
@@ -89,7 +89,72 @@ namespace {
     //   三通道相等且等于亮度 Y 的 gamma 编码——模型输入即此值（单通道）
     inline float gammaEncode(float y) {
         return (y <= 0.0031308f) ? y * 12.92f
-                                 : 1.055f * std::pow(y, 1.0f / 2.4f) - 0.055f;
+                                  : 1.055f * std::pow(y, 1.0f / 2.4f) - 0.055f;
+    }
+
+    /* ★ jointBilateralAb：a/b 联合双边精修（5×5 窗口，引导图 = 原图 L）。
+     *   纯双线性放大后的色度在物体边缘会"溢色"（背景色渗进前景 2~4px，
+     *   发丝/树叶/建筑轮廓一圈模糊色边）。本步对放大后的 a/b 做边缘感知平滑：
+     *   权重 = 空间高斯(σs≈1.8，5×5 预计算) × 值域高斯(|ΔL| 查 101 项 LUT，
+     *   σL=6，Lab L∈[0,100])——平坦区色度平滑去噪，L 突变处权重骤降，
+     *   色度突变对齐亮度突变，色彩边界干净锐利。
+     *   复杂度 O(W·H·25)（960 长边约 70 万像素 ≈ 1700 万次查表，数十毫秒级） */
+    void jointBilateralAb(const cv::Mat &lab, cv::Mat &planeA, cv::Mat &planeB) {
+        const int w = planeA.cols;
+        const int h = planeA.rows;
+        // 值域权重 LUT：|ΔL| 0..100 → exp(-d²/(2·σL²))，σL=6
+        static const std::vector<float> rangeLut = [] {
+            std::vector<float> v(101);
+            for (int i = 0; i <= 100; i++) {
+                v[i] = std::exp(-(float)(i * i) / 72.0f);
+            }
+            return v;
+        }();
+        // 空间权重 5×5（σs=1.8）：exp(-(dx²+dy²)/6.48)，窗口越远权重越低
+        static const std::vector<float> spatial = [] {
+            std::vector<float> v(25);
+            for (int dy = -2; dy <= 2; dy++) {
+                for (int dx = -2; dx <= 2; dx++) {
+                    v[(dy + 2) * 5 + (dx + 2)] = std::exp(-(float)(dx * dx + dy * dy) / 6.48f);
+                }
+            }
+            return v;
+        }();
+        // L 取自 lab 通道 0（CV_32F，0..100）；逐像素加权平均写独立输出
+        cv::Mat outA(h, w, CV_32FC1);
+        cv::Mat outB(h, w, CV_32FC1);
+        for (int y = 0; y < h; y++) {
+            const int y0 = std::max(0, y - 2);
+            const int y1 = std::min(h - 1, y + 2);
+            for (int x = 0; x < w; x++) {
+                const float lcx = lab.ptr<float>(y)[x * 3];
+                float wSum = 0.0f;
+                float vA = 0.0f;
+                float vB = 0.0f;
+                for (int qy = y0; qy <= y1; qy++) {
+                    const float *lRow = lab.ptr<float>(qy);
+                    const float *aRow = planeA.ptr<float>(qy);
+                    const float *bRow = planeB.ptr<float>(qy);
+                    const int x0 = std::max(0, x - 2);
+                    const int x1 = std::min(w - 1, x + 2);
+                    for (int qx = x0; qx <= x1; qx++) {
+                        float dl = lRow[qx * 3] - lcx;
+                        if (dl < 0.0f) dl = -dl;
+                        int di = (int)dl;
+                        if (di > 100) di = 100;
+                        const float wgt =
+                                spatial[(qy - y + 2) * 5 + (qx - x + 2)] * rangeLut[di];
+                        wSum += wgt;
+                        vA += wgt * aRow[qx];
+                        vB += wgt * bRow[qx];
+                    }
+                }
+                outA.ptr<float>(y)[x] = vA / (wSum + 1e-6f);
+                outB.ptr<float>(y)[x] = vB / (wSum + 1e-6f);
+            }
+        }
+        outA.copyTo(planeA);
+        outB.copyTo(planeB);
     }
 
 }  // namespace
@@ -259,14 +324,24 @@ int colorize_rgba(const uint8_t *in, int inW, int inH, uint8_t *out, int outW, i
             pa[i] = abData[i] - 0.8f * meanA;
             pb[i] = abData[abPx + i] - 0.8f * meanB;
         }
+        // ④b 轻度色度增益：a/b ×1.16 再钳 ±115——DDColor 输出整体偏"淡雅"，
+        //     小幅增益让色彩鲜活而不艳俗（钳制防个别像素过饱和出"荧光色"）
+        for (size_t i = 0; i < abPx; i++) {
+            float a = pa[i] * 1.16f;
+            float b = pb[i] * 1.16f;
+            pa[i] = a < -115.0f ? -115.0f : (a > 115.0f ? 115.0f : a);
+            pb[i] = b < -115.0f ? -115.0f : (b > 115.0f ? 115.0f : b);
+        }
 
-        // ⑤ a/b 双线性放大回原尺寸，与原图 L 合成 Lab：
-        //   OpenCV CV_32F Lab 约定 L∈[0,100]、a/b∈[-127,127]（D65 白点），
-        //   与模型输出及 PastVu 手写 D65 转换一致，可无转换直拼
+        // ⑤ a/b 双线性放大回原尺寸 → 以原图 L 为引导做联合双边边缘对齐
+        //   （消除纯双线性放大的物体边缘"溢色"，见 jointBilateralAb 注释）→
+        //   与原图 L 合成 Lab：OpenCV CV_32F Lab 约定 L∈[0,100]、a/b∈[-127,127]
+        //   （D65 白点），与模型输出及 PastVu 手写 D65 转换一致，可无转换直拼
         cv::resize(planeA, planeA, cv::Size(inW, inH), 0, 0, cv::INTER_LINEAR);
         cv::resize(planeB, planeB, cv::Size(inW, inH), 0, 0, cv::INTER_LINEAR);
         cv::Mat lab;
         cv::cvtColor(bgrF, lab, cv::COLOR_BGR2Lab);  // L 通道取自原图（细节保留）
+        jointBilateralAb(lab, planeA, planeB);
         {
             // 仅 a/b 两平面替换为模型结果，L 保留原图
             cv::Mat chans[3];

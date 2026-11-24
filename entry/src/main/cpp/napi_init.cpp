@@ -1309,7 +1309,9 @@ static napi_value RecognizeTable(napi_env env, napi_callback_info info) {
 //       （真黑白上色）；彩色照片绝不被模型颜色覆盖，模型未就绪/失败优雅跳过
 //   ③ AI 超分 ×N：quicksrnetmedium.onnx（libocr.so 内 onnxruntime CPU 推理），
 //      模型未就绪或推理失败时优雅回退原尺寸（修复流程不中断）
-//   ④ 褪色修复（纯手写两遍像素循环，无额外依赖）：
+//   ④ 褪色修复（纯手写两遍像素循环，无额外依赖；AI 上色成功的照片自动
+//      跳过 4a 白平衡与 4c 饱和度增益——模型色彩已平衡鲜活，二次调整
+//      反而偏色/过饱和，仅保留 4b 亮度对比度拉伸）：
 //      4a. 灰世界自动白平衡——R/G/B 通道均值拉齐到总均值，增益夹 [0.8,1.3]
 //          防极端场景色相翻转（典型老照片黄褐偏色由此去除）
 //      4b. 亮度 0.5%~99.5% 百分位裁剪 + 线性拉伸——褪色发灰照片恢复黑白场对比度
@@ -1361,7 +1363,10 @@ static void RestorePhotoExecute(napi_env env, void *data) {
     //     降采样 256px 计算 Lab a/b 通道标准差（色度离散度）判定近单色——
     //     黑白照片 ≈0、棕褐色调 3~6、真实彩色 15 以上，阈值 8 只放过彩色；
     //     判定命中且上色模型就绪时原地调用（rgbaIn 同输入输出缓冲），
-    //     上色失败静默跳过（后续去噪/超分/褪色修复照常，修复链不中断）
+    //     上色失败静默跳过（后续去噪/超分/褪色修复照常，修复链不中断）。
+    //     colorized 标志传给 ④：AI 上色成功的照片跳过白平衡与增饱和（模型
+    //     色彩已平衡鲜活，二次调整反而偏色/过饱和），仅保留亮度对比度拉伸
+    bool colorized = false;
     if (ocr_bridge::colorIsReady()) {
         cv::Mat small;
         cv::resize(bgrDenoised, small, cv::Size(256, 256), 0, 0, cv::INTER_AREA);
@@ -1375,6 +1380,7 @@ static void RestorePhotoExecute(napi_env env, void *data) {
         const double chromaSpread = std::sqrt(stdA[0] * stdA[0] + stdB[0] * stdB[0]);
         if (chromaSpread < 8.0 &&
             ocr_bridge::colorize(rgbaIn.data, w, h, rgbaIn.data, w, h)) {
+            colorized = true;
             OH_LOG_INFO(LOG_APP, "restorePhoto: colorized (chromaSpread=%{public}.1f)",
                         chromaSpread);
         }
@@ -1414,16 +1420,18 @@ static void RestorePhotoExecute(napi_env env, void *data) {
         sumB += p[2];
     }
     const double meanAll = (sumR + sumG + sumB) / (3.0 * static_cast<double>(px));
-    // 4a. 灰世界增益：meanAll / 通道均值，夹 [0.8, 1.3]（lambda 内联钳制）
+    // 4a. 灰世界增益：meanAll / 通道均值，夹 [0.8, 1.3]（lambda 内联钳制）。
+    //     AI 上色成功的照片增益置 1（跳过）——模型色彩已按场景平衡，
+    //     二次灰世界会把雪景/天空等中性色拉偏
     auto clampGain = [meanAll, px](double chSum) -> float {
         double g = meanAll / (chSum / static_cast<double>(px) + 1e-6);
         if (g < 0.8) g = 0.8;
         if (g > 1.3) g = 1.3;
         return static_cast<float>(g);
     };
-    const float gainR = clampGain(sumR);
-    const float gainG = clampGain(sumG);
-    const float gainB = clampGain(sumB);
+    const float gainR = colorized ? 1.0f : clampGain(sumR);
+    const float gainG = colorized ? 1.0f : clampGain(sumG);
+    const float gainB = colorized ? 1.0f : clampGain(sumB);
     // 4b. 亮度百分位：0.5% 低分位与 99.5% 高分位作为裁剪点
     const long clipLoCount = static_cast<long>(static_cast<double>(px) * 0.005);
     const long clipHiCount = static_cast<long>(static_cast<double>(px) * 0.995);
@@ -1446,7 +1454,10 @@ static void RestorePhotoExecute(napi_env env, void *data) {
     }
     const float stretch = 255.0f / static_cast<float>(hi - lo);
     const float loF = static_cast<float>(lo);
-    // 4c. 第二遍：白平衡 → 亮度拉伸 → 饱和度 1.25x → 钳制写回
+    // 4c. 第二遍：白平衡 → 亮度拉伸 → 饱和度 → 钳制写回。
+    //     饱和度增益：AI 上色照片 ×1.0（模型色度已含 1.16 增益，再乘会过
+    //     饱和出"荧光色"），普通褪色照片 ×1.25（色彩回鲜保留明暗层次）
+    const float satK = colorized ? 1.0f : 1.25f;
     p = ctx->out.data();
     for (size_t i = 0; i < px; i++, p += 4) {
         float r = p[0] * gainR;
@@ -1456,9 +1467,9 @@ static void RestorePhotoExecute(napi_env env, void *data) {
         g = (g - loF) * stretch;
         b = (b - loF) * stretch;
         const float lum = 0.299f * r + 0.587f * g + 0.114f * b;
-        r = lum + (r - lum) * 1.25f;
-        g = lum + (g - lum) * 1.25f;
-        b = lum + (b - lum) * 1.25f;
+        r = lum + (r - lum) * satK;
+        g = lum + (g - lum) * satK;
+        b = lum + (b - lum) * satK;
         p[0] = r < 0.0f ? 0 : (r > 255.0f ? 255 : static_cast<uint8_t>(r + 0.5f));
         p[1] = g < 0.0f ? 0 : (g > 255.0f ? 255 : static_cast<uint8_t>(g + 0.5f));
         p[2] = b < 0.0f ? 0 : (b > 255.0f ? 255 : static_cast<uint8_t>(b + 0.5f));
