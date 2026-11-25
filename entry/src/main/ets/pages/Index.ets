@@ -961,7 +961,6 @@ struct Index {
     this.speech.stop();
     this.previewReady = false;
     this.started = false;
-    try { entry.stopPipeline(); } catch (_) {}
     this.vision.stop();
     // ★ USB 取流后台继续占 USB 带宽：息屏/退后台先停流，回前台重连恢复到 USB
     if (this.cameraPosition === 2) {
@@ -976,6 +975,10 @@ struct Index {
       // ★ 带 3s 超时释放：onPageHide 时相机服务卡死会锁死 releasingCamera，
       //   onPageShow 恢复重试全部耗尽 → 永远黑屏
       await self.releaseCameraSafe();
+      // ★ 顺序不可反：必须先停相机会话（断流）再停 native 管线——
+      //   管线释放会销毁 ImageReceiver 消费端，相机 HAL 仍在产帧时
+      //   会触发 Bufferqueue 41202000 连环报错（生产者往已释放 surface 送帧）
+      try { entry.stopPipeline(); } catch (_) {}
       self.releasingCamera = false;
     })();
   }
@@ -3252,8 +3255,9 @@ struct Index {
     const previewId = this.xcController.getXComponentSurfaceId();
     if (!rawId || !previewId) { this.switching = false; this.loading = false; return; }
     try {
-      try { entry.stopPipeline(); } catch (_) {}
+      // ★ 先停相机会话再停管线（防 Bufferqueue 41202000：生产者往已释放 surface 送帧）
       await this.releaseCameraSafe();
+      try { entry.stopPipeline(); } catch (_) {}
       const aiId = entry.createYuvReceiver(640, 480);
       if (aiId) {
         try { entry.setRotation(SENSOR_ROTATION); } catch (_) {}
@@ -3306,8 +3310,9 @@ struct Index {
     const previewId = this.xcController.getXComponentSurfaceId();
     if (!rawId || !previewId) { this.switching = false; this.loading = false; return; }
     try {
-      try { entry.stopPipeline(); } catch (_) {}
+      // ★ 先停相机会话再停管线（防 Bufferqueue 41202000：生产者往已释放 surface 送帧）
       await this.releaseCameraSafe();
+      try { entry.stopPipeline(); } catch (_) {}
       const aiId = entry.createYuvReceiver(640, 480);
       if (aiId) {
         try { entry.setRotation(SENSOR_ROTATION); } catch (_) {}
@@ -3499,9 +3504,10 @@ struct Index {
     this.loadingMsg = '正在连接 USB 摄像头…';
     this.previewReady = false;
     this.vision.stop();
-    try { entry.stopPipeline(); } catch (_) {}
     // ★ 带 3s 超时释放：USB 连接路径相机服务卡死时不能无限挂起（连接失败回退也走得到这里）
+    //   先停相机会话再停管线（防 Bufferqueue 41202000：生产者往已释放 surface 送帧）
     await this.releaseCameraSafe();
+    try { entry.stopPipeline(); } catch (_) {}
 
     // ★ 等价 Android UsbManager.openDevice + getFileDescriptor：
     //   connectDevice 拿 pipe → getFileDescriptor 把 usbfs fd dup 进本进程
