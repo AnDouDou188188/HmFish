@@ -78,6 +78,13 @@ export interface AppSettings {
   // ★ "参数非零但模式为关→升为非AI"迁移的一次性标记：此前该迁移每次启动都跑，
   //   用户明明选了"关闭"重启却被强行改回非AI——加标记保证只迁移一次
   usbParamModeMigrated: boolean;
+  // ★ 画中画（后台悬浮小窗）开关：退后台时用 PiP 小窗继续看画面（默认开）
+  pipEnabled: boolean;
+  // ★ 应用内自动更新：自动检查开关 / 跳过的版本 tag / 稍后提醒截止时间戳 / 上次检查时间戳
+  updateAutoCheck: boolean;
+  updateSkipTag: string;
+  updateSnoozeUntil: number;
+  updateLastCheck: number;
 }
 
 // ★ preferences 文件名：带版本号——跨大版本结构不兼容时换文件名即可整体重置
@@ -147,7 +154,12 @@ export class SettingsStore {
       faceEnabled: false,
       usbEnhanceV2: false,
       usbEnhanceV3: false,
-      usbParamModeMigrated: false
+      usbParamModeMigrated: false,
+      pipEnabled: true,
+      updateAutoCheck: true,
+      updateSkipTag: '',
+      updateSnoozeUntil: 0,
+      updateLastCheck: 0
     };
     if (!SettingsStore.pref) return r;
     const p = SettingsStore.pref;
@@ -221,6 +233,12 @@ export class SettingsStore {
     r.usbEnhanceV2 = await p.get('usbEnhanceV2', false) as boolean;
     r.usbEnhanceV3 = await p.get('usbEnhanceV3', false) as boolean;
     r.usbParamModeMigrated = await p.get('usbParamModeMigrated', false) as boolean;
+    // ★ 画中画 + 应用内更新设置
+    r.pipEnabled = await p.get('pipEnabled', true) as boolean;
+    r.updateAutoCheck = await p.get('updateAutoCheck', true) as boolean;
+    r.updateSkipTag = await p.get('updateSkipTag', '') as string;
+    r.updateSnoozeUntil = await p.get('updateSnoozeUntil', 0) as number;
+    r.updateLastCheck = await p.get('updateLastCheck', 0) as number;
     if (!r.usbEnhanceV3) {
       if (r.usbEnhanceMode >= 2 && r.usbEnhanceMode <= 5) {
         r.usbEnhanceMode = 2;
@@ -290,6 +308,11 @@ export class SettingsStore {
     if (s.usbEnhanceV2 !== undefined) await p.put('usbEnhanceV2', s.usbEnhanceV2);
     if (s.usbEnhanceV3 !== undefined) await p.put('usbEnhanceV3', s.usbEnhanceV3);
     if (s.usbParamModeMigrated !== undefined) await p.put('usbParamModeMigrated', s.usbParamModeMigrated);
+    if (s.pipEnabled !== undefined) await p.put('pipEnabled', s.pipEnabled);
+    if (s.updateAutoCheck !== undefined) await p.put('updateAutoCheck', s.updateAutoCheck);
+    if (s.updateSkipTag !== undefined) await p.put('updateSkipTag', s.updateSkipTag);
+    if (s.updateSnoozeUntil !== undefined) await p.put('updateSnoozeUntil', s.updateSnoozeUntil);
+    if (s.updateLastCheck !== undefined) await p.put('updateLastCheck', s.updateLastCheck);
     if (s.enabledLabels !== undefined) await p.put('enabledLabels', s.enabledLabels.join(','));
     if (s.alertLabels !== undefined) await p.put('alertLabels', s.alertLabels.join(','));
     await p.flush();

@@ -39,6 +39,8 @@ export struct ModelSheet {
   // ★ 触发音效：自动录像触发时的提示音（默认内置报警音，可选自定义 MP3，可试听）
   @Prop recordSoundOn: boolean = true;
   @Prop recordSoundName: string = '';
+  // ★ 画中画后台识别：退出应用后以悬浮窗继续相机预览+YOLO 识别（录像/播报不停）
+  @Prop pipEnabled: boolean = false;
 
   // ── 交互回调：关闭/选模型/勾类别/阈值提交/各开关切换/音效选择·试听·恢复 ──
   onClose?: () => void;
@@ -53,6 +55,7 @@ export struct ModelSheet {
   onPickSound?: () => void;
   onPreviewSound?: () => void;
   onResetSound?: () => void;
+  onPipToggle?: () => void;
 
   @State appear: boolean = false;
   // ★ 滑条本地缓冲：拖动期间只更新本地值，松手才提交父组件
@@ -338,6 +341,27 @@ export struct ModelSheet {
                 .fontSize(10).fontColor('#8E97A3')
                 .width('100%').margin({ top: 6 })
             }
+
+            // ★ 画中画后台识别：退出 App 后以悬浮小窗继续预览+识别，
+            //   录像/语音播报/自动录像不中断（需系统"自动启动画中画"开关配合）
+            Row({ space: 8 }) {
+              Text('▤').fontSize(14).fontColor('#00E5FF')
+              Text('画中画后台识别').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+              Text(this.pipEnabled ? '已开启' : '已关闭').fontSize(11)
+                .fontColor(this.pipEnabled ? '#00E5FF' : '#6E7681')
+              Blank()
+              Toggle({ type: ToggleType.Switch, isOn: this.pipEnabled })
+                .selectedColor('#00E5FF')
+                .onChange((isOn: boolean) => {
+                  if (isOn !== this.pipEnabled) this.onPipToggle?.();
+                })
+            }
+            .width('100%')
+            .margin({ top: 20 })
+
+            Text('开启后按 Home 键退出，相机预览与识别以画中画悬浮窗继续，录像/播报不中断')
+              .fontSize(10).fontColor('#8E97A3')
+              .width('100%').margin({ top: 6 })
 
             // ── 识别模型横向列表：点卡片切换模型（Index 负责卸载/热加载） ──
             this.SectionTitle('◆', '识别模型', '点击切换')
