@@ -41,6 +41,8 @@ export struct ModelSheet {
   @Prop recordSoundName: string = '';
   // ★ 画中画后台识别：退出应用后以悬浮窗继续相机预览+YOLO 识别（录像/播报不停）
   @Prop pipEnabled: boolean = false;
+  // ★ 语音命令：点悬浮麦克风说话，离线 AI 模糊识别+拼音纠正后执行全部功能
+  @Prop voiceCmdOn: boolean = false;
 
   // ── 交互回调：关闭/选模型/勾类别/阈值提交/各开关切换/音效选择·试听·恢复 ──
   onClose?: () => void;
@@ -56,6 +58,7 @@ export struct ModelSheet {
   onPreviewSound?: () => void;
   onResetSound?: () => void;
   onPipToggle?: () => void;
+  onVoiceCmdToggle?: () => void;
 
   @State appear: boolean = false;
   // ★ 滑条本地缓冲：拖动期间只更新本地值，松手才提交父组件
@@ -360,6 +363,28 @@ export struct ModelSheet {
             .margin({ top: 20 })
 
             Text('开启后按 Home 键退出，相机预览与识别以画中画悬浮窗继续，录像/播报不中断')
+              .fontSize(10).fontColor('#8E97A3')
+              .width('100%').margin({ top: 6 })
+
+            // ★ 语音命令：点悬浮麦克风说话 → 离线 AI 识别 + 拼音模糊纠正 →
+            //   执行录像/截图/识别/画质/模型/能耗等全部功能（支持多轮澄清对话）
+            Row({ space: 8 }) {
+              Text('🎤').fontSize(14).fontColor('#00E5FF')
+              Text('语音命令').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
+              Text(this.voiceCmdOn ? '已开启' : '已关闭').fontSize(11)
+                .fontColor(this.voiceCmdOn ? '#00E5FF' : '#6E7681')
+              Blank()
+              Toggle({ type: ToggleType.Switch, isOn: this.voiceCmdOn })
+                .selectedColor('#00E5FF')
+                .onChange((isOn: boolean) => {
+                  if (isOn !== this.voiceCmdOn) this.onVoiceCmdToggle?.();
+                })
+            }
+            .width('100%')
+            .margin({ top: 20 })
+
+            Text('点麦克风说话即可控制：开始录像、截图、打开人脸识别、省电模式、变焦两倍…'
+              + '识别不准会自动模糊纠正并多轮追问确认')
               .fontSize(10).fontColor('#8E97A3')
               .width('100%').margin({ top: 6 })
 

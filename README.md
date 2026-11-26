@@ -2,9 +2,9 @@
 
 ![Version](https://img.shields.io/badge/version-2.2-blue) ![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-green) ![Offline](https://img.shields.io/badge/inference-100%25%20on--device-orange)
 
-> **v2.2 画中画后台识别 + 应用内自动更新 / PiP background & in-app updates**：微信式画中画悬浮窗（按 Home 退出后相机预览 + YOLO 识别在小窗继续，录像/语音播报/自动录像不中断；小窗 HUD 芯片显示 REC 计时与识别计数，播放/暂停按钮控制推理；识别设置内一键开关，3s 看门狗兜底回退省电路径）· 应用内 GitHub 自动更新（每小时后台检查 + 24h 节流；发现新版本弹窗提示，支持稍后提醒 3 天/跳过此版本；流式下载断点续传 + 5 次自动重试，下载完成存到下载目录一键安装；GitHub 不可达时可打开发布页浏览器下载；HUD 电池旁版本胶囊 `v2.2` / `⤓ 新版本` 点击打开更新面板）
+> **v2.2 画中画后台识别 + 应用内自动更新 + 语音命令 / PiP background, in-app updates & voice commands**：微信式画中画悬浮窗（按 Home 退出后相机预览 + YOLO 识别在小窗继续，录像/语音播报/自动录像不中断；小窗 HUD 芯片显示 REC 计时与识别计数，播放/暂停按钮控制推理；识别设置内一键开关，3s 看门狗兜底回退省电路径）· 应用内 GitHub 自动更新（每小时后台检查 + 24h 节流；发现新版本弹窗提示，支持稍后提醒 3 天/跳过此版本；流式下载断点续传 + 5 次自动重试，下载完成存到下载目录一键安装；GitHub 不可达时可打开发布页浏览器下载；HUD 电池旁版本胶囊 `v2.2` / `⤓ 新版本` 点击打开更新面板）· 离线语音命令（端侧识别 + 热词注入 + 拼音级模糊纠错 NLU + 多轮对话澄清/确认，语音控制全部功能："开始录像""截图""打开人脸识别""变焦两倍""省电模式"等，识别设置内开关，悬浮麦克风入口）
 >
-> **v2.2 WeChat-style PiP & in-app updates**: picture-in-picture floating window keeps camera preview + YOLO detection alive after pressing Home (recording / voice broadcast / auto-record continue uninterrupted; PiP HUD chip shows REC timer and detection count; play/pause button toggles inference; one-tap switch in Detection Settings with a 3s watchdog falling back to the power-saving path) · in-app GitHub auto-updater (hourly background checks with 24h throttle; new-version dialog with 3-day snooze and skip-this-version; streaming download with HTTP Range resume and 5 auto-retries, saved to the Downloads folder for one-tap install; open-the-releases-page browser fallback when GitHub is unreachable; version pill `v2.2` / `⤓ 新版本` next to the battery in the HUD opens the update panel)
+> **v2.2 WeChat-style PiP, in-app updates & voice commands**: picture-in-picture floating window keeps camera preview + YOLO detection alive after pressing Home (recording / voice broadcast / auto-record continue uninterrupted; PiP HUD chip shows REC timer and detection count; play/pause button toggles inference; one-tap switch in Detection Settings with a 3s watchdog falling back to the power-saving path) · in-app GitHub auto-updater (hourly background checks with 24h throttle; new-version dialog with 3-day snooze and skip-this-version; streaming download with HTTP Range resume and 5 auto-retries, saved to the Downloads folder for one-tap install; open-the-releases-page browser fallback when GitHub is unreachable; version pill `v2.2` / `⤓ 新版本` next to the battery in the HUD opens the update panel) · fully offline voice commands (on-device recognition + hotword injection + pinyin-level fuzzy-correction NLU + multi-turn clarify/confirm dialog controlling every feature — "start recording", "take a photo", "enable face recognition", "zoom 2x", "power saver"; switch in Detection Settings, floating-mic entry point)
 
 > **v2.1 OCR 提效与稳定性 / OCR efficiency & stability**：OpenCV5 静帧门控（64×64 缩略图比对，画面不变不重复推理）· OCR 自适应预处理（暗光 gamma 提亮 + 低对比度直方图裁剪拉伸，普通/票据两种模式共用，低质量帧识别率提升）· 推理前降采样长边 1024 · 模型切换不再卡死（释放引擎移出主线程，修复切换时 appfreeze 闪退）· 表格识别占用引擎时 OCR 自动让路（try-lock 跳过，不抢占 CPU）· OpenCV 线程池上限 4（与 YOLO/人脸/SR 线程预算隔离）· 画面徽标按增强模式变色区分（灰=关/青=增强/紫=AI）· PictureSheet"完成"按钮提交滑条并关闭
 >
@@ -41,6 +41,7 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 | 能耗档位 / Power presets | 省电/平衡/性能三档（处理间隔），适合长时间挂机 / Power-saver / balanced / performance presets (processing interval) for long sessions |
 | 画中画后台识别 / PiP background | 微信式悬浮小窗：按 Home 退出后预览+识别继续（录像/播报/自动录像不中断），小窗 HUD 显示 REC 计时与识别计数，播放/暂停控制推理；识别设置内开关 / WeChat-style floating window: preview + detection keep running after Home (recording/broadcast/auto-record continue), PiP HUD shows REC timer and detection count, play/pause toggles inference; switchable in Detection Settings |
 | 应用内自动更新 / In-app updates | 每小时检查 GitHub Releases（24h 节流 + 稍后提醒/跳过版本）；新版本弹窗、断点续传下载（5 次自动重试）、存下载目录一键安装、浏览器兜底；HUD 版本胶囊入口 / Hourly GitHub Releases checks (24h throttle + snooze/skip); new-version dialog, resumable download (5 auto-retries), save-to-Downloads one-tap install, browser fallback; version pill in the HUD |
+| 语音命令 / Voice commands | 离线语音控制全部功能："开始录像""截图""打开人脸识别""变焦两倍""置信度60""省电模式""用fishm模型"——端侧识别 + 热词优先 + 拼音级模糊纠错（同音字自动纠正）+ 多轮对话（没听清会追问澄清/确认），长按麦克风听示例 / Fully offline voice control: "start recording", "take a photo", "enable face recognition", "zoom 2x", "confidence 60", "power saver", "use the fishm model" — on-device recognition + hotword boost + pinyin-level fuzzy correction (homophones auto-corrected) + multi-turn dialog (clarify/confirm when unsure); long-press the mic for examples |
 | 捏合变焦 / Pinch zoom | 预览区双指捏合调焦（硬件变焦），倍数持久化 / Two-finger pinch on the preview adjusts (hardware) zoom; the ratio persists |
 
 ---
@@ -95,6 +96,12 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 **中文** 应用每小时后台检查一次 GitHub Releases（24 小时内不重复，可在更新面板关闭自动检查）。发现新版本时弹出更新提示（版本号、更新说明、安装包大小），支持"立即更新 / 稍后提醒（3 天）/ 跳过此版本"。下载采用 HTTP 流式 + Range 断点续传，网络中断自动重试最多 5 次（3s/10s/30s/60s 退避）；下载完成后经系统保存选择器存入"下载"目录，点击 hap 文件即可安装（普通应用无静默安装权限）。GitHub 无法访问（国内网络常见）时可一键打开发布页用浏览器下载。入口：HUD 第一行电池旁的版本胶囊（`v2.2` 灰色 / `⤓ 新版本` 青色）。
 
 **English** The app checks GitHub Releases hourly in the background (throttled to once per 24 hours; auto-check can be disabled in the update panel). When a newer version is found, an update dialog pops up (version, release notes, package size) with "Update now / Remind me later (3 days) / Skip this version". Downloads are streamed with HTTP Range resume and up to 5 automatic retries (3s/10s/30s/60s backoff); the finished hap is saved to the Downloads folder via the system save picker — tap it to install (ordinary apps cannot install silently). When GitHub is unreachable (common on mainland networks), one tap opens the releases page in a browser. Entry point: the version pill next to the battery in the first HUD row (`v2.2` gray / `⤓ new version` cyan).
+
+### 语音命令 / Voice Commands
+
+**中文** 在"识别设置"中开启"语音命令"后，屏幕右侧出现悬浮麦克风 🎤，点按即说、再点取消。识别全程离线（系统 CoreSpeechKit 端侧引擎），说"开始录像、截图、打开人脸识别、关闭运动检测、变焦两倍、置信度60、录像时长20秒、省电模式、用 fishm 模型、打开识别设置、现在什么状态、撤销、帮助"等即可控制全部功能。三层 AI 纠错：① 命令词与模型名作为热词注入识别引擎，专有词优先命中；② 识别结果经拼音级模糊匹配 NLU，"录象/鹿象"等同音误识别自动纠正回"录像"，并按置信度打分排序；③ 不确定时进入多轮对话——两个候选分数接近会追问"你是想要【录像】还是【识别】？"，只听到"打开"会追问"打开什么？"，低置信度会先确认再执行。语音播报关闭时命令反馈仍然播报（语音交互必须有反馈），尊重系统静音。
+
+**English** With "Voice commands" enabled in Detection Settings, a floating mic 🎤 appears on the right edge of the screen — tap to talk, tap again to cancel. Recognition is fully offline (the system CoreSpeechKit on-device engine): say "start recording, take a photo, enable face recognition, turn off motion detection, zoom 2x, confidence 60, record length 20 seconds, power saver, use the fishm model, open detection settings, what's the status, undo, help" to control every feature. Three layers of AI correction: ① command phrases and model names are injected as hotwords so domain terms are recognized first; ② the recognized text goes through a pinyin-level fuzzy-matching NLU — homophone mis-recognitions like "录象/鹿象" auto-correct back to "录像", with candidates ranked by confidence; ③ uncertain matches enter a multi-turn dialog — two close candidates trigger "did you mean 【record】 or 【detect】?", a bare "enable" asks "enable what?", and low-confidence commands are confirmed before executing. Command feedback is spoken even when voice broadcast is off (voice interaction needs feedback), and system silent mode is respected.
 
 ### 性能设计 / Performance Design
 
@@ -207,7 +214,8 @@ entry/src/main/
 │   ├── view/                 # HUD、底部面板、各设置 Sheet、结果弹窗
 │   ├── camera/               # 手机相机 / UVC 相机 / 录像服务
 │   ├── common/               # 模型管理、TTS、电源、设置持久化、USB 扫描
-│   └── core/                 # 媒体控制、定位服务、视觉控制器
+│   └── core/                 # 媒体控制、定位服务、视觉控制器、画中画、更新器、
+│                             #   语音命令（拼音表 / NLU / 离线识别引擎）
 └── resources/rawfile/        # 内置模型与词典 / bundled models & dictionaries
 ```
 
@@ -218,7 +226,7 @@ entry/src/main/
 | 权限 / Permission | 用途 / Purpose |
 |---|---|
 | ohos.permission.CAMERA | 相机预览与录像 / Camera preview and recording |
-| ohos.permission.MICROPHONE | 录像采集声音 / Audio for recordings |
+| ohos.permission.MICROPHONE | 录像采集声音、离线语音命令识别 / Audio for recordings, offline voice-command recognition |
 | ohos.permission.LOCATION / APPROXIMATELY_LOCATION | HUD 显示位置地名 / Place name in the HUD |
 | ohos.permission.INTERNET | OCR/模型可选在线词典通道 / Optional online dictionary channel |
 
