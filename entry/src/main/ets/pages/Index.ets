@@ -58,12 +58,16 @@ import { RecTimerPopup } from '../view/RecTimerPopup';
 import { OcrResultPopup } from '../view/OcrResultPopup';
 import { TableResultPopup, TableCellData } from '../view/TableResultPopup';
 import { UsbDeviceSheet } from '../view/UsbDeviceSheet';
+import { UpdateSheet } from '../view/UpdateSheet';
+import { UpdateDialog } from '../view/UpdateDialog';
+import { PipManager } from '../core/PipManager';
+import { AppUpdater, ReleaseInfo } from '../core/AppUpdater';
 import { VisionController } from '../core/VisionController';
 import { MediaController } from '../core/MediaController';
 import { Det, Merged } from '../common/Types';
 import { SpeechService } from '../common/SpeechService';
 import { POWER_PRESETS } from '../common/PowerPresets';
-import { common, abilityAccessCtrl, Permissions } from '@kit.AbilityKit';
+import { common, abilityAccessCtrl, Permissions, bundleManager } from '@kit.AbilityKit';
 import { promptAction, display, window } from '@kit.ArkUI';
 import entry from 'libentry.so';
 import { image } from '@kit.ImageKit';
@@ -546,6 +550,46 @@ struct Index {
   @State batteryCharging: boolean = false;
   private batteryTimer: number = -1;
 
+  // ═══════════════ 画中画后台识别（PipManager）═══════════════
+  // ★ 退后台不拆管线，以悬浮小窗继续预览+识别（录像/播报/自动录像不中断）
+  @State pipEnabled: boolean = false;
+  private pipManager: PipManager = new PipManager();
+  // PiP 控制器是否创建成功（系统不支持/开关关闭则 false，退后台走原释放路径）
+  private pipReady: boolean = false;
+  // 退后台时相机是否被 PiP 保活（onPageShow 据此跳过重建直接恢复）
+  private cameraKeptAlive: boolean = false;
+  // 3s 看门狗：退后台赌系统自动拉起小窗，超时未拉起走原释放路径省电
+  private pipWatchdog: number = -1;
+  // 小窗 HUD 芯片 1s 轮询（REC/鱼数）
+  private pipHudTimer: number = -1;
+  // 小窗播放/暂停控件当前态（暂停=停 YOLO 推理）
+  private pipPaused: boolean = false;
+
+  // ═══════════════ 应用内更新（AppUpdater + GitHub Releases）═══════════════
+  @State appVersion: string = '';
+  @State updateSheetVisible: boolean = false;
+  @State updateDialogVisible: boolean = false;
+  // 检查中 / 下载中 / 下载进度 0~100 / 失败原因（弹窗四态驱动）
+  @State updateChecking: boolean = false;
+  @State updateDownloading: boolean = false;
+  @State updateProgressPct: number = 0;
+  @State updateErrorMsg: string = '';
+  // 有新版本（HUD 胶囊变"⤓ 新版本"）/ 自动检查开关 / 上次检查时间文案
+  @State updateAvailable: boolean = false;
+  @State updateAutoCheck: boolean = true;
+  @State updateLastCheckText: string = '';
+  // 最新版本信息（检查成功后填充）
+  @State updateInfo: ReleaseInfo | null = null;
+  private updater: AppUpdater = new AppUpdater();
+  // 每小时检查 tick 定时器 + 上次检查时间戳（24h 节流）+ 稍后提醒截止 + 跳过版本 tag
+  private updateTimer: number = -1;
+  private updateLastCheck: number = 0;
+  private updateSnoozeUntil: number = 0;
+  private updateSkipTag: string = '';
+  // 检查进行中防重入 / 下载取消标记
+  private updateCheckingNow: boolean = false;
+  private updateDownloadCanceled: boolean = false;
+
   // ★ USB 层（usbManager）设备列表弹窗，照抄 Android UsbManager + 设备选择 Dialog
   @State usbSheetVisible: boolean = false;
   @State usbDevices: UsbCamInfo[] = [];
@@ -652,7 +696,9 @@ struct Index {
         aiDenoise: this.aiDenoise,
         aiClarity: this.aiClarity,
         aiColorRestore: this.aiColorRestore,
-        faceEnabled: this.faceEnabled
+        faceEnabled: this.faceEnabled,
+        pipEnabled: this.pipEnabled,
+        updateAutoCheck: this.updateAutoCheck
       });
     }, 150);
   }
@@ -781,6 +827,20 @@ struct Index {
       this.aiClarity = s.aiClarity;
       this.aiColorRestore = s.aiColorRestore;
       this.faceEnabled = s.faceEnabled;
+      // ★ 画中画后台识别 + 应用内更新设置恢复
+      this.pipEnabled = s.pipEnabled;
+      this.updateAutoCheck = s.updateAutoCheck;
+      this.updateSkipTag = s.updateSkipTag;
+      this.updateSnoozeUntil = s.updateSnoozeUntil;
+      this.updateLastCheck = s.updateLastCheck;
+      this.updateLastCheckText = this.fmtCheckTimeFrom(this.updateLastCheck);
+      // ★ 当前版本号（bundleManager）：更新比较与 HUD 版本胶囊展示
+      try {
+        const bi = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+        this.appVersion = bi.versionName;
+      } catch (_) {
+        this.appVersion = '';
+      }
       // ★ 旧版迁移（一次性）：仅存增强参数但模式为关 → 升级为非AI增强模式；
       //   之前每次启动都执行，用户选"关闭"重启后被强行改回——加迁移标记只跑一次
       if (!s.usbParamModeMigrated) {
@@ -864,6 +924,8 @@ struct Index {
       }
       // ★ 电池电量：置信度旁显示，60s 轮询刷新
       this.startBatteryPoll();
+      // ★ 应用更新：每小时 tick + 启动 20s 首检（内部 24h 节流）
+      this.scheduleUpdateChecks();
       if (!this.yoloEnabled) {
         try { entry.setYoloEnabled(false); } catch (_) {}
       }
@@ -952,41 +1014,50 @@ struct Index {
   }
 
   // ═══════════════ 生命周期：onPageHide / onPageShow（后台与前台切换）═══════════════
-  // onHide：停管线/停 USB 取流（省带宽防发热）/带超时释放相机；
-  // onShow：按退出前摄像头恢复（USB 设备在则重连+重新授权，拔出回退后置）
+  // onHide：PiP 保活开启且控制器就绪 → 不拆管线赌系统拉起悬浮小窗（3s 看门狗
+  //         兜底）；否则走 stopForBackground（停管线/停 USB/带超时释放相机）。
+  // onShow：PiP 保活回来 → 停小窗+重绑 surface+恢复推理，不重建相机；
+  //         普通回来 → 按退出前摄像头恢复（USB 设备在则重连，拔出回退后置）
   onPageHide(): void {
     this.pageHidden = true;
     this.persistSettings();
-    // ★ 退后台停止进行中的语音播报
-    this.speech.stop();
-    this.previewReady = false;
-    this.started = false;
-    this.vision.stop();
-    // ★ USB 取流后台继续占 USB 带宽：息屏/退后台先停流，回前台重连恢复到 USB
-    if (this.cameraPosition === 2) {
-      this.stopUvcWatchdog();
-      try { entry.uvcStopStreaming(); } catch (_) {}
-      try { entry.uvcDisconnect(); } catch (_) {}
-      this.usbPipeHandle = null;
+    // ★ PiP 保活：预览在跑 + 控制器就绪 → 相机/管线/识别原样保留，
+    //   尝试主动拉起小窗并武装 3s 看门狗（未拉起 → stopForBackground 省电）
+    if (this.pipEnabled && this.pipReady && this.previewReady && !this.switching) {
+      this.cameraKeptAlive = true;
+      this.pipManager.start();
+      this.armPipWatchdog();
+      return;
     }
-    this.releasingCamera = true;
-    const self = this;
-    (async (): Promise<void> => {
-      // ★ 带 3s 超时释放：onPageHide 时相机服务卡死会锁死 releasingCamera，
-      //   onPageShow 恢复重试全部耗尽 → 永远黑屏
-      await self.releaseCameraSafe();
-      // ★ 顺序不可反：必须先停相机会话（断流）再停 native 管线——
-      //   管线释放会销毁 ImageReceiver 消费端，相机 HAL 仍在产帧时
-      //   会触发 Bufferqueue 41202000 连环报错（生产者往已释放 surface 送帧）
-      try { entry.stopPipeline(); } catch (_) {}
-      self.releasingCamera = false;
-    })();
+    this.stopForBackground();
   }
 
   onPageShow(): void {
     if (!this.pageHidden) return;
     this.pageHidden = false;
+    this.disarmPipWatchdog();
+    this.maybeCheckUpdate(false);
     const self = this;
+    // ★ PiP 保活恢复：管线一直在跑，无需重建相机——停小窗、恢复推理开关、
+    //   surface 变了重绑、恢复识别结果分发即可
+    if (this.cameraKeptAlive) {
+      this.cameraKeptAlive = false;
+      this.stopPipHudLoop();
+      this.pipPaused = false;
+      this.pipManager.stop();
+      this.pipManager.setPlayPausePlaying(true);
+      if (this.yoloEnabled) {
+        try { entry.setYoloEnabled(true); } catch (_) {}
+      }
+      try {
+        const previewId = this.xcController.getXComponentSurfaceId();
+        if (previewId && previewId !== this.lastAttachedPreviewId) {
+          entry.attachPreviewSurface(previewId);
+          this.lastAttachedPreviewId = previewId;
+        }
+      } catch (_) {}
+      return;
+    }
     const tryStart = (retries: number): void => {
       if ((self.switching || self.releasingCamera) && retries > 0) {
         setTimeout(() => tryStart(retries - 1), 100);
@@ -3021,6 +3092,8 @@ struct Index {
       if (ratio < 0.4) ratio = 0.4;
       if (ratio > 1) ratio = 1;
       try { entry.setLocationBottomRatio(ratio); } catch (_) {}
+      // ★ 预览比例变化同步小窗内容比例（画中画窗口不变形）
+      try { this.pipManager.updateContentSize(Math.round(this.previewW), Math.round(this.previewH)); } catch (_) {}
     } catch (_) {
       this.previewW = 0;
       this.previewH = 0;
@@ -3605,6 +3678,11 @@ struct Index {
     if (this.batteryTimer !== -1) { clearInterval(this.batteryTimer); this.batteryTimer = -1; }
     if (this.geoTimer !== -1) { clearTimeout(this.geoTimer); this.geoTimer = -1; }
     this.stopFaceInfoPoll();
+    // ★ 画中画 + 更新检查清理：看门狗/HUD 轮询/小时 tick/小窗销毁
+    this.disarmPipWatchdog();
+    this.stopPipHudLoop();
+    if (this.updateTimer >= 0) { clearInterval(this.updateTimer); this.updateTimer = -1; }
+    try { this.pipManager.destroy(); } catch (_) {}
     try {
       if (this.displayChangeListener) display.off('change', this.displayChangeListener);
     } catch (_) {}
@@ -3627,6 +3705,309 @@ struct Index {
       try { await self.alertService.release(); } catch (_) {}
       try { entry.stopPipeline(); } catch (_) {}
     })();
+  }
+
+  // ═══════════════ 画中画后台识别（PipManager 保活）═══════════════
+  // stopForBackground：退后台标准释放路径（原 onPageHide 逻辑抽出）——
+  //   停语音/停分发/停 USB 取流/带超时释放相机/停 native 管线
+  private stopForBackground(): void {
+    this.cameraKeptAlive = false;
+    this.disarmPipWatchdog();
+    this.stopPipHudLoop();
+    this.speech.stop();
+    this.previewReady = false;
+    this.started = false;
+    this.vision.stop();
+    // ★ USB 取流后台继续占 USB 带宽：息屏/退后台先停流，回前台重连恢复到 USB
+    if (this.cameraPosition === 2) {
+      this.stopUvcWatchdog();
+      try { entry.uvcStopStreaming(); } catch (_) {}
+      try { entry.uvcDisconnect(); } catch (_) {}
+      this.usbPipeHandle = null;
+    }
+    this.releasingCamera = true;
+    const self = this;
+    (async (): Promise<void> => {
+      // ★ 带 3s 超时释放：相机服务卡死会锁死 releasingCamera，
+      //   onPageShow 恢复重试全部耗尽 → 永远黑屏
+      await self.releaseCameraSafe();
+      // ★ 顺序不可反：必须先停相机会话（断流）再停 native 管线——
+      //   管线释放会销毁 ImageReceiver 消费端，相机 HAL 仍在产帧时
+      //   会触发 Bufferqueue 41202000 连环报错（生产者往已释放 surface 送帧）
+      try { entry.stopPipeline(); } catch (_) {}
+      self.releasingCamera = false;
+    })();
+  }
+
+  // ★ 武装 3s 看门狗：退后台赌系统自动拉起小窗，超时未拉起走标准释放省电
+  private armPipWatchdog(): void {
+    this.disarmPipWatchdog();
+    this.pipWatchdog = setTimeout((): void => {
+      this.pipWatchdog = -1;
+      if (this.pageHidden && this.cameraKeptAlive && !this.pipManager.isStarted()) {
+        this.appendUvcLog('pip: watchdog fired, fallback to background release');
+        this.stopForBackground();
+      }
+    }, 3000);
+  }
+
+  private disarmPipWatchdog(): void {
+    if (this.pipWatchdog >= 0) {
+      clearTimeout(this.pipWatchdog);
+      this.pipWatchdog = -1;
+    }
+  }
+
+  // ★ 小窗 HUD 芯片 1s 轮询：REC 红点+秒数 / 识别计数刷进 @Observed 数据
+  private startPipHudLoop(): void {
+    this.stopPipHudLoop();
+    this.pipHudTimer = setInterval((): void => {
+      this.pipManager.updateHud(this.isRecording, this.recordSec, this.detList.length);
+    }, 1000);
+  }
+
+  private stopPipHudLoop(): void {
+    if (this.pipHudTimer >= 0) {
+      clearInterval(this.pipHudTimer);
+      this.pipHudTimer = -1;
+    }
+  }
+
+  // ★ PiP 生命周期：STARTED → 解除看门狗 + surface 迁移重绑 + 启 HUD 轮询；
+  //   STOPPED/ERROR → 停 HUD 轮询 + 600ms 延迟兜底（后台期间用户关小窗 →
+  //   释放相机省电；若期间已回前台则 onPageShow 已接管，什么都不做）
+  private handlePipStateChange(started: boolean): void {
+    if (started) {
+      this.disarmPipWatchdog();
+      try {
+        const previewId = this.xcController.getXComponentSurfaceId();
+        if (previewId && previewId !== this.lastAttachedPreviewId) {
+          entry.attachPreviewSurface(previewId);
+          this.lastAttachedPreviewId = previewId;
+        }
+      } catch (_) {}
+      this.startPipHudLoop();
+      return;
+    }
+    this.stopPipHudLoop();
+    setTimeout((): void => {
+      if (this.pageHidden && this.cameraKeptAlive) {
+        this.appendUvcLog('pip: closed in background, fallback to background release');
+        this.stopForBackground();
+      }
+    }, 600);
+  }
+
+  // ★ 小窗播放/暂停：暂停=停 YOLO 推理（相机/录像/播报不停）；恢复=按原开关续推
+  private handlePipPause(paused: boolean): void {
+    this.pipPaused = paused;
+    try { entry.setYoloEnabled(!paused && this.yoloEnabled); } catch (_) {}
+    this.pipManager.setPlayPausePlaying(!paused);
+  }
+
+  // ★ setupPip：预览就绪后创建 PiP 控制器（幂等；系统不支持/开关关闭静默跳过）
+  private async setupPip(): Promise<void> {
+    if (!this.pipEnabled || this.pipReady) return;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const ok = await this.pipManager.create(ctx, this.xcController,
+        (started: boolean): void => { this.handlePipStateChange(started); },
+        (paused: boolean): void => { this.handlePipPause(paused); });
+      this.pipReady = ok;
+      if (ok) this.pipManager.setAutoStart(true);
+    } catch (_) {
+      this.pipReady = false;
+    }
+  }
+
+  // ★ 画中画开关（识别设置弹窗）：开 → 创建控制器；关 → 弃用（下次退后台走释放）
+  private togglePip(): void {
+    this.pipEnabled = !this.pipEnabled;
+    if (this.pipEnabled) {
+      this.setupPip();
+      this.showToast('已开启画中画：退出应用后悬浮识别');
+    } else {
+      this.pipReady = false;
+      this.pipManager.stop();
+      this.showToast('已关闭画中画后台识别');
+    }
+    this.persistSettings();
+  }
+
+  // ═══════════════ 应用内更新（AppUpdater + GitHub Releases）═══════════════
+  // ★ 每小时 tick + 启动 20s 首检（maybeCheckUpdate 内部 24h 节流 + 提醒门控）
+  private scheduleUpdateChecks(): void {
+    if (this.updateTimer >= 0) {
+      clearInterval(this.updateTimer);
+      this.updateTimer = -1;
+    }
+    if (!this.updateAutoCheck) return;
+    this.updateTimer = setInterval((): void => {
+      this.maybeCheckUpdate(false);
+    }, 3600 * 1000);
+    setTimeout((): void => {
+      this.maybeCheckUpdate(false);
+    }, 20000);
+  }
+
+  // ★ 自动检查门控：24h 内不重复 + 稍后提醒期内不打扰；手动检查绕过全部门控
+  private maybeCheckUpdate(manual: boolean): void {
+    if (!manual) {
+      if (!this.updateAutoCheck) return;
+      const now = Date.now();
+      if (now - this.updateLastCheck < 24 * 3600 * 1000) return;
+      if (this.updateSnoozeUntil > now) return;
+    }
+    this.checkUpdate(manual);
+  }
+
+  // ★ 检查更新：GitHub releases/latest（内部 3 次重试）；
+  //   发现新版本 → 弹更新窗（跳过过的版本只亮胶囊不弹窗）；已是最新 → toast
+  private checkUpdate(manual: boolean): void {
+    if (this.updateCheckingNow) return;
+    this.updateCheckingNow = true;
+    this.updateChecking = true;
+    this.updateErrorMsg = '';
+    if (manual) {
+      this.updateDialogVisible = true;
+    }
+    this.updater.checkLatest().then((info: ReleaseInfo): void => {
+      this.updateCheckingNow = false;
+      this.updateChecking = false;
+      this.updateLastCheck = Date.now();
+      this.updateLastCheckText = this.fmtCheckTimeFrom(this.updateLastCheck);
+      SettingsStore.save({ updateLastCheck: this.updateLastCheck });
+      if (this.updater.isNewer(info.tag, this.appVersion)) {
+        this.updateInfo = info;
+        this.updateAvailable = true;
+        if (this.updateSkipTag === info.tag) {
+          if (manual) {
+            this.updateDialogVisible = false;
+            this.showToast(`新版本 ${info.tag} 已被跳过`);
+          }
+          return;
+        }
+        this.updateDialogVisible = true;
+      } else {
+        this.updateAvailable = false;
+        if (manual) {
+          this.updateDialogVisible = false;
+          this.showToast('已是最新版本');
+        }
+      }
+    }).catch((_e: BusinessError): void => {
+      this.updateCheckingNow = false;
+      this.updateChecking = false;
+      if (manual) {
+        this.updateErrorMsg = '检查更新失败：无法访问 GitHub，请检查网络后重试';
+      } else {
+        this.updateDialogVisible = false;
+      }
+    });
+  }
+
+  // ★ 自动检查开关切换（更新面板）：开 → 重启检查循环；关 → 停 tick
+  private toggleUpdateAutoCheck(): void {
+    this.updateAutoCheck = !this.updateAutoCheck;
+    this.scheduleUpdateChecks();
+    this.persistSettings();
+  }
+
+  // ★ 稍后提醒：3 天内不再弹窗（胶囊仍提示）
+  private snoozeUpdate(): void {
+    this.updateSnoozeUntil = Date.now() + 3 * 24 * 3600 * 1000;
+    SettingsStore.save({ updateSnoozeUntil: this.updateSnoozeUntil });
+    this.updateDialogVisible = false;
+    this.showToast('3 天内不再提醒该版本');
+  }
+
+  // ★ 跳过此版本：该 tag 永不弹窗（胶囊仍提示，面板可手动查看）
+  private skipUpdate(): void {
+    if (this.updateInfo !== null) {
+      this.updateSkipTag = this.updateInfo.tag;
+      SettingsStore.save({ updateSkipTag: this.updateSkipTag });
+    }
+    this.updateDialogVisible = false;
+    this.showToast('已跳过该版本');
+  }
+
+  // ★ 立即更新：流式下载（断点续传+5 次重试）→ 系统保存选择器存 hap →
+  //   用户在下载目录点 hap 由系统安装器安装（普通应用无静默安装权限）
+  private startUpdateDownload(): void {
+    if (this.updateInfo === null) return;
+    const info = this.updateInfo;
+    if (info.assetUrl.length === 0) {
+      this.updateErrorMsg = '该版本未提供安装包，请打开发布页下载';
+      return;
+    }
+    this.updateDownloadCanceled = false;
+    this.updateDownloading = true;
+    this.updateProgressPct = 0;
+    this.updateErrorMsg = '';
+    const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+    this.updater.downloadHap(ctx, info, (pct: number): void => {
+      this.updateProgressPct = pct;
+    }).then((path: string): void => {
+      this.updateDownloading = false;
+      if (this.updateDownloadCanceled) return;
+      const fileName = `HmFish_${info.tag}.hap`;
+      this.updater.saveToPublicDir(ctx, path, fileName).then((ok: boolean): void => {
+        if (this.updateDownloadCanceled) return;
+        if (ok) {
+          this.updateDialogVisible = false;
+          this.showToast(`已保存 ${fileName} 到下载目录，请点击该文件安装`);
+        } else {
+          this.updateErrorMsg = '未选择保存位置；点击"立即更新"可重新保存';
+        }
+      });
+    }).catch((e: BusinessError): void => {
+      this.updateDownloading = false;
+      if (!this.updateDownloadCanceled) {
+        this.updateErrorMsg = `下载失败：${e.message}`;
+      }
+    });
+  }
+
+  // ★ 取消下载：中断重试循环，回到"发现新版本"态（已下部分保留续传）
+  private cancelUpdateDownload(): void {
+    this.updateDownloadCanceled = true;
+    this.updater.cancel();
+    this.updateDownloading = false;
+    this.updateProgressPct = 0;
+  }
+
+  // ★ 关闭更新弹窗：下载中先取消下载再隐藏
+  private closeUpdateDialog(): void {
+    if (this.updateDownloading) {
+      this.cancelUpdateDownload();
+    }
+    this.updateDialogVisible = false;
+  }
+
+  // ★ 打开发布页（浏览器兜底：GitHub 不可达/无 hap 资产时手动下载）
+  private openReleasesPage(): void {
+    const url = this.updateInfo !== null && this.updateInfo.url.length > 0
+      ? this.updateInfo.url : 'https://github.com/AnDouDou188188/HmFish/releases';
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      ctx.openLink(url, { appLinkingOnly: false });
+    } catch (_) {
+      this.showToast('无法打开浏览器，请手动访问 GitHub 发布页');
+    }
+  }
+
+  // ★ 安装包大小文案（弹窗展示；资产无大小信息返回空）
+  private updateSizeText(): string {
+    if (this.updateInfo === null || this.updateInfo.assetSize <= 0) return '';
+    return `${(this.updateInfo.assetSize / 1024 / 1024).toFixed(1)} MB`;
+  }
+
+  // ★ 时间戳 → "M月d日 HH:mm"（更新面板上次检查时间）
+  private fmtCheckTimeFrom(ts: number): string {
+    if (ts <= 0) return '';
+    const d = new Date(ts);
+    const two = (n: number): string => n < 10 ? '0' + n : `${n}`;
+    return `${d.getMonth() + 1}月${d.getDate()}日 ${two(d.getHours())}:${two(d.getMinutes())}`;
   }
 
   // ═══════════════ build()：全屏 Stack 层级结构 ═══════════════
@@ -3658,6 +4039,8 @@ struct Index {
               const rawId = this.rawCtrl.getXComponentSurfaceId();
               const previewId = this.xcController.getXComponentSurfaceId();
               if (rawId && previewId) this.startOrRestoreCamera(rawId, previewId);
+              // ★ PiP 控制器随预览就绪创建（幂等；开关关闭/系统不支持则静默跳过）
+              this.setupPip();
             }, 200);
           })
         // ★ 触摸覆盖层：承载点击（命中人脸识别框 → 弹详情面板）与双指捏合
@@ -3736,7 +4119,11 @@ struct Index {
         onShowOcrPopup: (): void => { this.showOcrPopup(); },
         // ★ 表格识别：点击"▦ 表格"徽标对当前画面做一次 PP-Structure 表格结构识别
         tableBusy: this.tableBusy,
-        onRecognizeTable: (): void => { this.doRecognizeTable(); }
+        onRecognizeTable: (): void => { this.doRecognizeTable(); },
+        // ★ 版本/更新胶囊（电池旁）：v2.1 / ⤓ 新版本，点击弹应用更新面板
+        appVersion: this.appVersion,
+        updateAvailable: this.updateAvailable,
+        onShowUpdateSheet: (): void => { this.updateSheetVisible = true; }
       })
 
       // ★ 人脸详情弹层（点 HUD 人脸行"详细"胶囊 / 点预览识别框弹出）：
@@ -3934,6 +4321,8 @@ struct Index {
           detectSpeakOn: this.detectSpeakOn,
           recordSoundOn: this.recordSoundOn,
           recordSoundName: this.recordSoundName,
+          // ★ 画中画后台识别开关（退后台悬浮小窗继续预览+识别）
+          pipEnabled: this.pipEnabled,
           onClose: (): void => { this.sheetVisible = false; },
           onSelectModel: (id: string): void => { this.selectModel(id); },
           onToggleLabel: (idx: number): void => { this.toggleAlertLabel(idx); },
@@ -3945,7 +4334,8 @@ struct Index {
           onSoundToggle: (): void => { this.toggleRecordSound(); },
           onPickSound: (): void => { this.pickRecordSound(); },
           onPreviewSound: (): void => { this.previewRecordSound(); },
-          onResetSound: (): void => { this.resetRecordSound(); }
+          onResetSound: (): void => { this.resetRecordSound(); },
+          onPipToggle: (): void => { this.togglePip(); }
         })
       }
 
@@ -4431,6 +4821,47 @@ struct Index {
         .justifyContent(FlexAlign.End)
         .backgroundColor('rgba(0,0,0,0.55)')
         .onClick((): void => { this.usbSheetVisible = false; })
+      }
+
+      // ★ 应用更新面板（点 HUD 版本胶囊弹出：当前版本/检查更新/自动检查/发布页）
+      if (this.updateSheetVisible) {
+        UpdateSheet({
+          appVersion: this.appVersion,
+          latestTag: this.updateInfo !== null ? this.updateInfo.tag : '',
+          updateAvailable: this.updateAvailable,
+          checking: this.updateChecking,
+          lastCheckText: this.updateLastCheckText,
+          autoCheck: this.updateAutoCheck,
+          onClose: (): void => { this.updateSheetVisible = false; },
+          onCheckNow: (): void => { this.checkUpdate(true); },
+          onAutoCheckToggle: (): void => { this.toggleUpdateAutoCheck(); },
+          onViewUpdate: (): void => {
+            this.updateSheetVisible = false;
+            this.updateDialogVisible = true;
+          },
+          onOpenReleases: (): void => { this.openReleasesPage(); }
+        })
+      }
+
+      // ★ 更新弹窗（检查中/发现新版本/下载进度/失败重试四态居中卡片）
+      if (this.updateDialogVisible) {
+        UpdateDialog({
+          tag: this.updateInfo !== null ? this.updateInfo.tag : '',
+          versionName: this.updateInfo !== null ? this.updateInfo.name : '',
+          notes: this.updateInfo !== null ? this.updateInfo.notes : '',
+          sizeText: this.updateSizeText(),
+          checking: this.updateChecking,
+          downloading: this.updateDownloading,
+          progressPct: this.updateProgressPct,
+          errorMsg: this.updateErrorMsg,
+          onUpdateNow: (): void => { this.startUpdateDownload(); },
+          onSnooze: (): void => { this.snoozeUpdate(); },
+          onSkip: (): void => { this.skipUpdate(); },
+          onRetry: (): void => { this.checkUpdate(true); },
+          onOpenReleases: (): void => { this.openReleasesPage(); },
+          onCancelDownload: (): void => { this.cancelUpdateDownload(); },
+          onClose: (): void => { this.closeUpdateDialog(); }
+        })
       }
     }
     .width('100%').height('100%').backgroundColor('#000')

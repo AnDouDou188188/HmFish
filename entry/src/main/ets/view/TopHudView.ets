@@ -89,6 +89,10 @@ export struct TopHudView {
   @Prop faceHudRows: FaceHudRow[] = [];
   // ★ 画面增强模式（画面徽标按设置变色区分）：0关/1非AI/2 AI增强
   @Prop usbEnhanceMode: number = 0;
+  // ★ 应用版本与更新：版本胶囊（电池旁，点击弹更新面板）；
+  //   有新版本时胶囊变青色"⤓ 新版本"，否则灰色 v2.1
+  @Prop appVersion: string = '';
+  @Prop updateAvailable: boolean = false;
 
   // ── 与 Index 的交互回调：选摄像头/各功能开关（短按）与长按弹设置/
   //    透明度实时提交/各弹窗入口/人脸详情/表格识别触发 ──
@@ -109,6 +113,8 @@ export struct TopHudView {
   onRecognizeTable?: () => void;
   // ★ 表格识别中：徽标显示转圈，防重复触发
   @Prop tableBusy: boolean = false;
+  // ★ 版本胶囊点击：弹出应用更新面板（检查更新/自动检查/新版本下载）
+  onShowUpdateSheet?: () => void;
 
   // ★ 透明度滑条本地缓冲：滑条绑本地值切断 @Prop 回写回路（否则拖动会被打断/回跳），
   //   拖动中实时提交父组件（HUD 背景即时变化）
@@ -219,6 +225,16 @@ export struct TopHudView {
               .fontWeight(FontWeight.Bold)
               .opacity(this.hudOpacity)
           }
+          // ★ 版本/更新胶囊（电池旁）：有新版本青色"⤓ 新版本"，否则灰色 v2.1；
+          //   点击弹应用更新面板（检查更新/下载安装包）
+          Text(this.updateAvailable ? '⤓ 新版本' : `v${this.appVersion}`)
+            .fontSize(9).fontWeight(FontWeight.Bold)
+            .fontColor(this.updateAvailable ? '#062A33' : '#B7BDC7')
+            .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+            .borderRadius(7)
+            .backgroundColor(this.updateAvailable ? '#00E5FF' : 'rgba(255,255,255,0.10)')
+            .opacity(this.hudOpacity)
+            .onClick((): void => { this.onShowUpdateSheet?.(); })
         }.width('100%')
 
         // ★ 折叠态：以下整块隐藏，只留第一行（HUD 徽标切换）

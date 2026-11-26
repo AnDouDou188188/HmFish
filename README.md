@@ -1,6 +1,10 @@
 # HmFish — 鸿蒙智能探鱼相机 / Smart Fishing Camera for HarmonyOS
 
-![Version](https://img.shields.io/badge/version-2.1-blue) ![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-green) ![Offline](https://img.shields.io/badge/inference-100%25%20on--device-orange)
+![Version](https://img.shields.io/badge/version-2.2-blue) ![Platform](https://img.shields.io/badge/platform-HarmonyOS%20NEXT-green) ![Offline](https://img.shields.io/badge/inference-100%25%20on--device-orange)
+
+> **v2.2 画中画后台识别 + 应用内自动更新 / PiP background & in-app updates**：微信式画中画悬浮窗（按 Home 退出后相机预览 + YOLO 识别在小窗继续，录像/语音播报/自动录像不中断；小窗 HUD 芯片显示 REC 计时与识别计数，播放/暂停按钮控制推理；识别设置内一键开关，3s 看门狗兜底回退省电路径）· 应用内 GitHub 自动更新（每小时后台检查 + 24h 节流；发现新版本弹窗提示，支持稍后提醒 3 天/跳过此版本；流式下载断点续传 + 5 次自动重试，下载完成存到下载目录一键安装；GitHub 不可达时可打开发布页浏览器下载；HUD 电池旁版本胶囊 `v2.2` / `⤓ 新版本` 点击打开更新面板）
+>
+> **v2.2 WeChat-style PiP & in-app updates**: picture-in-picture floating window keeps camera preview + YOLO detection alive after pressing Home (recording / voice broadcast / auto-record continue uninterrupted; PiP HUD chip shows REC timer and detection count; play/pause button toggles inference; one-tap switch in Detection Settings with a 3s watchdog falling back to the power-saving path) · in-app GitHub auto-updater (hourly background checks with 24h throttle; new-version dialog with 3-day snooze and skip-this-version; streaming download with HTTP Range resume and 5 auto-retries, saved to the Downloads folder for one-tap install; open-the-releases-page browser fallback when GitHub is unreachable; version pill `v2.2` / `⤓ 新版本` next to the battery in the HUD opens the update panel)
 
 > **v2.1 OCR 提效与稳定性 / OCR efficiency & stability**：OpenCV5 静帧门控（64×64 缩略图比对，画面不变不重复推理）· OCR 自适应预处理（暗光 gamma 提亮 + 低对比度直方图裁剪拉伸，普通/票据两种模式共用，低质量帧识别率提升）· 推理前降采样长边 1024 · 模型切换不再卡死（释放引擎移出主线程，修复切换时 appfreeze 闪退）· 表格识别占用引擎时 OCR 自动让路（try-lock 跳过，不抢占 CPU）· OpenCV 线程池上限 4（与 YOLO/人脸/SR 线程预算隔离）· 画面徽标按增强模式变色区分（灰=关/青=增强/紫=AI）· PictureSheet"完成"按钮提交滑条并关闭
 >
@@ -35,6 +39,8 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 | HUD 信息栏 / HUD | 可折叠、透明度可调；模型名、相机信息、电池电量、录像计时；识别数据统一排序（人脸 → YOLO → OCR）；位置地名行在底部面板变焦行上方 / Collapsible with adjustable opacity; model name, camera info, battery, record timer; recognition data in unified order (face → YOLO → OCR); geo place-name row sits above the zoom row in the bottom panel |
 | 语音播报 / Voice broadcast | 按钮操作与识别结果 TTS 播报（如"识别到草鱼3条、鲫鱼1条"），音量可调 / TTS for button actions and detection results (e.g. "3 crucian carp, 1 common carp"), adjustable volume |
 | 能耗档位 / Power presets | 省电/平衡/性能三档（处理间隔），适合长时间挂机 / Power-saver / balanced / performance presets (processing interval) for long sessions |
+| 画中画后台识别 / PiP background | 微信式悬浮小窗：按 Home 退出后预览+识别继续（录像/播报/自动录像不中断），小窗 HUD 显示 REC 计时与识别计数，播放/暂停控制推理；识别设置内开关 / WeChat-style floating window: preview + detection keep running after Home (recording/broadcast/auto-record continue), PiP HUD shows REC timer and detection count, play/pause toggles inference; switchable in Detection Settings |
+| 应用内自动更新 / In-app updates | 每小时检查 GitHub Releases（24h 节流 + 稍后提醒/跳过版本）；新版本弹窗、断点续传下载（5 次自动重试）、存下载目录一键安装、浏览器兜底；HUD 版本胶囊入口 / Hourly GitHub Releases checks (24h throttle + snooze/skip); new-version dialog, resumable download (5 auto-retries), save-to-Downloads one-tap install, browser fallback; version pill in the HUD |
 | 捏合变焦 / Pinch zoom | 预览区双指捏合调焦（硬件变焦），倍数持久化 / Two-finger pinch on the preview adjusts (hardware) zoom; the ratio persists |
 
 ---
@@ -77,6 +83,18 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
 **中文** 画面增强对全部相机（USB 探鱼器 + 手机前后置）生效，共三档：关闭（原始画面）、非 AI（亮度/锐度/对比度/饱和度实时调节，不占用 AI 算力，附"恢复水下默认值"一键推荐参数）、AI 增强。AI 档采用"修复层"异步解耦架构，含四个独立调节、互不干扰的模块：① **超分细节**（QuickSRNetMedium ×4，细节层 delta 增益 0~220% 注入）；② **AI 降噪**（以超分输出为无噪引导图做联合双边滤波，抹平暗光噪点、保留真实边缘纹理）；③ **水下去浊**（暗通道先验去雾，对抗水下浑浊散射，提升透视感）；④ **色彩还原**（灰世界白平衡，拉回水下偏绿/偏蓝色偏、补偿红通道衰减）。相机线程每帧照常渲染基底（全帧率，永不因推理丢帧），SR 工作线程以自身节奏（约 2~7Hz）异步产出三张"修复层"快照（细节/降噪/去浊+色彩，显示分辨率、int8、软限幅），相机帧取最新层按龄衰减合成（窗口内全强度，之后 400ms 线性淡出），层间 65/35 时域混合消除闪烁；SR 网格分辨率自适应（2/4/8 倍增梯子，带滞回与死区防震荡），推理过慢时自动升档保流畅。去浊与色彩还原在微缩图（长边 128）上估计环境光，纯低频校正，时域天然稳定不闪烁。
 
 **English** Enhancement applies to all cameras (USB fish finder + phone front/rear) with three modes: off (raw), non-AI (real-time brightness/sharpness/contrast/saturation, no AI cost, plus one-tap underwater defaults), and AI. The AI mode uses an asynchronous "repair-layer" architecture with four independently adjustable modules: ① **SR detail** (QuickSRNetMedium ×4, detail-layer delta injected at 0–220% gain); ② **AI denoise** (joint bilateral filtering guided by the noise-free SR output — smooths low-light noise while preserving true edges); ③ **underwater dehaze** (dark-channel-prior defogging that fights turbid-water scattering and improves depth perception); ④ **color restoration** (gray-world white balance that pulls back the green/blue underwater cast and compensates red-channel attenuation). The camera thread renders the base frame every time (full frame rate, never dropping frames for inference), while the SR worker produces three repair-layer snapshots (detail / denoise / dehaze+color, at display resolution, int8, soft-clamped) at its own pace (~2–7 Hz); each frame composites the latest layers with age-based fading (full strength within the window, then a 400 ms linear fade), and 65/35 temporal blending removes flicker. The SR grid adapts on a 2/4/8 ladder with hysteresis, stepping up automatically when inference falls behind. Dehaze and color are estimated on a tiny (128-px long side) thumbnail — pure low-frequency correction that is temporally stable by construction.
+
+### 画中画后台识别 / Picture-in-Picture Background Detection
+
+**中文** 在"识别设置"中开启"画中画后台识别"后，按 Home 键退出应用时相机管线不拆除，预览画面以画中画悬浮小窗继续显示（微信视频通话式体验）：YOLO 识别、录像、语音播报、识别触发自动录像全部不中断。小窗内叠加 HUD 芯片（REC 红点 + 录像计时 + "鱼 N" 识别计数，1s 刷新），底部播放/暂停按钮控制识别推理的暂停与恢复（相机与录像不受影响）。回到应用后自动关闭小窗、恢复全屏预览；小窗被用户关闭且应用仍在后台时，自动走原省电释放路径（停管线、释放相机）。系统未开启"自动启动画中画"（设置 → 智慧多窗）时，3s 看门狗兜底回退省电路径，不会黑屏挂死。
+
+**English** With "PiP background detection" enabled in Detection Settings, pressing Home no longer tears down the camera pipeline — the preview continues in a picture-in-picture floating window (WeChat video-call style): YOLO detection, recording, voice broadcast, and detection-triggered auto recording all keep running. The PiP window overlays a HUD chip (REC dot + record timer + "fish N" detection count, refreshed every second), and its play/pause button toggles inference (camera and recording are unaffected). Returning to the app closes the window and restores the full-screen preview; if the user dismisses the window while the app is in the background, the original power-saving path takes over (stop pipeline, release camera). When the system "auto-start picture-in-picture" switch (Settings → Smart Multi-Window) is off, a 3-second watchdog falls back to the power-saving path instead of hanging.
+
+### 应用内自动更新 / In-App Auto-Update
+
+**中文** 应用每小时后台检查一次 GitHub Releases（24 小时内不重复，可在更新面板关闭自动检查）。发现新版本时弹出更新提示（版本号、更新说明、安装包大小），支持"立即更新 / 稍后提醒（3 天）/ 跳过此版本"。下载采用 HTTP 流式 + Range 断点续传，网络中断自动重试最多 5 次（3s/10s/30s/60s 退避）；下载完成后经系统保存选择器存入"下载"目录，点击 hap 文件即可安装（普通应用无静默安装权限）。GitHub 无法访问（国内网络常见）时可一键打开发布页用浏览器下载。入口：HUD 第一行电池旁的版本胶囊（`v2.2` 灰色 / `⤓ 新版本` 青色）。
+
+**English** The app checks GitHub Releases hourly in the background (throttled to once per 24 hours; auto-check can be disabled in the update panel). When a newer version is found, an update dialog pops up (version, release notes, package size) with "Update now / Remind me later (3 days) / Skip this version". Downloads are streamed with HTTP Range resume and up to 5 automatic retries (3s/10s/30s/60s backoff); the finished hap is saved to the Downloads folder via the system save picker — tap it to install (ordinary apps cannot install silently). When GitHub is unreachable (common on mainland networks), one tap opens the releases page in a browser. Entry point: the version pill next to the battery in the first HUD row (`v2.2` gray / `⤓ new version` cyan).
 
 ### 性能设计 / Performance Design
 
@@ -147,6 +165,30 @@ HmFish is a smart fishing-camera app for HarmonyOS NEXT. It unifies USB underwat
    hvigorw assembleHap
    ```
    The artifact is at `entry/build/default/outputs/default/entry-default-signed.hap`.
+
+---
+
+## 发布新版本 / Release Process
+
+**中文**（应用内更新按以下约定解析 Releases，务必遵守）
+
+1. 升版本号：`AppScope/app.json5` 中 `versionName`（如 `"2.3"`）与 `versionCode` 同步 +1。
+2. 构建签名包：`hvigorw assembleHap` → `entry-default-signed.hap`。
+3. 在 GitHub 创建 Release，**tag 必须为 `vX.Y` 格式**（如 `v2.3`，与应用 `versionName` 一致；应用按"去 v 前缀逐段数值比较"判断新旧）。
+4. 将签名 hap 作为附件上传（文件名不限，`.hap` 结尾即可，如 `HmFish_v2.3.hap`）。
+5. Release 标题/正文会展示在应用内更新弹窗（正文即"更新说明"）。
+
+已安装旧版本的用户会在 24 小时内收到弹窗提醒；点"立即更新"即断点续传下载该附件并保存到下载目录安装。GitHub 无法访问时可点"打开发布页"用浏览器下载。
+
+**English** (the in-app updater parses Releases by these conventions — follow them)
+
+1. Bump the version in `AppScope/app.json5`: `versionName` (e.g. `"2.3"`) and `versionCode` together.
+2. Build the signed package: `hvigorw assembleHap` → `entry-default-signed.hap`.
+3. Create a GitHub Release with the **tag in `vX.Y` format** (e.g. `v2.3`, matching `versionName`; the app compares versions numerically segment by segment after stripping the leading `v`).
+4. Attach the signed hap (any filename ending in `.hap`, e.g. `HmFish_v2.3.hap`).
+5. The release title/body are shown in the in-app update dialog (body = release notes).
+
+Users on older builds get the dialog within 24 hours; "Update now" downloads the attachment with resume support and saves it to the Downloads folder for installation. When GitHub is unreachable, "Open releases page" downloads via a browser instead.
 
 ---
 
