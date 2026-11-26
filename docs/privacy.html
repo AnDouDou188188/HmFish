@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>我爱钓鱼 隐私政策</title>
+<style>
+  body { font-family: -apple-system, "HarmonyOS Sans SC", "Microsoft YaHei", sans-serif;
+    max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; color: #222; line-height: 1.8; }
+  h1 { font-size: 24px; text-align: center; margin-bottom: 4px; }
+  .updated { text-align: center; color: #888; font-size: 14px; margin-bottom: 32px; }
+  h2 { font-size: 18px; margin-top: 32px; border-left: 4px solid #0091ff; padding-left: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #f5f7fa; }
+  .hl { background: #fff7e6; padding: 10px 14px; border-radius: 6px; }
+  ul { padding-left: 22px; }
+</style>
+</head>
+<body>
+<h1>「我爱钓鱼」隐私政策</h1>
+<p class="updated">生效日期：2026 年 11 月 26 日 &nbsp;|&nbsp; 版本：v1.0</p>
+
+<p>「我爱钓鱼」（以下简称"本应用"）是一款运行在 HarmonyOS 设备上的 AI 相机类工具应用。
+我们非常重视您的个人信息和隐私。请您在使用本应用前，仔细阅读并充分理解本政策的全部内容。
+<strong>本应用的核心设计原则是：所有 AI 分析均在您的设备本地（端侧）完成，我们不收集、不上传、不存储您的任何个人数据到我们的服务器（本应用也没有服务器和账号体系）。</strong></p>
+
+<h2>一、我们如何收集和使用信息</h2>
+<p>本应用不要求注册账号，不采集您的身份信息。以下功能在设备本地处理相关数据：</p>
+<table>
+<tr><th>数据类型</th><th>使用目的</th><th>处理方式</th></tr>
+<tr><td>相机画面（视频流）</td><td>实时预览，并在端侧进行 AI 识别（鱼种/目标检测、人脸检测与分析、文字识别 OCR、水深估算、运动检测、画质增强）</td><td>帧数据仅在内存中参与本地推理，不保存、不上传</td></tr>
+<tr><td>人脸图像数据（敏感个人信息）</td><td>人脸检测、关键点定位、性别/年龄/颜值分析，仅用于屏幕上的实时展示</td><td><strong>全部在设备端推理，结果不保存到磁盘、不上传任何服务器，应用退出即销毁</strong></td></tr>
+<tr><td>麦克风音频</td><td>① 录像时录制环境声音（保存到您本地的视频文件中）；② 离线语音命令识别（使用系统端侧语音识别引擎）</td><td>会话结束后音频缓冲立即释放，不做云端识别，不上传音频</td></tr>
+<tr><td>地理位置（近似/精确）</td><td>在 HUD 信息栏显示当前地名；为拍摄的照片/录像标记位置信息</td><td>仅在本应用界面展示与写入您本地的媒体文件，不上传</td></tr>
+<tr><td>照片与视频</td><td>拍摄结果保存到您的系统相册；您主动从相册选择照片后，可进行 AI 修复、人脸分析、OCR 等本地处理</td><td>通过系统安全控件与系统选择器访问，处理结果仅在本地展示或按您的要求保存</td></tr>
+<tr><td>应用设置</td><td>记住您的功能开关、模型选择、画质参数等偏好</td><td>保存在设备本地的应用数据区，不上传</td></tr>
+</table>
+
+<h2>二、应用申请的系统权限及用途</h2>
+<table>
+<tr><th>权限</th><th>用途</th><th>申请时机</th></tr>
+<tr><td>相机（CAMERA）</td><td>相机预览与拍摄、AI 检测的视频源</td><td>首次进入相机界面时</td></tr>
+<tr><td>麦克风（MICROPHONE）</td><td>录像录制声音；开启语音命令功能时进行离线语音识别</td><td>首次使用录像/语音命令时</td></tr>
+<tr><td>位置（LOCATION / APPROXIMATELY_LOCATION）</td><td>HUD 显示地名、为照片/录像标记位置</td><td>首次使用位置功能时</td></tr>
+<tr><td>网络（INTERNET）</td><td>仅用于：检查应用新版本（访问 GitHub Releases）与下载更新包；OCR 词典可选在线通道</td><td>应用运行时</td></tr>
+</table>
+<p>您可以在系统"设置 → 隐私与安全 → 权限管理"中随时开启或撤销上述权限。撤销后对应功能将不可用，但不影响应用其他功能的使用。</p>
+
+<h2>三、网络访问说明</h2>
+<p>本应用仅在以下场景访问网络：</p>
+<ul>
+<li><strong>应用内更新检查</strong>：应用会定期访问 GitHub（github.com）查询是否有新版本，并可下载更新安装包。此过程仅传输版本号等应用信息，不传输您的个人数据。</li>
+<li>OCR 可选在线词典通道（如使用）。</li>
+</ul>
+<p>除上述场景外，本应用不与任何服务器建立连接，所有 AI 模型推理（鱼类检测、人脸分析、OCR、超分辨率、语音识别等）均在设备端离线完成。</p>
+
+<h2>四、信息的存储</h2>
+<ul>
+<li>您拍摄的照片与录像保存在<strong>您设备的系统相册</strong>中，本应用不上传、不备份、不删除。</li>
+<li>应用设置保存在设备本地应用沙箱内，卸载应用即被清除。</li>
+<li>本应用不使用任何第三方分析、统计、广告或崩溃收集 SDK。</li>
+</ul>
+
+<h2>五、敏感个人信息说明（人脸数据）</h2>
+<div class="hl">本应用的人脸检测与分析功能（人脸框、性别/年龄/颜值估计等）全部使用设备端内置 AI 模型在本地内存中完成。
+分析结果仅实时叠加显示在屏幕上，<strong>不会保存任何人脸图像或分析结果，不会上传，也不会用于身份识别或训练任何模型</strong>。</div>
+
+<h2>六、未成年人保护</h2>
+<p>本应用不面向未满 14 周岁的儿童设计，也不会主动收集未成年人个人信息。如您是未成年人的监护人，发现您的孩子使用了本应用并认为其权益受到侵害，可通过本政策末尾的联系方式与我们联系。</p>
+
+<h2>七、本政策的更新</h2>
+<p>我们可能会不定期修订本政策。重大变更将通过应用内公告或本页面公告的形式通知您。更新后的政策自发布之日起生效。</p>
+
+<h2>八、联系我们</h2>
+<p>如果您对本政策或本应用的隐私实践有任何疑问、意见或建议，欢迎通过以下方式联系我们：</p>
+<ul>
+<li>GitHub Issues：<a href="https://github.com/AnDouDou188188/HmFish/issues">https://github.com/AnDouDou188188/HmFish/issues</a></li>
+<li>项目主页：<a href="https://github.com/AnDouDou188188/HmFish">https://github.com/AnDouDou188188/HmFish</a></li>
+</ul>
+</body>
+</html>
