@@ -70,13 +70,47 @@ const PINYIN_TABLE: Record<string, string> = {
   '母': 'mu', '海': 'hai', '豚': 'tun', '鲸': 'jing', '鲨': 'sha', '兽': 'shou'
 };
 
-// ★ 逐字转拼音串（表外字符原样保留 → 相似度退化为字形比对）
-export function pinyinOf(text: string): string {
+// ★ 方言口音归一化（西南官话/四川话常见系统性偏移，比对双方同时归一后
+//   口音差异即被抵消）：
+//   · 平翘舌不分：zh→z、ch→c、sh→s
+//   · 鼻边音不分：声母 n→l
+//   · 前后鼻音不分：ang→an、eng→en、ing→in（iang/uang/iu? 随子串一并归一）
+function dialectSyllable(p: string): string {
+  let s = p;
+  if (s.startsWith('zh')) {
+    s = 'z' + s.substring(2);
+  } else if (s.startsWith('ch')) {
+    s = 'c' + s.substring(2);
+  } else if (s.startsWith('sh')) {
+    s = 's' + s.substring(2);
+  }
+  if (s.startsWith('n')) {
+    s = 'l' + s.substring(1);
+  }
+  if (s.includes('ang')) {
+    s = s.replace('ang', 'an');
+  }
+  if (s.includes('eng')) {
+    s = s.replace('eng', 'en');
+  }
+  if (s.includes('ing')) {
+    s = s.replace('ing', 'in');
+  }
+  return s;
+}
+
+// ★ 逐字转拼音串（表外字符原样保留 → 相似度退化为字形比对）；
+//   dialect=true 时按西南官话归一（口音容错），比对双方需同为 dialect
+export function pinyinOf(text: string, dialect: boolean = false): string {
   let out = '';
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     const py = PINYIN_TABLE[ch];
-    out += py !== undefined ? py : ch.toLowerCase();
+    if (py !== undefined) {
+      out += dialect ? dialectSyllable(py) : py;
+    } else {
+      out += ch.toLowerCase();
+    }
   }
   return out;
 }

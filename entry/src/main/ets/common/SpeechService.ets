@@ -27,6 +27,18 @@ export class SpeechService {
   private lastAnnounceMs: number = 0;
   private lastAnnounceText: string = '';
 
+  // ★ 回声抑制状态跟踪（供 Index 协调 TTS 与语音识别）：
+  //   当前在播 requestId（onStart 置 / onComplete|onStop|onError 清）+
+  //   乐观兜底窗口（speak 发出即认为即将出声，防止 onStart 回调晚于
+  //   识别会话启动导致回声漏进；真实事件到达后由 requestId 接管）
+  private playingRequestId: string = '';
+  private playStartMs: number = 0;
+  private optimisticUntil: number = 0;
+  private optimisticTimer: number = -1;
+  private lastNotifiedSpeaking: boolean = false;
+  // ★ 播报状态变化回调（Index 挂接：开始 → 静音识别引擎；结束 → 解除恢复）
+  onSpeakingChange?: (speaking: boolean) => void;
+
   // ★ 对外开关与音量（0~100）：由设置页 speechOn/speechVolume 同步赋值
   enabled: boolean = true;
   volumePct: number = 30;
@@ -39,6 +51,24 @@ export class SpeechService {
       return mgr.getRingerModeSync() !== audio.AudioRingMode.RINGER_MODE_NORMAL;
     } catch (_) {
       return false;
+    }
+  }
+
+  // ★ 是否正在出声（真实在播 + 60s 硬过期防事件丢失卡死 + 乐观窗口）
+  isSpeaking(): boolean {
+    const now = Date.now();
+    if (this.playingRequestId !== '' && now - this.playStartMs > 60000) {
+      this.playingRequestId = '';
+    }
+    return this.playingRequestId !== '' || now < this.optimisticUntil;
+  }
+
+  // ★ 播报状态变化通知（仅状态翻转时回调一次）
+  private notifySpeaking(): void {
+    const s = this.isSpeaking();
+    if (s !== this.lastNotifiedSpeaking) {
+      this.lastNotifiedSpeaking = s;
+      this.onSpeakingChange?.(s);
     }
   }
 
@@ -56,6 +86,32 @@ export class SpeechService {
         extraParams: extraParam
       };
       this.engine = await textToSpeech.createEngine(createParams);
+      // ★ 播报生命周期监听：跟踪在播状态（回声抑制用）
+      this.engine.setListener({
+        onStart: (requestId: string, _response: textToSpeech.StartResponse): void => {
+          this.playingRequestId = requestId;
+          this.playStartMs = Date.now();
+          this.notifySpeaking();
+        },
+        onComplete: (requestId: string, _response: textToSpeech.CompleteResponse): void => {
+          if (requestId === this.playingRequestId) {
+            this.playingRequestId = '';
+          }
+          this.notifySpeaking();
+        },
+        onStop: (requestId: string, _response: textToSpeech.StopResponse): void => {
+          if (requestId === this.playingRequestId) {
+            this.playingRequestId = '';
+          }
+          this.notifySpeaking();
+        },
+        onError: (requestId: string, _errorCode: number, _errorMessage: string): void => {
+          if (requestId === this.playingRequestId) {
+            this.playingRequestId = '';
+          }
+          this.notifySpeaking();
+        }
+      });
       return true;
     } catch (e) {
       const err = e as BusinessError;
@@ -71,6 +127,19 @@ export class SpeechService {
   speak(text: string): void {
     if (!this.enabled || text.length === 0) return;
     if (SpeechService.isRingerSilent()) return;
+    // ★ 乐观兜底窗口：speak 发出即认为即将出声（onStart 回调可能晚于
+    //   识别会话启动），按字数估时时长；真实 onStart/complete 事件接管后
+    //   自然覆盖；估时到期仍未在播 → 通知结束解除静音
+    const estMs = Math.min(12000, Math.max(1500, 500 + text.length * 260));
+    this.optimisticUntil = Date.now() + estMs;
+    if (this.optimisticTimer !== -1) {
+      clearTimeout(this.optimisticTimer);
+    }
+    this.optimisticTimer = setTimeout((): void => {
+      this.optimisticTimer = -1;
+      this.notifySpeaking();
+    }, estMs);
+    this.notifySpeaking();
     this.doSpeak(text);
   }
 
@@ -117,11 +186,25 @@ export class SpeechService {
   // ★ stop：打断当前播报（切换设置/停止播报按钮用），不释放引擎
   stop(): void {
     try { if (this.engine) this.engine.stop(); } catch (_) {}
+    // 引擎 onStop 回调会清在播状态；乐观窗口也一并作废防止误判
+    this.optimisticUntil = 0;
+    if (this.optimisticTimer !== -1) {
+      clearTimeout(this.optimisticTimer);
+      this.optimisticTimer = -1;
+    }
+    this.notifySpeaking();
   }
 
   // ★ shutdown：彻底释放引擎（Ability 销毁时必须调用——引擎名额有限要还）
   shutdown(): void {
     try { if (this.engine) this.engine.shutdown(); } catch (_) {}
     this.engine = null;
+    this.playingRequestId = '';
+    this.optimisticUntil = 0;
+    if (this.optimisticTimer !== -1) {
+      clearTimeout(this.optimisticTimer);
+      this.optimisticTimer = -1;
+    }
+    this.notifySpeaking();
   }
 }

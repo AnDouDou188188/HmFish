@@ -20,7 +20,8 @@
         "exported": true,
         "skills": [
           { "entities": ["entity.system.home"], "actions": ["action.system.home"] }
-        ]
+        ],
+        "backgroundModes": ["audioPlayback"]
       }
     ],
     "requestPermissions": [
@@ -42,6 +43,11 @@
       {
         "name": "ohos.permission.APPROXIMATELY_LOCATION",
         "reason": "$string:location_reason",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
+      },
+      {
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "reason": "$string:background_reason",
         "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
       },
       {

@@ -5,6 +5,7 @@
     { "name": "EntryAbility_label", "value": "我爱钓鱼" },
     { "name": "camera_reason", "value": "用于实时拍摄画面并进行 AI 目标检测" },
     { "name": "mic_reason", "value": "用于录像时同步录制环境声音" },
+    { "name": "background_reason", "value": "用于画中画后台识别时保持相机预览与 AI 检测持续运行" },
     { "name": "read_media_reason", "value": "用于在相册按钮上展示最近拍摄的照片" },
     { "name": "write_media_reason", "value": "用于把拍摄的照片和录像保存到系统相册" },
     { "name": "location_reason", "value": "用于在拍摄的照片和录像上标记当前地理位置" }

@@ -140,6 +140,10 @@ export struct BottomPanel {
   @Prop autoRecordOn: boolean = false;
   // ★ 位置行（移自顶部 HUD）：地名展示，点击弹复制地址/坐标
   @Prop geoName: string = '';
+  // ★ 语音命令开关（地址栏麦克风按钮高亮态；点击由 Index 处理开关切换）
+  @Prop voiceMicOn: boolean = false;
+  // ★ 唤醒词：显示在麦克风芯片上（"🎤钓鱼"），一眼可知说什么唤醒
+  @Prop voiceWakeWord: string = '';
   // ★ 变焦上限按相机支持范围动态设定：手机用 getZoomRatioRange 上限，USB 默认 4x
   @Prop zoomMax: number = 4.0;
   // ★ 摄像头主要参数（预览分辨率）：变焦气泡旁展示
@@ -162,6 +166,7 @@ export struct BottomPanel {
   onDepthLongPress?: () => void;
   onZoomChange?: (v: number) => void;
   onShowGeoPopup?: () => void;
+  onVoiceMicTap?: () => void;
 
   // ★ SideBtn：36×36 侧栏小按钮（图标+文字，深色底白边小方块），
   //   当前布局未使用，保留为扩展入口
@@ -181,21 +186,44 @@ export struct BottomPanel {
 
   build() {
     Column() {
-      // ★ 位置行（移自顶部 HUD）：地名 + 复制胶囊，置于变焦气泡行上一行
-      if (this.geoName.length > 0) {
+      // ★ 位置行（移自顶部 HUD）：地名 + 语音麦克风开关 + 复制胶囊，
+      //   置于变焦气泡行上一行；麦克风为语音命令手动开关（识别设置内亦有总开关）
+      if (this.geoName.length > 0 || this.voiceMicOn) {
         Row({ space: 5 }) {
-          Text('📍').fontSize(12)
-          Text(this.geoName)
-            .fontSize(12).fontColor('#D8DCE2')
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .layoutWeight(1)
-          Text('复制')
-            .fontSize(11).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
-            .padding({ left: 12, right: 12, top: 4, bottom: 4 })
-            .borderRadius(12)
-            .backgroundColor('rgba(0,229,255,0.18)')
-            .border({ width: 1, color: '#00E5FF' })
+          if (this.geoName.length > 0) {
+            Text('📍').fontSize(12)
+          }
+          if (this.geoName.length > 0) {
+            Text(this.geoName)
+              .fontSize(12).fontColor('#D8DCE2')
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .layoutWeight(1)
+          } else {
+            Blank()
+          }
+          Row({ space: 3 }) {
+            Text('🎤')
+              .fontSize(12)
+            if (this.voiceMicOn && this.voiceWakeWord.length > 0) {
+              Text(this.voiceWakeWord)
+                .fontSize(10).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+            }
+          }
+            .padding({ left: 8, right: 8, top: 3, bottom: 3 })
+            .borderRadius(11)
+            .backgroundColor(this.voiceMicOn ? 'rgba(0,229,255,0.30)' : 'rgba(0,0,0,0.5)')
+            .border({ width: 1, color: this.voiceMicOn ? '#00E5FF' : 'rgba(255,255,255,0.35)' })
+            .opacity(this.voiceMicOn ? 1 : 0.75)
+            .onClick(() => this.onVoiceMicTap?.())
+          if (this.geoName.length > 0) {
+            Text('复制')
+              .fontSize(11).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+              .padding({ left: 12, right: 12, top: 4, bottom: 4 })
+              .borderRadius(12)
+              .backgroundColor('rgba(0,229,255,0.18)')
+              .border({ width: 1, color: '#00E5FF' })
+          }
         }
         .width('90%')
         .padding({ top: 3, bottom: 3 })

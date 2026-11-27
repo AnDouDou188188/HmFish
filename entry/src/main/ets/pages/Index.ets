@@ -69,7 +69,8 @@ import { MediaController } from '../core/MediaController';
 import { Det, Merged } from '../common/Types';
 import { SpeechService } from '../common/SpeechService';
 import { POWER_PRESETS } from '../common/PowerPresets';
-import { common, abilityAccessCtrl, Permissions, bundleManager } from '@kit.AbilityKit';
+import { common, abilityAccessCtrl, Permissions, bundleManager, wantAgent, Want } from '@kit.AbilityKit';
+import { backgroundTaskManager } from '@kit.BackgroundTasksKit';
 import { promptAction, display, window } from '@kit.ArkUI';
 import entry from 'libentry.so';
 import { image } from '@kit.ImageKit';
@@ -566,6 +567,8 @@ struct Index {
   private pipHudTimer: number = -1;
   // 小窗播放/暂停控件当前态（暂停=停 YOLO 推理）
   private pipPaused: boolean = false;
+  // ★ 画中画保活长时任务（audioPlayback）是否在跑：退后台申请、回前台/兜底释放释放
+  private pipTaskRunning: boolean = false;
 
   // ═══════════════ 应用内更新（AppUpdater + GitHub Releases）═══════════════
   @State appVersion: string = '';
@@ -598,6 +601,7 @@ struct Index {
   @State vcListening: boolean = false;
   @State vcBubble: string = '';
   @State vcBubbleVisible: boolean = false;
+  @State vcPartial: string = '';
   // 离线识别引擎（含热词注入 + 拼音纠错 NLU 在外层 VoiceNlu）
   private vcEngine: VoiceCommandEngine = new VoiceCommandEngine();
   // 对话状态机：0 空闲 / 1 澄清二选一 / 2 确认 / 3 追问目标（只听到"打开"）
@@ -610,6 +614,19 @@ struct Index {
   private vcLastToggleAction: string = '';
   // 气泡自动隐藏定时器
   private vcBubbleTimer: number = -1;
+  // 聆听呼吸动画开关 + 驱动定时器
+  @State private vcPulse: boolean = false;
+  private vcPulseTimer: number = -1;
+  // 唤醒词（默认"钓鱼"，识别设置可自定义 2~8 字）+ 唤醒监听循环运行态
+  @State vcWakeWord: string = '钓鱼';
+  @State vcWakeActive: boolean = false;
+  // 唤醒重试退避：连续失败次数与重试定时器（2s 起指数退避，30s 封顶）
+  private vcWakeFailCount: number = 0;
+  private vcWakeRetryTimer: number = -1;
+  // ★ 命令模式：唤醒后进入，持续聆听命令（一句可含多个，逐个批量执行），
+  //   没声音/说"完毕"/超时自动退出回唤醒监听
+  private vcCmdMode: boolean = false;
+  private vcCmdContinueTimer: number = -1;
 
   // ★ USB 层（usbManager）设备列表弹窗，照抄 Android UsbManager + 设备选择 Dialog
   @State usbSheetVisible: boolean = false;
@@ -720,6 +737,7 @@ struct Index {
         faceEnabled: this.faceEnabled,
         pipEnabled: this.pipEnabled,
         voiceCmdEnabled: this.voiceCmdEnabled,
+        vcWakeWord: this.vcWakeWord,
         updateAutoCheck: this.updateAutoCheck
       });
     }, 150);
@@ -733,6 +751,11 @@ struct Index {
     try {
       // ★ 落盘日志自检：每次启动写一行，重连 PC 后检查 files/uvc_debug.log 是否存在即可确认通路
       this.appendUvcLog('app started (log channel ok)');
+      // ★ 回声抑制挂接：TTS 播报开始 → 静音识别引擎（播报内容不再被麦克风
+      //   识别成命令）；播报结束 → 300ms 尾音后解除静音、恢复挂起的监听
+      this.speech.onSpeakingChange = (speaking: boolean): void => {
+        this.onTtsSpeakingChange(speaking);
+      };
       // ★ 折叠屏展开/折叠、屏幕旋转：预览区按最近一次内容比例重新适配屏幕尺寸
       //   （display 尺寸更新略滞后于事件，补一次 500ms 延迟重算确保用上新尺寸）
       this.displayChangeListener = (displayId: number): void => {
@@ -852,6 +875,7 @@ struct Index {
       // ★ 画中画后台识别 + 语音命令 + 应用内更新设置恢复
       this.pipEnabled = s.pipEnabled;
       this.voiceCmdEnabled = s.voiceCmdEnabled;
+      this.vcWakeWord = s.vcWakeWord;
       this.updateAutoCheck = s.updateAutoCheck;
       this.updateSkipTag = s.updateSkipTag;
       this.updateSnoozeUntil = s.updateSnoozeUntil;
@@ -1029,6 +1053,12 @@ struct Index {
       // ★ 位置水印循环：当前地名解析（系统逆地理免费优先，高德/百度 Key 在 GeoService 顶部补充）
       this.startGeoLoop();
 
+      // ★ 语音命令：冷启动设置已恢复，直接进入唤醒监听循环
+      //   （首个 onPageShow 被 pageHidden=false 守卫拦截，不会重复启动）
+      if (this.voiceCmdEnabled) {
+        this.startVcWakeLoop();
+      }
+
       this.loading = false;
     } catch (e) {
       console.error('[aboutToAppear]', e);
@@ -1044,16 +1074,15 @@ struct Index {
   onPageHide(): void {
     this.pageHidden = true;
     this.persistSettings();
-    // ★ 语音命令：退后台中断聆听会话（麦克风不跨生命周期持有）
-    if (this.vcListening) {
-      this.vcEngine.cancel();
-      this.vcListening = false;
-    }
+    // ★ 语音命令：退后台停唤醒监听（麦克风不跨生命周期持有）
+    this.stopVcWakeLoop();
     this.vcDialog = 0;
     // ★ PiP 保活：预览在跑 + 控制器就绪 → 相机/管线/识别原样保留，
     //   尝试主动拉起小窗并武装 3s 看门狗（未拉起 → stopForBackground 省电）
     if (this.pipEnabled && this.pipReady && this.previewReady && !this.switching) {
       this.cameraKeptAlive = true;
+      // ★ 先申请长时任务再拉小窗：无任务后台秒挂起，小窗冻结/拉起失败
+      this.startPipKeepAliveTask();
       this.pipManager.start();
       this.armPipWatchdog();
       return;
@@ -1065,7 +1094,13 @@ struct Index {
     if (!this.pageHidden) return;
     this.pageHidden = false;
     this.disarmPipWatchdog();
+    // ★ 回前台释放画中画保活长时任务（两条恢复路径共用）
+    this.stopPipKeepAliveTask();
     this.maybeCheckUpdate(false);
+    // ★ 语音命令：回前台恢复唤醒监听循环
+    if (this.voiceCmdEnabled) {
+      this.startVcWakeLoop();
+    }
     const self = this;
     // ★ PiP 保活恢复：管线一直在跑，无需重建相机——停小窗、恢复推理开关、
     //   surface 变了重绑、恢复识别结果分发即可
@@ -3707,12 +3742,16 @@ struct Index {
     if (this.batteryTimer !== -1) { clearInterval(this.batteryTimer); this.batteryTimer = -1; }
     if (this.geoTimer !== -1) { clearTimeout(this.geoTimer); this.geoTimer = -1; }
     this.stopFaceInfoPoll();
-    // ★ 语音命令：销毁 ASR 引擎/采集器 + 清气泡定时器
+    // ★ 语音命令：停唤醒循环 → 销毁 ASR 引擎/采集器 + 清气泡/重试/呼吸动画定时器
+    this.stopVcWakeLoop();
     this.vcEngine.destroy();
     if (this.vcBubbleTimer !== -1) { clearTimeout(this.vcBubbleTimer); this.vcBubbleTimer = -1; }
-    // ★ 画中画 + 更新检查清理：看门狗/HUD 轮询/小时 tick/小窗销毁
+    if (this.vcPulseTimer !== -1) { clearInterval(this.vcPulseTimer); this.vcPulseTimer = -1; }
+    if (this.ttsResumeTimer !== -1) { clearTimeout(this.ttsResumeTimer); this.ttsResumeTimer = -1; }
+    // ★ 画中画 + 更新检查清理：看门狗/HUD 轮询/小时 tick/小窗销毁/长时任务
     this.disarmPipWatchdog();
     this.stopPipHudLoop();
+    this.stopPipKeepAliveTask();
     if (this.updateTimer >= 0) { clearInterval(this.updateTimer); this.updateTimer = -1; }
     try { this.pipManager.destroy(); } catch (_) {}
     try {
@@ -3744,6 +3783,7 @@ struct Index {
   //   停语音/停分发/停 USB 取流/带超时释放相机/停 native 管线
   private stopForBackground(): void {
     this.cameraKeptAlive = false;
+    this.stopPipKeepAliveTask();
     this.disarmPipWatchdog();
     this.stopPipHudLoop();
     this.speech.stop();
@@ -3769,6 +3809,36 @@ struct Index {
       try { entry.stopPipeline(); } catch (_) {}
       self.releasingCamera = false;
     })();
+  }
+
+  // ★ 画中画保活长时任务：退后台申请 audioPlayback（无此任务应用数秒内被挂起，
+  //   小窗拉不起来/画面冻结）；wantAgent 指定点通知回本应用
+  private async startPipKeepAliveTask(): Promise<void> {
+    if (this.pipTaskRunning) return;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      const want: Want = { bundleName: 'com.fish.ayf', abilityName: 'EntryAbility' };
+      const info: wantAgent.WantAgentInfo = {
+        wants: [want],
+        actionType: wantAgent.OperationType.START_ABILITY,
+        requestCode: 0
+      };
+      const wa = await wantAgent.getWantAgent(info);
+      await backgroundTaskManager.startBackgroundRunning(ctx, ['audioPlayback'], wa);
+      this.pipTaskRunning = true;
+    } catch (e) {
+      this.appendUvcLog(`pip task start failed: ${e}`);
+    }
+  }
+
+  // ★ 释放画中画保活长时任务（回前台/兜底释放/页面卸载）
+  private stopPipKeepAliveTask(): void {
+    if (!this.pipTaskRunning) return;
+    this.pipTaskRunning = false;
+    try {
+      const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+      backgroundTaskManager.stopBackgroundRunning(ctx).catch((_e: BusinessError): void => {});
+    } catch (_) {}
   }
 
   // ★ 武装 3s 看门狗：退后台赌系统自动拉起小窗，超时未拉起走标准释放省电
@@ -3847,8 +3917,9 @@ struct Index {
         (paused: boolean): void => { this.handlePipPause(paused); });
       this.pipReady = ok;
       if (ok) this.pipManager.setAutoStart(true);
-    } catch (_) {
+    } catch (e) {
       this.pipReady = false;
+      this.appendUvcLog(`pip setup failed: ${e}`);
     }
   }
 
@@ -4042,9 +4113,10 @@ struct Index {
     return `${d.getMonth() + 1}月${d.getDate()}日 ${two(d.getHours())}:${two(d.getMinutes())}`;
   }
 
-  // ═══════════════ 语音命令（离线 AI 识别 + 拼音模糊纠错 NLU + 多轮对话）═══════════════
-  // 开关（识别设置）→ 悬浮麦克风 → 一次会话 = 采集→离线识别→NLU 候选打分→
-  // 执行(≥0.75) / 澄清二选一 / 确认(0.52~0.75) / 追问目标 / 没听懂(<0.52)
+  // ═══════════════ 语音命令（唤醒词 + 离线 AI 识别 + 拼音/口音模糊纠错 + 多轮对话）═══════════════
+  // 开关（识别设置/地址栏麦克风）→ 持续静默唤醒监听（说"小鱼小鱼"）→ 答"在呢"→
+  // 命令会话 = 采集→离线识别→NLU 候选打分→执行(≥0.75) / 澄清二选一 /
+  // 确认(0.52~0.75) / 追问目标 / 没听懂(<0.52)；交互结束自动回唤醒监听
 
   // ★ 画面旋转 90°（BottomPanel 旋转按钮与语音命令共用）
   private rotatePreview(): void {
@@ -4071,7 +4143,7 @@ struct Index {
     }
   }
 
-  // ★ 语音命令总开关（识别设置内）：开启需麦克风权限
+  // ★ 语音命令总开关（识别设置内 / 地址栏麦克风按钮）：开启即持续唤醒监听
   private async toggleVoiceCmd(): Promise<void> {
     if (!this.voiceCmdEnabled) {
       const ok = await this.ensureMicPermission();
@@ -4083,14 +4155,204 @@ struct Index {
     }
     this.voiceCmdEnabled = !this.voiceCmdEnabled;
     if (!this.voiceCmdEnabled) {
-      this.vcEngine.cancel();
-      this.vcListening = false;
+      this.stopVcWakeLoop();
       this.vcDialog = 0;
       this.hideVcBubble();
+    } else {
+      this.startVcWakeLoop();
     }
-    this.showToast(this.voiceCmdEnabled ? '已开启语音命令' : '已关闭语音命令');
-    this.speak(this.voiceCmdEnabled ? '语音命令已开启，点击麦克风说话' : '语音命令已关闭');
+    this.showToast(this.voiceCmdEnabled
+      ? `已开启语音命令，说“${this.vcWakeWord}${this.vcWakeWord}”唤醒`
+      : '已关闭语音命令');
+    this.speak(this.voiceCmdEnabled
+      ? '语音命令已开启' : '语音命令已关闭');
     this.persistSettings();
+  }
+
+  // ★ 唤醒词监听循环：开关开启后持续静默聆听（无 UI），听到唤醒词（默认"小鱼"，
+  //   支持叠词/同音/四川话口音）→ 答"在呢"→ 下一句即命令；
+  //   "小鱼，开始录像"唤醒词直接带命令则一并执行。
+  //   单轮 = 一条离线识别会话（25s 兜底），结束自动续下一轮，连续失败指数退避
+  private async startVcWakeLoop(): Promise<void> {
+    if (!this.voiceCmdEnabled || this.vcWakeActive) return;
+    const ok = await this.ensureMicPermission();
+    if (!ok) {
+      this.showToast('需要麦克风权限才能使用语音命令');
+      return;
+    }
+    this.vcWakeActive = true;
+    this.vcWakeFailCount = 0;
+    this.runWakeSession();
+  }
+
+  // ★ 停止唤醒监听（开关关闭/退后台/页面卸载）：取消会话、清重试定时器
+  private stopVcWakeLoop(): void {
+    this.vcWakeActive = false;
+    this.vcWakeFailCount = 0;
+    this.vcCmdMode = false;
+    if (this.vcCmdContinueTimer !== -1) {
+      clearTimeout(this.vcCmdContinueTimer);
+      this.vcCmdContinueTimer = -1;
+    }
+    if (this.vcWakeRetryTimer !== -1) {
+      clearTimeout(this.vcWakeRetryTimer);
+      this.vcWakeRetryTimer = -1;
+    }
+    this.vcEngine.cancel();
+    // ★ 关闭语音命令时解除回声抑制静音，防止引擎残留 muted 状态
+    try { this.vcEngine.mute(false); } catch (_) {}
+    this.setVcListening(false);
+  }
+
+  // ★ 唤醒失败退避重试：连续失败越多间隔越长（2s→4s→…→30s 封顶）；
+  //   第 3 次失败起把引擎错误气泡提示给用户（如 1002200001 服务不可用）
+  private scheduleWakeRetry(errMsg: string): void {
+    if (!this.vcWakeActive) return;
+    this.vcWakeFailCount++;
+    const delay = Math.min(2000 * Math.pow(2, this.vcWakeFailCount - 1), 30000);
+    if (this.vcWakeFailCount >= 3 && errMsg.length > 0) {
+      this.showVcBubble(errMsg, 4000);
+    }
+    if (this.vcWakeRetryTimer !== -1) {
+      clearTimeout(this.vcWakeRetryTimer);
+    }
+    this.vcWakeRetryTimer = setTimeout((): void => {
+      this.vcWakeRetryTimer = -1;
+      this.runWakeSession();
+    }, delay);
+  }
+
+  // ★ 单轮静默唤醒监听会话（无卡片 UI；命令聆听才用 startVcListening 大卡片）
+  private async runWakeSession(): Promise<void> {
+    if (!this.vcWakeActive || this.vcEngine.isListening()) return;
+    if (this.switching || this.loading) {
+      this.scheduleWakeRetry('');
+      return;
+    }
+    const cbs: VcSessionCallbacks = {
+      onPartial: (_t: string): void => {},
+      onFinal: (t: string): void => {
+        if (!this.vcWakeActive) return;
+        this.vcWakeFailCount = 0;
+        this.handleVcWakeFinal(t);
+      },
+      onError: (m: string): void => {
+        if (this.vcWakeActive) {
+          this.scheduleWakeRetry(m);
+        }
+      }
+    };
+    const started = await this.vcEngine.startSession(
+      VoiceNlu.collectHotwords(this.dynamicVcEntries(), this.vcWakeWord), cbs, 25000);
+    if (!started && this.vcWakeActive) {
+      this.scheduleWakeRetry('');
+    }
+  }
+
+  // ★ 唤醒词命中分流：唤醒词后带命令 → 直接执行；仅唤醒词 → 答"在呢"进命令模式；
+  //   未命中 → 静默续听下一轮
+  private handleVcWakeFinal(text: string): void {
+    if (!this.vcWakeActive) return;
+    const m = VoiceNlu.matchWakeWord(text, this.vcWakeWord);
+    if (!m.hit) {
+      this.runWakeSession();
+      return;
+    }
+    if (m.rest.trim().length >= 2) {
+      this.enterCmdMode();
+      this.handleVcFinal(m.rest);
+      return;
+    }
+    this.enterCmdMode();
+  }
+
+  // ★ 进入命令模式：只播报"在呢"（帮助提示文字显示不朗读），随后持续听命令
+  private enterCmdMode(): void {
+    this.vcCmdMode = true;
+    this.vcSpeak('在呢');
+    this.showVcBubble('在呢，请说命令（可连续说多个）', 5000);
+    this.startVcListening();
+  }
+
+  // ★ 退出命令模式：回唤醒监听（说"完毕"/没声音/出错/手动取消）
+  private exitCmdMode(msg: string): void {
+    this.vcCmdMode = false;
+    if (this.vcCmdContinueTimer !== -1) {
+      clearTimeout(this.vcCmdContinueTimer);
+      this.vcCmdContinueTimer = -1;
+    }
+    if (msg.length > 0) {
+      this.showVcBubble(msg, 2500);
+    }
+    this.resumeWakeAfterInteraction();
+  }
+
+  // ★ TTS 播报状态变化（回声抑制）：开始 → 立即静音识别引擎；
+  //   结束 → 300ms 尾音后解除静音并补启动挂起的监听（命令模式续听/唤醒续听）
+  private ttsResumeTimer: number = -1;
+  private onTtsSpeakingChange(speaking: boolean): void {
+    if (speaking) {
+      if (this.ttsResumeTimer !== -1) {
+        clearTimeout(this.ttsResumeTimer);
+        this.ttsResumeTimer = -1;
+      }
+      try { this.vcEngine.mute(true); } catch (_) {}
+      return;
+    }
+    if (this.ttsResumeTimer !== -1) {
+      clearTimeout(this.ttsResumeTimer);
+    }
+    this.ttsResumeTimer = setTimeout((): void => {
+      this.ttsResumeTimer = -1;
+      try { this.vcEngine.mute(false); } catch (_) {}
+      if (!this.voiceCmdEnabled) return;
+      // ★ 静音期间到期/结束的会话在此补启动，监听链路不断档
+      if (this.vcCmdMode && !this.vcEngine.isListening()) {
+        this.startVcListening();
+      } else if (this.vcWakeActive && !this.vcCmdMode && !this.vcEngine.isListening()) {
+        this.runWakeSession();
+      }
+    }, 300);
+  }
+
+  // ★ 命令模式内续听：命令反馈后短暂停顿即开下一轮聆听（支持连续多命令）
+  private continueCmdListening(): void {
+    if (!this.vcCmdMode || !this.voiceCmdEnabled) return;
+    if (this.vcCmdContinueTimer !== -1) {
+      clearTimeout(this.vcCmdContinueTimer);
+    }
+    this.vcCmdContinueTimer = setTimeout((): void => {
+      this.vcCmdContinueTimer = -1;
+      if (this.vcCmdMode) {
+        this.startVcListening();
+      }
+    }, 600);
+  }
+
+  // ★ 交互结束回唤醒监听：命令执行完(vcResult)/取消/出错后 1.2s 重启唤醒会话
+  private resumeWakeAfterInteraction(): void {
+    if (!this.voiceCmdEnabled) return;
+    if (!this.vcWakeActive) {
+      this.startVcWakeLoop();
+      return;
+    }
+    if (this.vcWakeRetryTimer !== -1) {
+      clearTimeout(this.vcWakeRetryTimer);
+    }
+    this.vcWakeRetryTimer = setTimeout((): void => {
+      this.vcWakeRetryTimer = -1;
+      this.runWakeSession();
+    }, 1200);
+  }
+
+  // ★ 唤醒词修改（识别设置输入框提交/失焦）：规范化 + 持久化，下轮会话热词自动生效
+  private onVcWakeWordChange(w: string): void {
+    const t = VoiceNlu.normalize(w);
+    const word = t.length >= 2 ? t : '钓鱼';
+    if (word === this.vcWakeWord) return;
+    this.vcWakeWord = word;
+    this.persistSettings();
+    this.showToast(`唤醒词已设为「${word}」`);
   }
 
   // ★ 动态命令词条：模型名/模型 id → "用XX模型"（每次会话前重建，热词同步注入）
@@ -4135,6 +4397,26 @@ struct Index {
     this.vcBubble = '';
   }
 
+  // ★ 聆听态统一入口：置位 + 清实时文本 + 启停呼吸动画定时器
+  private setVcListening(on: boolean): void {
+    this.vcListening = on;
+    if (on) {
+      this.vcPartial = '';
+      if (this.vcPulseTimer === -1) {
+        this.vcPulseTimer = setInterval((): void => {
+          this.vcPulse = !this.vcPulse;
+        }, 600);
+      }
+    } else {
+      if (this.vcPulseTimer !== -1) {
+        clearInterval(this.vcPulseTimer);
+        this.vcPulseTimer = -1;
+      }
+      this.vcPulse = false;
+      this.vcPartial = '';
+    }
+  }
+
   // ★ 语音命令专属播报：语音播报总开关关闭时也说话（语音交互必须有反馈），
   //   但尊重系统静音/震动模式（SpeechService 内部 ringer 拦截）
   private vcSpeak(text: string): void {
@@ -4144,29 +4426,40 @@ struct Index {
     this.speech.enabled = prev;
   }
 
-  // ★ 执行反馈：气泡常显 + 总播报关闭时补一句语音（开启时内部方法已播报）
+  // ★ 执行反馈：气泡常显 + 总播报关闭时补一句语音（开启时内部方法已播报）；
+  //   命令模式 → 继续听下一命令；唤醒模式 → 1.2s 后回唤醒监听
   private vcResult(text: string): void {
     this.showVcBubble(text, 4000);
     if (!this.speechOn) {
       this.vcSpeak(text);
     }
+    if (this.vcCmdMode) {
+      this.continueCmdListening();
+    } else {
+      this.resumeWakeAfterInteraction();
+    }
   }
 
-  // ★ 点麦克风：聆听中=取消；空闲=开一轮识别会话
+  // ★ 点聆听卡片：取消当前聆听，退出命令模式回唤醒监听
   private async onTapMic(): Promise<void> {
     if (this.vcListening) {
       this.vcEngine.cancel();
-      this.vcListening = false;
+      this.setVcListening(false);
       this.vcDialog = 0;
-      this.showVcBubble('已取消', 1500);
+      if (this.vcCmdMode) {
+        this.exitCmdMode('已取消，说唤醒词再叫我');
+      } else {
+        this.showVcBubble('已取消', 1500);
+        this.resumeWakeAfterInteraction();
+      }
       return;
     }
     await this.startVcListening();
   }
 
-  // ★ 开一轮聆听会话（点麦克风 / 对话追问自动续听共用）
+  // ★ 开一轮命令聆听会话（唤醒应答后 / 对话追问自动续听共用；卡片 UI）
   private async startVcListening(): Promise<void> {
-    if (!this.voiceCmdEnabled || this.vcListening) return;
+    if (!this.voiceCmdEnabled || this.vcListening || this.vcEngine.isListening()) return;
     if (this.switching || this.loading) {
       this.showVcBubble('相机忙碌，稍后再试', 2000);
       return;
@@ -4178,32 +4471,36 @@ struct Index {
     }
     const cbs: VcSessionCallbacks = {
       onPartial: (t: string): void => {
-        this.showVcBubble(`“${t}”`, 0);
+        this.vcPartial = t;
       },
       onFinal: (t: string): void => {
-        this.vcListening = false;
+        this.setVcListening(false);
         this.handleVcFinal(t);
       },
       onError: (m: string): void => {
-        this.vcListening = false;
+        this.setVcListening(false);
         this.vcDialog = 0;
         this.showVcBubble(m, 3000);
+        this.resumeWakeAfterInteraction();
       }
     };
-    this.vcListening = true;
+    this.setVcListening(true);
     this.showVcBubble('正在聆听…', 0);
     const started = await this.vcEngine.startSession(
-      VoiceNlu.collectHotwords(this.dynamicVcEntries()), cbs);
+      VoiceNlu.collectHotwords(this.dynamicVcEntries(), this.vcWakeWord), cbs);
     if (!started) {
-      this.vcListening = false;
-      this.showVcBubble('启动聆听失败，请重试', 2500);
+      this.setVcListening(false);
+      if (!this.vcBubbleVisible) {
+        this.showVcBubble('启动聆听失败，请重试', 2500);
+      }
+      this.resumeWakeAfterInteraction();
     }
   }
 
-  // ★ 提问并自动续听（澄清/确认/追问目标 → 用户语音回答）
+  // ★ 提问并自动续听（澄清/确认/追问目标 → 用户语音回答）；
+  //   帮助/提示类文案只显示不朗读（显示文字就行了）
   private askVc(question: string): void {
     this.showVcBubble(question, 12000);
-    this.vcSpeak(question);
     setTimeout((): void => {
       this.startVcListening();
     }, 800);
@@ -4214,7 +4511,13 @@ struct Index {
     const heard = text.trim();
     if (heard.length === 0) {
       this.vcDialog = 0;
-      this.showVcBubble('没听到语音，点麦克风重试', 2500);
+      if (this.vcCmdMode) {
+        // ★ 命令模式没听到声音 → 退出回唤醒监听（"完毕"也有同义口令）
+        this.exitCmdMode('没听到命令，说唤醒词随时再叫我');
+      } else {
+        this.showVcBubble('没听到语音，请再说一次', 2500);
+        this.resumeWakeAfterInteraction();
+      }
       return;
     }
     if (this.vcDialog === 1) {
@@ -4230,6 +4533,23 @@ struct Index {
       return;
     }
     const dyn = this.dynamicVcEntries();
+    // ★ 多命令批量执行：一句里带连接词/标点切出多段（"打开识别，然后开始录像"），
+    //   置信度≥0.75 的段直接逐个执行，其余段忽略；一段都没中 → 整句走常规理解
+    const segs = VoiceNlu.splitCommands(heard);
+    if (segs.length > 1) {
+      let execAny = false;
+      for (const seg of segs) {
+        const sa = VoiceNlu.analyze(seg, dyn);
+        const top = sa.candidates.length > 0 ? sa.candidates[0] : null;
+        if (top !== null && top.score >= 0.75) {
+          execAny = true;
+          this.executeVc(top, seg);
+        }
+      }
+      if (execAny) {
+        return;
+      }
+    }
     const analysis = VoiceNlu.analyze(heard, dyn);
     this.decideVc(heard, analysis, dyn);
   }
@@ -4245,7 +4565,7 @@ struct Index {
         this.askVc(a.polarity === VcPolarity.OFF ? '关闭什么？请说功能名' : '打开什么？请说功能名');
         return;
       }
-      this.askVc(`没听懂“${heard}”。可以说：开始录像、截图、打开人脸识别、省电模式、变焦两倍，或说"帮助"`);
+      this.askVc(`没听懂“${heard}”。可以说：录像、截图、变焦两倍、帮助`);
       return;
     }
     if (top.score < 0.75) {
@@ -4273,6 +4593,7 @@ struct Index {
       this.vcDialog = 0;
       this.vcCandidates = [];
       this.showVcBubble('好的，已取消', 2500);
+      this.resumeWakeAfterInteraction();
       return;
     }
     if (idx >= 0) {
@@ -4308,6 +4629,7 @@ struct Index {
       this.vcDialog = 0;
       this.vcCandidates = [];
       this.showVcBubble('好的，已取消', 2500);
+      this.resumeWakeAfterInteraction();
       return;
     }
     if (idx === -3 || idx === 0) {
@@ -4603,6 +4925,55 @@ struct Index {
         }
         break;
       }
+      case 'zoom_default': {
+        if (this.zoomRatio <= 1.001) {
+          fin('变焦已是默认一倍');
+        } else {
+          this.applyPinchZoom(1);
+          this.applyZoomToCamera();
+          this.persistSettings();
+          fin('变焦已恢复默认一倍');
+        }
+        break;
+      }
+      case 'zoom_min': {
+        if (this.zoomRatio <= 1.001) {
+          fin('已是最小变焦');
+        } else {
+          this.applyPinchZoom(1);
+          this.applyZoomToCamera();
+          this.persistSettings();
+          fin('已调到最小变焦一倍');
+        }
+        break;
+      }
+      case 'zoom_max': {
+        if (this.zoomRatio >= this.zoomMax - 0.001) {
+          fin(`已是最大变焦${this.zoomMax}倍`);
+        } else {
+          this.applyPinchZoom(this.zoomMax);
+          this.applyZoomToCamera();
+          this.persistSettings();
+          fin(`已调到最大变焦${this.zoomMax}倍`);
+        }
+        break;
+      }
+      case 'table_rec': {
+        this.doRecognizeTable();
+        fin('正在识别表格');
+        break;
+      }
+      case 'exit_app': {
+        fin('好的，再见');
+        setTimeout((): void => {
+          try {
+            const ctx = this.getUIContext().getHostContext() as common.UIAbilityContext;
+            ctx.terminateSelf();
+          } catch (_) {
+          }
+        }, 1000);
+        break;
+      }
       case 'rotate': {
         this.rotatePreview();
         fin(`画面已旋转，当前${this.rotateText}`);
@@ -4729,8 +5100,15 @@ struct Index {
         break;
       }
       case 'help': {
-        this.vcResult('可以试试说：开始录像、停止录像、截图、打开人脸识别、切换模型、'
-          + '省电模式、变焦两倍、置信度60、打开识别设置、现在什么状态、撤销');
+        // ★ 帮助只显示文字不朗读（命令模式内继续听命令）
+        this.showVcBubble('可以说：开始录像、停止录像、截图、变焦三倍、恢复默认变焦、'
+          + '打开/关闭人脸识别·文字识别·水深检测·运动检测、切换摄像头、省电/性能模式、'
+          + '置信度60、切换模型、识别表格、现在什么状态、退出软件、帮助', 10000);
+        if (this.vcCmdMode) {
+          this.continueCmdListening();
+        } else {
+          this.resumeWakeAfterInteraction();
+        }
         break;
       }
       case 'undo': {
@@ -4753,6 +5131,14 @@ struct Index {
       }
       case 'cancel': {
         this.vcResult('好的');
+        break;
+      }
+      case 'cmd_done': {
+        if (this.vcCmdMode) {
+          this.exitCmdMode('好的，有事再叫我');
+        } else {
+          this.vcResult('好的');
+        }
         break;
       }
       default: {
@@ -5026,6 +5412,10 @@ struct Index {
         onMotionLongPress: (): void => { this.motionSheetVisible = true; },
         onAlbumPreview: (): void => { this.openAlbumPicker(); },
         onShowToast: (msg: string): void => { this.showToast(msg); },
+        // ★ 地址栏麦克风：语音命令手动开关（点按切换，与识别设置内开关联动）
+      voiceMicOn: this.voiceCmdEnabled,
+      voiceWakeWord: this.vcWakeWord,
+      onVoiceMicTap: (): void => { this.toggleVoiceCmd(); },
         onZoomChange: (v: number): void => {
           this.zoomRatio = v;
           this.applyZoomToCamera();
@@ -5045,49 +5435,91 @@ struct Index {
         .hitTestBehavior(HitTestMode.Transparent)
       }
 
-      // ★ 语音命令悬浮麦克风（识别设置开启后显示）：右侧偏上，
-      //   聆听中红色描边呼吸 + 气泡实时显示识别文本/对话内容
+      // ★ 语音命令 UI（识别设置开启后显示）：
+      //   唤醒监听 = 无 UI（地址栏麦克风按钮高亮，说唤醒词即答"在呢"）
+      //   命令聆听中 = 顶部居中大面板：呼吸红点 + 实时识别文本 + 示例口令 + 点按取消
+      //   空闲 = 右侧对话气泡（应答/结果/澄清反馈），开关移至地址栏麦克风按钮
       if (this.voiceCmdEnabled) {
-        Column({ space: 8 }) {
-          if (this.vcBubbleVisible) {
-            Text(this.vcBubble)
-              .fontSize(14)
-              .fontColor(Color.White)
-              .backgroundColor('#CC1A1A2E')
-              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-              .borderRadius(12)
-              .constraintSize({ maxWidth: 240 })
-              .onClick((): void => {
-                if (!this.vcListening) {
-                  this.startVcListening();
-                }
-              })
+        // ── 聆听面板（覆盖在预览上方，点按任意处取消）──
+        if (this.vcListening) {
+          Column({ space: 14 }) {
+            Row({ space: 12 }) {
+              Stack() {
+                Column()
+                  .width(14)
+                  .height(14)
+                  .borderRadius(7)
+                  .backgroundColor('#FF5252')
+                Column()
+                  .width(14)
+                  .height(14)
+                  .borderRadius(7)
+                  .backgroundColor('#80FF5252')
+                  .scale(this.vcPulse ? { x: 1, y: 1 } : { x: 2.4, y: 2.4 })
+                  .opacity(this.vcPulse ? 0.6 : 0)
+                  .animation({ duration: 600, curve: Curve.EaseOut })
+              }
+              .width(40)
+              .height(40)
+              Text('正在聆听…')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+                .fontColor(Color.White)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+                .layoutWeight(1)
+            }
+            .width('100%')
+            // ★ 实时识别文本（大字号青色，看得清"它听到了什么"）
+            Text(this.vcPartial.length > 0 ? this.vcPartial : '请说出你的口令')
+              .fontSize(22)
+              .fontWeight(FontWeight.Bold)
+              .fontColor(this.vcPartial.length > 0 ? '#00E5FF' : 'rgba(255,255,255,0.45)')
+              .maxLines(2)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+              .width('100%')
+              .textAlign(TextAlign.Center)
+            // ★ 示例口令（新手引导，点按直接说）
+            Row({ space: 8 }) {
+              ForEach(['开始录像', '截图', '打开人脸识别'], (cmd: string) => {
+                Text(cmd)
+                  .fontSize(13)
+                  .fontColor('#B3E5FC')
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .backgroundColor('#3300E5FF')
+                  .borderRadius(14)
+              }, (cmd: string) => cmd)
+            }
+            Text('点按任意处取消')
+              .fontSize(12)
+              .fontColor('rgba(255,255,255,0.4)')
           }
-          Stack() {
-            Text('🎤')
-              .fontSize(24)
-              .hitTestBehavior(HitTestMode.None)
-          }
-          .width(52)
-          .height(52)
-          .borderRadius(26)
-          .backgroundColor('#33FFFFFF')
-          .border({ width: 2, color: this.vcListening ? '#FF5252' : '#00E5FF' })
+          .width('88%')
+          .padding({ left: 20, right: 20, top: 18, bottom: 16 })
+          .borderRadius(22)
+          .backgroundColor('#D9141620')
+          .border({ width: 1, color: '#4D00E5FF' })
+          .alignItems(HorizontalAlign.Center)
+          .position({ x: '6%', y: '13%' })
           .onClick((): void => {
             this.onTapMic();
           })
-          .gesture(
-            LongPressGesture({ repeat: false, duration: 600 })
-              .onAction((): void => {
-                this.showVcBubble('可以说：开始录像、截图、打开人脸识别、'
-                  + '省电模式、变焦两倍、现在什么状态、帮助', 8000);
-              })
-          )
+        } else if (this.vcBubbleVisible) {
+          // ── 空闲态：仅右侧对话气泡（应答/结果/澄清反馈）──
+          Column() {
+            Text(this.vcBubble)
+              .fontSize(15)
+              .fontColor(Color.White)
+              .backgroundColor('#E61A1A2E')
+              .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+              .borderRadius(14)
+              .constraintSize({ maxWidth: 260 })
+          }
+          .alignItems(HorizontalAlign.End)
+          .position({ x: '100%', y: '40%' })
+          .markAnchor({ x: 74, y: 0 })
+          .hitTestBehavior(HitTestMode.Transparent)
         }
-        .alignItems(HorizontalAlign.Center)
-        .position({ x: '100%', y: '42%' })
-        .markAnchor({ x: 70, y: 0 })
-        .hitTestBehavior(this.vcBubbleVisible ? HitTestMode.Default : HitTestMode.Transparent)
       }
 
       // ★ loading 期间与首帧未就绪的间隙统一用 loading.gif 遮罩（纯 gif，无文案）：
@@ -5115,6 +5547,8 @@ struct Index {
           pipEnabled: this.pipEnabled,
           // ★ 语音命令开关（离线 AI 识别 + 模糊纠错 NLU）
           voiceCmdOn: this.voiceCmdEnabled,
+          // ★ 唤醒词（默认"小鱼"，可自定义 2~8 字，支持四川话口音）
+          vcWakeWord: this.vcWakeWord,
           onClose: (): void => { this.sheetVisible = false; },
           onSelectModel: (id: string): void => { this.selectModel(id); },
           onToggleLabel: (idx: number): void => { this.toggleAlertLabel(idx); },
@@ -5128,7 +5562,8 @@ struct Index {
           onPreviewSound: (): void => { this.previewRecordSound(); },
           onResetSound: (): void => { this.resetRecordSound(); },
           onPipToggle: (): void => { this.togglePip(); },
-          onVoiceCmdToggle: (): void => { this.toggleVoiceCmd(); }
+          onVoiceCmdToggle: (): void => { this.toggleVoiceCmd(); },
+          onWakeWordChange: (w: string): void => { this.onVcWakeWordChange(w); }
         })
       }
 

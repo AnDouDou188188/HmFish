@@ -20,6 +20,10 @@
 import { PiPWindow, BuilderNode, NodeController, FrameNode } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { BusinessError } from '@kit.BasicServicesKit';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+const LOG_DOMAIN: number = 0x00A0;
+const LOG_TAG: string = 'Pip';
 
 // ★ 小窗 HUD 数据（@Observed + @ObjectLink 子组件：字段变更自动重绘）
 @Observed
@@ -110,7 +114,10 @@ export class PipManager {
     onState: (started: boolean) => void,
     onPauseToggle: (paused: boolean) => void): Promise<boolean> {
     if (this.controller !== null) return true;
-    if (!PiPWindow.isPiPEnabled()) return false;
+    if (!PiPWindow.isPiPEnabled()) {
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'create failed: device PiP not enabled');
+      return false;
+    }
     this.onState = onState;
     this.onPauseToggle = onPauseToggle;
     const config: PiPWindow.PiPConfiguration = {
@@ -122,7 +129,10 @@ export class PipManager {
     };
     try {
       this.controller = await PiPWindow.create(config);
-    } catch (_) {
+    } catch (e) {
+      const err = e as BusinessError;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'PiPWindow.create failed: %{public}d %{public}s',
+        err.code, `${err.message}`);
       this.controller = null;
       return false;
     }
@@ -163,7 +173,10 @@ export class PipManager {
     try {
       await this.controller.startPiP();
       return true;
-    } catch (_) {
+    } catch (e) {
+      const err = e as BusinessError;
+      hilog.error(LOG_DOMAIN, LOG_TAG, 'startPiP failed: %{public}d %{public}s',
+        err.code, `${err.message}`);
       return false;
     }
   }

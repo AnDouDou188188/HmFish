@@ -41,8 +41,10 @@ export struct ModelSheet {
   @Prop recordSoundName: string = '';
   // ★ 画中画后台识别：退出应用后以悬浮窗继续相机预览+YOLO 识别（录像/播报不停）
   @Prop pipEnabled: boolean = false;
-  // ★ 语音命令：点悬浮麦克风说话，离线 AI 模糊识别+拼音纠正后执行全部功能
+  // ★ 语音命令：说唤醒词唤醒后下指令，离线 AI 模糊识别+拼音/口音纠正后执行全部功能
   @Prop voiceCmdOn: boolean = false;
+// ★ 唤醒词（默认"钓鱼"，可自定义 2~8 字，支持四川话口音）
+@Prop vcWakeWord: string = '钓鱼';
 
   // ── 交互回调：关闭/选模型/勾类别/阈值提交/各开关切换/音效选择·试听·恢复 ──
   onClose?: () => void;
@@ -59,6 +61,7 @@ export struct ModelSheet {
   onResetSound?: () => void;
   onPipToggle?: () => void;
   onVoiceCmdToggle?: () => void;
+  onWakeWordChange?: (w: string) => void;
 
   @State appear: boolean = false;
   // ★ 滑条本地缓冲：拖动期间只更新本地值，松手才提交父组件
@@ -366,8 +369,8 @@ export struct ModelSheet {
               .fontSize(10).fontColor('#8E97A3')
               .width('100%').margin({ top: 6 })
 
-            // ★ 语音命令：点悬浮麦克风说话 → 离线 AI 识别 + 拼音模糊纠正 →
-            //   执行录像/截图/识别/画质/模型/能耗等全部功能（支持多轮澄清对话）
+            // ★ 语音命令：说唤醒词（默认"钓鱼"）唤醒 → 再说命令 → 离线 AI 识别 +
+            //   拼音/四川话口音模糊纠正 → 执行录像/截图/识别/画质/模型/能耗等全部功能
             Row({ space: 8 }) {
               Text('🎤').fontSize(14).fontColor('#00E5FF')
               Text('语音命令').fontSize(14).fontColor('#EDEFF2').fontWeight(FontWeight.Bold)
@@ -383,10 +386,51 @@ export struct ModelSheet {
             .width('100%')
             .margin({ top: 20 })
 
-            Text('点麦克风说话即可控制：开始录像、截图、打开人脸识别、省电模式、变焦两倍…'
-              + '识别不准会自动模糊纠正并多轮追问确认')
+            Text('开启后持续聆听唤醒词，唤醒只答"在呢"，随后可连续说多个命令批量执行：开始录像、'
+              + '截图、变焦三倍、恢复默认变焦、打开人脸识别、退出软件…识别不准自动模糊纠正'
+              + '并多轮确认（支持四川话口音）')
               .fontSize(10).fontColor('#8E97A3')
               .width('100%').margin({ top: 6 })
+
+            // ── 唤醒词自定义：2~8 字，默认"钓鱼"，说完自动保存 ──
+            if (this.voiceCmdOn) {
+              Row({ space: 8 }) {
+                Text('唤醒词').fontSize(13).fontColor('#EDEFF2')
+                TextInput({ text: this.vcWakeWord, placeholder: '钓鱼' })
+                  .fontSize(13)
+                  .fontColor('#00E5FF')
+                  .placeholderColor('#6E7681')
+                  .placeholderFont({ size: 13 })
+                  .backgroundColor('#141A21')
+                  .borderRadius(8)
+                  .height(36)
+                  .maxLength(8)
+                  .layoutWeight(1)
+                  .onChange((t: string) => {
+                    this.vcWakeWord = t;
+                  })
+                  .onSubmit(() => {
+                    this.onWakeWordChange?.(this.vcWakeWord);
+                  })
+                  .onBlur(() => {
+                    this.onWakeWordChange?.(this.vcWakeWord);
+                  })
+                Text('保存').fontSize(12).fontColor('#00E5FF').fontWeight(FontWeight.Bold)
+                  .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+                  .borderRadius(10)
+                  .backgroundColor('rgba(0,229,255,0.18)')
+                  .border({ width: 1, color: '#00E5FF' })
+                  .onClick(() => {
+                    this.onWakeWordChange?.(this.vcWakeWord);
+                  })
+              }
+              .width('100%')
+              .margin({ top: 10 })
+
+              Text('建议 2~4 字、避开聊天常用词；说两遍亦可唤醒（"钓鱼钓鱼"）')
+                .fontSize(10).fontColor('#8E97A3')
+                .width('100%').margin({ top: 6 })
+            }
 
             // ── 识别模型横向列表：点卡片切换模型（Index 负责卸载/热加载） ──
             this.SectionTitle('◆', '识别模型', '点击切换')

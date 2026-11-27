@@ -51,6 +51,12 @@ export class VcAnalysis {
   number: number = -1;
 }
 
+// ★ 唤醒词命中结果：hit=是否命中唤醒词；rest=唤醒词之后的剩余文本（即命令）
+export class WakeMatch {
+  hit: boolean = false;
+  rest: string = '';
+}
+
 // ★ 开/关意图词（长词优先匹配，匹配后从文本摘除再比对目标词）
 const ON_WORDS: string[] = ['打开一下', '打开', '开启', '启用', '启动', '开始', '开起', '开一下', '开'];
 const OFF_WORDS: string[] = ['关闭掉', '关闭', '关掉', '停止', '停用', '取消', '停下', '关了', '停了', '关'];
@@ -83,18 +89,29 @@ function buildEntries(): VcEntry[] {
   add('auto_record', ['自动录像', '自动记录']);
   add('sound', ['提示音', '触发音效', '音效']);
   add('enhance', ['画质增强', '增强画质', 'AI增强', '高清增强', '超分']);
-  add('record', ['录像', '录影', '拍摄']);
+  add('record', ['录像', '录影', '拍摄', '录个像', '录一段', '帮我录像']);
   // ── 方向性动作（极性无意义，直接执行）──
-  add('snapshot', ['截图', '拍照', '拍一张', '来一张', '拍张照']);
+  add('snapshot', ['截图', '拍照', '拍一张', '来一张', '拍张照', '拍个照', '照一张', '照相',
+    '来张照片', '拍张照片', '咔嚓']);
   add('camera_front', ['前置摄像头', '前摄像头', '前摄', '前置']);
   add('camera_back', ['后置摄像头', '后摄像头', '后摄', '后置']);
   add('camera_usb', ['USB摄像头', '外接摄像头', '外接相机', 'USB相机']);
-  add('camera_switch', ['切换摄像头', '换个摄像头', '换摄像头', '翻转摄像头', '翻转']);
-  add('zoom_in', ['放大', '拉近', '变焦放大']);
-  add('zoom_out', ['缩小', '拉远']);
+  add('camera_switch', ['切换摄像头', '换个摄像头', '换摄像头', '翻转摄像头', '翻转',
+    '换一个摄像头', '换镜头', '翻转相机', '翻个面']);
+  add('zoom_in', ['放大', '拉近', '变焦放大', '再放大', '放大一点', '放大一些',
+    '拉近一点', '再近一点', '再近点']);
+  add('zoom_out', ['缩小', '拉远', '再缩小', '缩小一点', '缩小一些',
+    '拉远一点', '再远一点', '再远点']);
   add('zoom_set', ['变焦', '倍焦']);
+  add('zoom_default', ['恢复默认变焦', '变焦恢复默认', '恢复变焦', '变焦复位', '恢复默认',
+    '复位变焦', '回到一倍', '一倍变焦', '变焦复原', '变焦恢复']);
+  add('zoom_min', ['最小变焦', '最小倍数', '变焦最小', '最小倍率']);
+  add('zoom_max', ['最大变焦', '最大倍数', '变焦最大', '最大倍率', '拉到最近', '放大到最大']);
+  add('table_rec', ['表格识别', '识别表格', '读表格', '表格结构']);
+  add('exit_app', ['退出应用', '退出软件', '退出程序', '关闭应用', '关闭软件', '关闭程序',
+    '关掉应用', '关掉软件', '退出app', '不玩了', '再见', '拜拜']);
   add('rotate', ['旋转画面', '旋转', '转一下', '横竖切换']);
-  add('model_next', ['切换模型', '换个模型', '下一个模型', '换模型']);
+  add('model_next', ['切换模型', '换个模型', '下一个模型', '换模型', '换一个模型', '下个模型']);
   add('power_saver', ['省电模式', '节能模式', '省电']);
   add('power_std', ['标准模式', '平衡模式', '默认模式']);
   add('power_perf', ['性能模式', '高性能模式']);
@@ -106,11 +123,15 @@ function buildEntries(): VcEntry[] {
   add('sheet_power', ['能耗设置', '能耗面板', '能耗菜单']);
   add('sheet_record', ['记录设置', '录像设置']);
   add('sheet_update', ['更新面板', '更新设置']);
-  add('close_sheet', ['关闭面板', '关闭设置', '关闭菜单', '收起面板', '关闭弹窗']);
+  add('close_sheet', ['关闭面板', '关闭设置', '关闭菜单', '收起面板', '关闭弹窗',
+    '收起设置', '收起菜单', '关闭所有面板']);
   add('update_check', ['检查更新', '看看有没有新版本', '有没有新版本']);
-  add('help', ['你能做什么', '你能干什么', '你会什么', '有什么功能', '怎么用', '帮助']);
+  add('help', ['你能做什么', '你能干什么', '你会什么', '有什么功能', '怎么用', '帮助',
+    '有什么命令', '有哪些命令', '命令列表', '功能列表', '你会哪些']);
   add('undo', ['撤销刚才', '取消刚才', '恢复刚才', '撤销', '反悔']);
-  add('status', ['现在什么状态', '当前状态', '什么状态', '状态']);
+  add('status', ['现在什么状态', '当前状态', '什么状态', '状态', '现在怎么样',
+    '现在什么情况', '当前情况', '汇报状态', '怎么样了']);
+  add('cmd_done', ['完毕', '就这些', '没有了', '没了', '搞定了', '完事', '结束命令']);
   add('cancel', ['算了', '不用了']);
   return e;
 }
@@ -303,12 +324,12 @@ export class VoiceNlu {
   }
 
   // ★ 单词条对文本的模糊得分：精确子串=1，否则滑动窗口取
-  //   max(0.45×字形相似 + 0.55×拼音相似)，拼音通道主导同音纠错
+  //   max(0.45×字形相似 + 0.55×拼音相似)，拼音通道走方言归一（口音容错）
   static phraseScore(text: string, phrase: string): number {
     if (phrase.length === 0 || text.length === 0) return 0;
     if (text.includes(phrase)) return 1;
-    const pyText = pinyinOf(text);
-    const pyPhrase = pinyinOf(phrase);
+    const pyText = pinyinOf(text, true);
+    const pyPhrase = pinyinOf(phrase, true);
     const L = phrase.length;
     let best = 0;
     if (text.length <= L) {
@@ -319,7 +340,7 @@ export class VoiceNlu {
       for (let i = 0; i + L <= text.length; i++) {
         const win = text.substring(i, i + L);
         const cs = similarity(phrase, win);
-        const ps = similarity(pyPhrase, pinyinOf(win));
+        const ps = similarity(pyPhrase, pinyinOf(win, true));
         const s = 0.45 * cs + 0.55 * ps;
         if (s > best) best = s;
       }
@@ -327,6 +348,77 @@ export class VoiceNlu {
     // 特异性加权：长词（更具体的意图）小幅加分，避免"识别"抢走"识别设置"
     const bonus = L >= 5 ? 0.06 : (L >= 4 ? 0.05 : (L >= 3 ? 0.03 : 0.01));
     return Math.min(1, best + bonus);
+  }
+
+  // ★ 唤醒词匹配：识别文本头部模糊定位唤醒词（同音/近音/叠词/口音均可），
+  //   命中后循环剥离（"小鱼小鱼"→一层层剥），返回剩余文本作为命令；
+  //   窗口只允许出现在开头前 2 字内（避免句中误触发唤醒）
+  static matchWakeWord(text: string, wakeWord: string): WakeMatch {
+    const m = new WakeMatch();
+    if (wakeWord.length === 0) return m;
+    const pyWake = pinyinOf(wakeWord, true);
+    const L = wakeWord.length;
+    let rest = VoiceNlu.normalize(text);
+    let matchedAny = false;
+    for (let round = 0; round < 3; round++) {
+      const cur = rest.length === 0 ? '' : rest;
+      if (cur.length === 0) break;
+      // 1) 精确前缀直接剥离
+      if (cur.startsWith(wakeWord)) {
+        matchedAny = true;
+        rest = cur.substring(L);
+        continue;
+      }
+      // 2) 模糊前缀：窗口长度 L-1~L+1，起点限前 2 字，双通道加权取最高
+      let best = 0;
+      let bestEnd = -1;
+      const lo = L - 1 > 1 ? L - 1 : 1;
+      for (let wl = lo; wl <= L + 1; wl++) {
+        for (let i = 0; i + wl <= cur.length && i <= 2; i++) {
+          const win = cur.substring(i, i + wl);
+          const cs = similarity(wakeWord, win);
+          const ps = similarity(pyWake, pinyinOf(win, true));
+          const s = 0.45 * cs + 0.55 * ps;
+          if (s > best) {
+            best = s;
+            bestEnd = i + wl;
+          }
+        }
+      }
+      if (best >= 0.72 && bestEnd > 0) {
+        matchedAny = true;
+        rest = cur.substring(bestEnd);
+        continue;
+      }
+      break;
+    }
+    if (matchedAny) {
+      m.hit = true;
+      m.rest = rest;
+    }
+    return m;
+  }
+
+  // ★ 多命令分割：一句里说多个命令时按连接词/标点切开，批量执行
+  //   （"打开识别，然后开始录像" → ["打开识别","开始录像"]；
+  //     不切裸"再/和"，避免破坏"再放大""和面"等命令词）
+  static splitCommands(text: string): string[] {
+    let t = text;
+    const connectors: string[] = ['还有', '然后', '接着', '并且', '同时', '以及'];
+    for (const c of connectors) {
+      while (t.includes(c)) {
+        t = t.replace(c, '，');
+      }
+    }
+    const parts = t.split('，');
+    const out: string[] = [];
+    for (const p of parts) {
+      const norm = VoiceNlu.normalize(p);
+      if (norm.length >= 2) {
+        out.push(norm);
+      }
+    }
+    return out;
   }
 
   // ★ 核心：分析识别文本 → 候选意图排序
@@ -442,7 +534,7 @@ export class VoiceNlu {
   }
 
   // ★ 热词收集：静态词库 + 动态词条，喂给离线识别引擎提升命令词命中率
-  static collectHotwords(dynamic: VcEntry[]): string[] {
+  static collectHotwords(dynamic: VcEntry[], wakeWord: string = ''): string[] {
     const seen: Record<string, boolean> = {};
     const out: string[] = [];
     const add = (w: string): void => {
@@ -451,6 +543,10 @@ export class VoiceNlu {
       seen[w] = true;
       out.push(w);
     };
+    // ★ 唤醒词优先注入（识别源头提升唤醒命中率，如"小鱼/小于/小宇"统一吸到"小鱼"）
+    if (wakeWord.length >= 2) {
+      add(wakeWord);
+    }
     for (const e of VoiceNlu.ENTRIES) {
       add(e.phrase);
     }

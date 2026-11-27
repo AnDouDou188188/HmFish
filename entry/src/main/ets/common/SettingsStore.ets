@@ -80,8 +80,10 @@ export interface AppSettings {
   usbParamModeMigrated: boolean;
   // ★ 画中画（后台悬浮小窗）开关：退后台时用 PiP 小窗继续看画面（默认开）
   pipEnabled: boolean;
-  // ★ 语音命令开关：点悬浮麦克风说话，AI 模糊识别纠正后执行（默认关）
+  // ★ 语音命令开关：说唤醒词唤醒后下指令，AI 模糊识别纠正后执行（默认关）
   voiceCmdEnabled: boolean;
+  // ★ 语音唤醒词（默认"钓鱼"，可自定义 2~8 字）
+  vcWakeWord: string;
   // ★ 应用内自动更新：自动检查开关 / 跳过的版本 tag / 稍后提醒截止时间戳 / 上次检查时间戳
   updateAutoCheck: boolean;
   updateSkipTag: string;
@@ -159,6 +161,7 @@ export class SettingsStore {
       usbParamModeMigrated: false,
       pipEnabled: true,
       voiceCmdEnabled: false,
+      vcWakeWord: '钓鱼',
       updateAutoCheck: true,
       updateSkipTag: '',
       updateSnoozeUntil: 0,
@@ -239,6 +242,12 @@ export class SettingsStore {
     // ★ 画中画 + 语音命令 + 应用内更新设置
     r.pipEnabled = await p.get('pipEnabled', true) as boolean;
     r.voiceCmdEnabled = await p.get('voiceCmdEnabled', false) as boolean;
+    r.vcWakeWord = await p.get('vcWakeWord', '钓鱼') as string;
+    // ★ 唤醒词默认值迁移：旧默认"小鱼" → 新默认"钓鱼"（用户自定义值不受影响）
+    if (r.vcWakeWord === '小鱼') {
+      r.vcWakeWord = '钓鱼';
+      await p.put('vcWakeWord', '钓鱼');
+    }
     r.updateAutoCheck = await p.get('updateAutoCheck', true) as boolean;
     r.updateSkipTag = await p.get('updateSkipTag', '') as string;
     r.updateSnoozeUntil = await p.get('updateSnoozeUntil', 0) as number;
@@ -314,6 +323,7 @@ export class SettingsStore {
     if (s.usbParamModeMigrated !== undefined) await p.put('usbParamModeMigrated', s.usbParamModeMigrated);
     if (s.pipEnabled !== undefined) await p.put('pipEnabled', s.pipEnabled);
     if (s.voiceCmdEnabled !== undefined) await p.put('voiceCmdEnabled', s.voiceCmdEnabled);
+    if (s.vcWakeWord !== undefined) await p.put('vcWakeWord', s.vcWakeWord);
     if (s.updateAutoCheck !== undefined) await p.put('updateAutoCheck', s.updateAutoCheck);
     if (s.updateSkipTag !== undefined) await p.put('updateSkipTag', s.updateSkipTag);
     if (s.updateSnoozeUntil !== undefined) await p.put('updateSnoozeUntil', s.updateSnoozeUntil);
